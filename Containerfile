@@ -29,5 +29,11 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 # hadolint ignore=DL3007
 FROM ghcr.io/yadgarhq/runtime:latest
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/yadgar-task-db /yadgar-task-db
+
+# The runtime base already declares this (D63). Repeating it is deliberate: a
+# static scanner reads THIS file and cannot follow the base image, so without the
+# line the image looks like it runs as root. Stating it also means a future change
+# of base cannot silently drop the guarantee.
+USER 65532:65532
 EXPOSE 50051
 ENTRYPOINT ["/yadgar-task-db"]
