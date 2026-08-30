@@ -3,6 +3,9 @@
 
 use sqlx::{MySqlPool, Row};
 use tonic::{Request, Response, Status};
+use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::observe::{Call, Outcome};
+use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::pb::yadgar::common::v1::{Meta, Scope};
 use crate::pb::yadgar::task::v1::task_db_service_server::TaskDbService;
@@ -34,6 +37,31 @@ fn subtree(project_id: &str) -> String {
     format!("{project_id}/%")
 }
 
+/// Copy the scope fields a record needs, before the request is consumed.
+///
+/// Empty strings when the scope is absent: the call is refused on its own merits,
+/// and telemetry must never be the thing that fails a request (D25).
+fn tel_scope(scope: &Option<Scope>) -> yadgar_telemetry::observe::Scope {
+    yadgar_telemetry::observe::Scope {
+        request_id: scope
+            .as_ref()
+            .map(|s| s.request_id.clone())
+            .unwrap_or_default(),
+        instance_id: scope
+            .as_ref()
+            .map(|s| s.instance_id.clone())
+            .unwrap_or_default(),
+        user_id: scope
+            .as_ref()
+            .map(|s| s.user_id.clone())
+            .unwrap_or_default(),
+        project_id: scope
+            .as_ref()
+            .map(|s| s.project_id.clone())
+            .unwrap_or_default(),
+    }
+}
+
 #[tonic::async_trait]
 impl TaskDbService for TaskDb {
     async fn create_task(
@@ -41,6 +69,7 @@ impl TaskDbService for TaskDb {
         request: Request<CreateTaskRequest>,
     ) -> Result<Response<CreateTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start("task-db", "CreateTask", Kind::Write, tel_scope(&req.scope));
         let scope = scope_of(&req.scope)?;
         let task = req
             .task
@@ -89,7 +118,7 @@ impl TaskDbService for TaskDb {
 
         tx.commit().await.map_err(internal)?;
 
-        Ok(Response::new(CreateTaskResponse {
+        let response = CreateTaskResponse {
             meta: Some(Meta {
                 id,
                 version: 1,
@@ -98,7 +127,15 @@ impl TaskDbService for TaskDb {
                 ..Default::default()
             }),
             number,
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn get_task(
@@ -106,6 +143,7 @@ impl TaskDbService for TaskDb {
         request: Request<GetTaskRequest>,
     ) -> Result<Response<GetTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start("task-db", "GetTask", Kind::Read, tel_scope(&req.scope));
         let scope = scope_of(&req.scope)?;
 
         // Scope is part of the WHERE, not a check after the fact. A row the
@@ -141,9 +179,17 @@ impl TaskDbService for TaskDb {
         .map_err(internal)?
         .ok_or_else(|| Status::not_found("no such task in this scope"))?;
 
-        Ok(Response::new(GetTaskResponse {
+        let response = GetTaskResponse {
             task: Some(row_to_task(&row)?),
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn list_tasks(
@@ -151,6 +197,7 @@ impl TaskDbService for TaskDb {
         request: Request<ListTasksRequest>,
     ) -> Result<Response<ListTasksResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start("task-db", "ListTasks", Kind::Read, tel_scope(&req.scope));
         let scope = scope_of(&req.scope)?;
 
         // A page size the caller did not set is 0, which would return nothing and
@@ -180,10 +227,18 @@ impl TaskDbService for TaskDb {
             .iter()
             .map(row_to_task)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Response::new(ListTasksResponse {
+        let response = ListTasksResponse {
             tasks,
             next_page_token: String::new(),
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: response.tasks.len() as u32,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn update_task(
@@ -191,6 +246,7 @@ impl TaskDbService for TaskDb {
         request: Request<UpdateTaskRequest>,
     ) -> Result<Response<UpdateTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start("task-db", "UpdateTask", Kind::Write, tel_scope(&req.scope));
         let scope = scope_of(&req.scope)?;
         let task = req
             .task
@@ -223,14 +279,22 @@ impl TaskDbService for TaskDb {
             ));
         }
 
-        Ok(Response::new(UpdateTaskResponse {
+        let response = UpdateTaskResponse {
             meta: Some(Meta {
                 id: req.id,
                 version: req.expect_version + 1,
                 project_id: scope.project_id.clone(),
                 ..Default::default()
             }),
-        }))
+        };
+        call.finish(Outcome {
+            status: "OK",
+            payload: format!("{response:?}"),
+            class: Class::Envelope,
+            rows: 1,
+            ..Default::default()
+        });
+        Ok(Response::new(response))
     }
 
     async fn delete_task(
@@ -238,6 +302,7 @@ impl TaskDbService for TaskDb {
         request: Request<DeleteTaskRequest>,
     ) -> Result<Response<DeleteTaskResponse>, Status> {
         let req = request.into_inner();
+        let call = Call::start("task-db", "DeleteTask", Kind::Write, tel_scope(&req.scope));
         let scope = scope_of(&req.scope)?;
 
         // Soft, and OWNER-ONLY (D26). The owner check is in the statement rather
@@ -262,6 +327,13 @@ impl TaskDbService for TaskDb {
                 "version mismatch, not the owner, or no such task in this scope",
             ));
         }
+        // Nothing to measure — an empty response. Recorded anyway: a delete
+        // still costs time and still belongs in the count.
+        call.finish(Outcome {
+            status: "OK",
+            rows: 1,
+            ..Default::default()
+        });
         Ok(Response::new(DeleteTaskResponse {}))
     }
 }
