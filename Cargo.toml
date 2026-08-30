@@ -1,0 +1,48 @@
+[package]
+name = "yadgar-task-db"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The task module's -db twin: the only writer of its store, serving TaskDbService over gRPC."
+
+[dependencies]
+# Pinned by REVISION, not by tag or branch. store has no tags yet, and a branch
+# is a moving target — the same reasoning that pins images by digest (D61) and
+# actions by SHA (D62). Bumped deliberately, never drifting underneath a build.
+yadgar-store = { git = "https://github.com/yadgarhq/store.git", rev = "3b5fe6f5a4bcb7fbd6d5ee9d0005c2e39279eb2b" }
+# In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
+# feature on tonic itself. Also no TLS feature here: the gateway terminates
+# outward TLS, and in-cluster hops are plain HTTP/2 today (D23).
+tonic = { version = "0.14", default-features = false, features = [
+  "codegen",
+  "router",
+  "server",
+  "transport",
+] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+sqlx = { version = "0.9", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
+  "mysql",
+  "macros",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

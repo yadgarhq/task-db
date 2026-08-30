@@ -1,0 +1,91 @@
+//! Boot order is the decision here, not the wiring.
+//!
+//! Probe, migrate, then serve — and the service does not report ready until all
+//! three have succeeded. D7 makes a capability gap a boot failure, and D69 puts
+//! the probe before the pool is declared ready precisely so a failure is a
+//! crash-loop rather than a pod that accepts traffic and fails queries. Under
+//! D68 the second shape is actively harmful: a pod that starts and then errors is
+//! one the HPA adds replicas around.
+
+use std::net::SocketAddr;
+
+use sqlx::Connection;
+use yadgar_store::capability::{Capability, CapabilitySet};
+use yadgar_store::credentials::{CredentialSource, Secret};
+use yadgar_store::pool::PoolConfig;
+use yadgar_store::{migrate, probe};
+
+use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbServiceServer;
+use yadgar_task_db::{schema, service::TaskDb};
+
+/// What this module needs of its engine (D69). Addressed, not ranked — so no
+/// vector search and no full-text (D10). Requiring either would make this module
+/// refuse to boot on an engine that serves it perfectly well.
+fn required() -> CapabilitySet {
+    CapabilitySet::from([Capability::Transactions, Capability::RowLocking])
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let config = PoolConfig {
+        host: env_or("DB_HOST", "127.0.0.1"),
+        port: env_or("DB_PORT", "3306").parse()?,
+        database: env_or("DB_NAME", "task"),
+        username: env_or("DB_USER", "task"),
+        max_connections: env_or("DB_MAX_CONNECTIONS", "8").parse()?,
+        replicas: env_or("REPLICAS", "2").parse()?,
+        engine_max_connections: env_or("DB_ENGINE_MAX_CONNECTIONS", "151").parse()?,
+        require_tls: env_or("DB_REQUIRE_TLS", "true") == "true",
+    };
+
+    // The credential never arrives as an environment variable — it is a mounted
+    // Secret the operator issued (D58), read through the seam so this module has
+    // no idea which deployment target it is on.
+    let secret: Secret = CredentialSource::SecretFile(
+        env_or("DB_PASSWORD_FILE", "/var/run/secrets/task-db/password").into(),
+    )
+    .resolve()?;
+
+    // 1. PROBE, on a connection of its own and before the pool exists. Refusing
+    //    here is the whole point of D7.
+    let mut conn = sqlx::MySqlConnection::connect(&format!(
+        "mysql://{}:{}@{}:{}/{}",
+        config.username,
+        secret.expose(),
+        config.host,
+        config.port,
+        config.database
+    ))
+    .await?;
+    let report = probe::run(&mut conn).await?;
+    report.satisfies(&required())?;
+    conn.close().await?;
+    tracing::info!("engine satisfies the required capabilities");
+
+    // 2. MIGRATE. Refuses outright if the database is ahead of this binary.
+    let pool = yadgar_store::pool::connect(&config, &secret).await?;
+    let applied = migrate::apply(&pool, &schema::migrations()?).await?;
+    tracing::info!(applied, "schema at migration {applied}");
+
+    // 3. SERVE. Only now.
+    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50051").parse()?;
+    tracing::info!(%addr, "task-db listening");
+    tonic::transport::Server::builder()
+        .add_service(TaskDbServiceServer::new(TaskDb::new(pool)))
+        .serve_with_shutdown(addr, async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutting down");
+        })
+        .await?;
+
+    Ok(())
+}

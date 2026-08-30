@@ -1,0 +1,29 @@
+# In git the image points at a moving TAG; the PUBLISHED chart pins a DIGEST,
+# rewritten by ci-release at package time (D65). The two differ deliberately: a
+# chart in git that pinned a digest would need a commit per release, and a
+# published chart that pointed at a tag would not be reproducible.
+image:
+  repository: ghcr.io/yadgarhq/task-db
+  tag: latest
+
+# At least two, always (D55). D18's cache coherence, D23's client-side balancing
+# and D47's atomic claim are multi-replica behaviours; one replica makes an
+# entire category of defect unreachable.
+replicaCount: 2
+
+# Requests are MANDATORY: an HPA cannot compute utilisation without them, and a
+# pod with no request is BestEffort and evicted first (D68). Memory has a limit;
+# CPU deliberately does not — throttling a latency-bound service is the opposite
+# of what scaling out is for.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+database:
+  host: task-db-mariadb
+  name: task
+  user: task
+  passwordSecret: task-db-password

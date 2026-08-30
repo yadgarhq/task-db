@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      # POD-level, and distinct from the container block below. Setting only the
+      # container context leaves the pod admitting root — runAsNonRoot is the
+      # assertion that actually refuses an image which would run as one, rather
+      # than trusting the Containerfile to have said so.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Chart.Name }}
+          # A published chart carries image.digest and no tag (D65, D61).
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
+          ports:
+            - name: grpc
+              containerPort: 50051
+          env:
+            - name: DB_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: REPLICAS
+              value: {{ .Values.replicaCount | quote }}
+          volumeMounts:
+            - name: db-password
+              mountPath: /var/run/secrets/task-db
+              readOnly: true
+          # NO readiness probe hitting a /health that returns early. The process
+          # does not listen until the capability probe and migrations have both
+          # succeeded (D69), so "the port is open" already means "ready" — and a
+          # probe that passed earlier than that would report ready for a pod that
+          # cannot serve, which under D68 is a pod the HPA adds replicas around.
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: db-password
+          secret:
+            secretName: {{ .Values.database.passwordSecret }}
