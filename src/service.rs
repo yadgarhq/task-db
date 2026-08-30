@@ -4,6 +4,7 @@
 use sqlx::{MySqlPool, Row};
 use tonic::{Request, Response, Status};
 use yadgar_telemetry::estimator::Class;
+use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -70,72 +71,81 @@ impl TaskDbService for TaskDb {
     ) -> Result<Response<CreateTaskResponse>, Status> {
         let req = request.into_inner();
         let call = Call::start("task-db", "CreateTask", Kind::Write, tel_scope(&req.scope));
-        let scope = scope_of(&req.scope)?;
-        let task = req
-            .task
-            .ok_or_else(|| Status::invalid_argument("task is required"))?;
 
-        // UUIDv7: time-ordered, so keyset pagination and index locality behave
-        // (D42). The URN is what leaves this service; the raw uuid never does.
-        let id = format!("yadgar:task:{}", uuid::Uuid::now_v7());
+        call.run(
+            async move {
+                let scope = scope_of(&req.scope)?;
+                let task = req
+                    .task
+                    .ok_or_else(|| Status::invalid_argument("task is required"))?;
 
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+                // UUIDv7: time-ordered, so keyset pagination and index locality behave
+                // (D42). The URN is what leaves this service; the raw uuid never does.
+                let id = format!("yadgar:task:{}", uuid::Uuid::now_v7());
 
-        // The number is per-project and allocated inside the same transaction as
-        // the insert. Reading a MAX and inserting afterwards in two statements is
-        // a race that hands two concurrent creates the same number; the UNIQUE on
-        // (project_id, number) would then reject one of them, which is safe but
-        // presents as a random failure. Holding it in one transaction is the fix.
-        let number: u32 = sqlx::query_scalar(
-            "SELECT CAST(COALESCE(MAX(number), 0) + 1 AS UNSIGNED)
-             FROM task WHERE project_id = ? FOR UPDATE",
-        )
-        .bind(&scope.project_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?;
+                let mut tx = self.pool.begin().await.map_err(internal)?;
 
-        sqlx::query(
-            "INSERT INTO task
-               (id, project_id, owner_user_id, team_id, visibility,
-                created_by, updated_by, number, title, body, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&scope.project_id)
-        .bind(&scope.user_id)
-        .bind(task.meta.as_ref().map(|m| m.team_id.as_str()).unwrap_or(""))
-        .bind(task.meta.as_ref().map(|m| m.visibility).unwrap_or(1) as i8)
-        .bind(&scope.user_id)
-        .bind(&scope.user_id)
-        .bind(number)
-        .bind(&task.title)
-        .bind(&task.body)
-        .bind(task.status as i8)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
+                // The number is per-project and allocated inside the same transaction as
+                // the insert. Reading a MAX and inserting afterwards in two statements is
+                // a race that hands two concurrent creates the same number; the UNIQUE on
+                // (project_id, number) would then reject one of them, which is safe but
+                // presents as a random failure. Holding it in one transaction is the fix.
+                let number: u32 = sqlx::query_scalar(
+                    "SELECT CAST(COALESCE(MAX(number), 0) + 1 AS UNSIGNED)
+                 FROM task WHERE project_id = ? FOR UPDATE",
+                )
+                .bind(&scope.project_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal)?;
 
-        tx.commit().await.map_err(internal)?;
+                sqlx::query(
+                    "INSERT INTO task
+                   (id, project_id, owner_user_id, team_id, visibility,
+                    created_by, updated_by, number, title, body, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&scope.project_id)
+                .bind(&scope.user_id)
+                .bind(task.meta.as_ref().map(|m| m.team_id.as_str()).unwrap_or(""))
+                .bind(task.meta.as_ref().map(|m| m.visibility).unwrap_or(1) as i8)
+                .bind(&scope.user_id)
+                .bind(&scope.user_id)
+                .bind(number)
+                .bind(&task.title)
+                .bind(&task.body)
+                .bind(task.status as i8)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
 
-        let response = CreateTaskResponse {
-            meta: Some(Meta {
-                id,
-                version: 1,
-                project_id: scope.project_id.clone(),
-                owner_user_id: scope.user_id.clone(),
+                tx.commit().await.map_err(internal)?;
+
+                let response = CreateTaskResponse {
+                    meta: Some(Meta {
+                        id,
+                        version: 1,
+                        project_id: scope.project_id.clone(),
+                        owner_user_id: scope.user_id.clone(),
+                        ..Default::default()
+                    }),
+                    number,
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
                 ..Default::default()
-            }),
-            number,
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn get_task(
@@ -144,52 +154,59 @@ impl TaskDbService for TaskDb {
     ) -> Result<Response<GetTaskResponse>, Status> {
         let req = request.into_inner();
         let call = Call::start("task-db", "GetTask", Kind::Read, tel_scope(&req.scope));
-        let scope = scope_of(&req.scope)?;
 
-        // Scope is part of the WHERE, not a check after the fact. A row the
-        // caller may not see must not be fetched and then filtered — the
-        // difference matters the day someone logs the pre-filter result.
-        let row = match req.key {
-            Some(get_task_request::Key::Id(id)) => {
-                sqlx::query(
-                    "SELECT id, version, project_id, owner_user_id, number, title, body, status
-                     FROM task
-                     WHERE id = ? AND deleted_at IS NULL
-                       AND (project_id = ? OR project_id LIKE ?)",
-                )
-                .bind(id)
-                .bind(&scope.project_id)
-                .bind(subtree(&scope.project_id))
-                .fetch_optional(&self.pool)
-                .await
-            }
-            Some(get_task_request::Key::Number(number)) => {
-                sqlx::query(
-                    "SELECT id, version, project_id, owner_user_id, number, title, body, status
-                     FROM task
-                     WHERE number = ? AND deleted_at IS NULL AND project_id = ?",
-                )
-                .bind(number)
-                .bind(&scope.project_id)
-                .fetch_optional(&self.pool)
-                .await
-            }
-            None => return Err(Status::invalid_argument("one of id or number is required")),
-        }
-        .map_err(internal)?
-        .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+        call.run(
+            async move {
+                let scope = scope_of(&req.scope)?;
 
-        let response = GetTaskResponse {
-            task: Some(row_to_task(&row)?),
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+                // Scope is part of the WHERE, not a check after the fact. A row the
+                // caller may not see must not be fetched and then filtered — the
+                // difference matters the day someone logs the pre-filter result.
+                let row = match req.key {
+                    Some(get_task_request::Key::Id(id)) => sqlx::query(
+                        "SELECT id, version, project_id, owner_user_id, number, title, body, status
+                         FROM task
+                         WHERE id = ? AND deleted_at IS NULL
+                           AND (project_id = ? OR project_id LIKE ?)",
+                    )
+                    .bind(id)
+                    .bind(&scope.project_id)
+                    .bind(subtree(&scope.project_id))
+                    .fetch_optional(&self.pool)
+                    .await,
+                    Some(get_task_request::Key::Number(number)) => sqlx::query(
+                        "SELECT id, version, project_id, owner_user_id, number, title, body, status
+                         FROM task
+                         WHERE number = ? AND deleted_at IS NULL AND project_id = ?",
+                    )
+                    .bind(number)
+                    .bind(&scope.project_id)
+                    .fetch_optional(&self.pool)
+                    .await,
+                    None => {
+                        return Err(Status::invalid_argument("one of id or number is required"))
+                    }
+                }
+                .map_err(internal)?
+                .ok_or_else(|| Status::not_found("no such task in this scope"))?;
+
+                let response = GetTaskResponse {
+                    task: Some(row_to_task(&row)?),
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn list_tasks(
@@ -198,47 +215,58 @@ impl TaskDbService for TaskDb {
     ) -> Result<Response<ListTasksResponse>, Status> {
         let req = request.into_inner();
         let call = Call::start("task-db", "ListTasks", Kind::Read, tel_scope(&req.scope));
-        let scope = scope_of(&req.scope)?;
 
-        // A page size the caller did not set is 0, which would return nothing and
-        // look like an empty store. Bounded above as well: an unbounded page is
-        // how one caller takes the whole table (D56 bounds reads).
-        let limit = match req.page_size {
-            n if n <= 0 => 50,
-            n if n > 500 => 500,
-            n => n,
-        } as i64;
+        call.run(
+            async move {
+                let scope = scope_of(&req.scope)?;
 
-        let rows = sqlx::query(
-            "SELECT id, version, project_id, owner_user_id, number, title, body, status
-             FROM task
-             WHERE deleted_at IS NULL AND (project_id = ? OR project_id LIKE ?)
-             ORDER BY id
-             LIMIT ?",
+                // A page size the caller did not set is 0, which would return nothing and
+                // look like an empty store. Bounded above as well: an unbounded page is
+                // how one caller takes the whole table (D56 bounds reads).
+                let limit = match req.page_size {
+                    n if n <= 0 => 50,
+                    n if n > 500 => 500,
+                    n => n,
+                } as i64;
+
+                let rows = sqlx::query(
+                    "SELECT id, version, project_id, owner_user_id, number, title, body, status
+                 FROM task
+                 WHERE deleted_at IS NULL AND (project_id = ? OR project_id LIKE ?)
+                 ORDER BY id
+                 LIMIT ?",
+                )
+                .bind(&scope.project_id)
+                .bind(subtree(&scope.project_id))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(internal)?;
+
+                let tasks = rows
+                    .iter()
+                    .map(row_to_task)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let response = ListTasksResponse {
+                    tasks,
+                    next_page_token: String::new(),
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                // The row count for a list is the LIST, not one. A blanket 1
+                // would make every page look like a single-row read.
+                rows: r.tasks.len() as u32,
+                ..Default::default()
+            },
+            status_name,
         )
-        .bind(&scope.project_id)
-        .bind(subtree(&scope.project_id))
-        .bind(limit)
-        .fetch_all(&self.pool)
         .await
-        .map_err(internal)?;
-
-        let tasks = rows
-            .iter()
-            .map(row_to_task)
-            .collect::<Result<Vec<_>, _>>()?;
-        let response = ListTasksResponse {
-            tasks,
-            next_page_token: String::new(),
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: response.tasks.len() as u32,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+        .map(Response::new)
     }
 
     async fn update_task(
@@ -247,54 +275,65 @@ impl TaskDbService for TaskDb {
     ) -> Result<Response<UpdateTaskResponse>, Status> {
         let req = request.into_inner();
         let call = Call::start("task-db", "UpdateTask", Kind::Write, tel_scope(&req.scope));
-        let scope = scope_of(&req.scope)?;
-        let task = req
-            .task
-            .ok_or_else(|| Status::invalid_argument("task is required"))?;
 
-        // Compare-and-set (D8). The version is in the WHERE, so a concurrent
-        // writer's update makes this one match zero rows rather than silently
-        // overwriting. FAILED_PRECONDITION is the contract's answer.
-        let result = sqlx::query(
-            "UPDATE task
-                SET title = ?, body = ?, status = ?, version = version + 1, updated_by = ?
-              WHERE id = ? AND version = ? AND deleted_at IS NULL
-                AND (project_id = ? OR project_id LIKE ?)",
-        )
-        .bind(&task.title)
-        .bind(&task.body)
-        .bind(task.status as i8)
-        .bind(&scope.user_id)
-        .bind(&req.id)
-        .bind(req.expect_version)
-        .bind(&scope.project_id)
-        .bind(subtree(&scope.project_id))
-        .execute(&self.pool)
-        .await
-        .map_err(internal)?;
+        call.run(
+            async move {
+                let scope = scope_of(&req.scope)?;
+                let task = req
+                    .task
+                    .ok_or_else(|| Status::invalid_argument("task is required"))?;
 
-        if result.rows_affected() == 0 {
-            return Err(Status::failed_precondition(
-                "version mismatch, or no such task in this scope — re-read and retry",
-            ));
-        }
+                // Compare-and-set (D8). The version is in the WHERE, so a concurrent
+                // writer's update makes this one match zero rows rather than silently
+                // overwriting. FAILED_PRECONDITION is the contract's answer.
+                let result = sqlx::query(
+                    "UPDATE task
+                    SET title = ?, body = ?, status = ?, version = version + 1, updated_by = ?
+                  WHERE id = ? AND version = ? AND deleted_at IS NULL
+                    AND (project_id = ? OR project_id LIKE ?)",
+                )
+                .bind(&task.title)
+                .bind(&task.body)
+                .bind(task.status as i8)
+                .bind(&scope.user_id)
+                .bind(&req.id)
+                .bind(req.expect_version)
+                .bind(&scope.project_id)
+                .bind(subtree(&scope.project_id))
+                .execute(&self.pool)
+                .await
+                .map_err(internal)?;
 
-        let response = UpdateTaskResponse {
-            meta: Some(Meta {
-                id: req.id,
-                version: req.expect_version + 1,
-                project_id: scope.project_id.clone(),
+                if result.rows_affected() == 0 {
+                    return Err(Status::failed_precondition(
+                        "version mismatch, or no such task in this scope — re-read and retry",
+                    ));
+                }
+
+                let response = UpdateTaskResponse {
+                    meta: Some(Meta {
+                        id: req.id,
+                        version: req.expect_version + 1,
+                        project_id: scope.project_id.clone(),
+                        ..Default::default()
+                    }),
+                };
+                Ok(response)
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                // The row count for a list is the LIST, not one. A blanket 1
+                // would make every page look like a single-row read.
+                rows: 1,
                 ..Default::default()
-            }),
-        };
-        call.finish(Outcome {
-            status: "OK",
-            payload: format!("{response:?}"),
-            class: Class::Envelope,
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(response))
+            },
+            status_name,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn delete_task(
@@ -303,38 +342,51 @@ impl TaskDbService for TaskDb {
     ) -> Result<Response<DeleteTaskResponse>, Status> {
         let req = request.into_inner();
         let call = Call::start("task-db", "DeleteTask", Kind::Write, tel_scope(&req.scope));
-        let scope = scope_of(&req.scope)?;
 
-        // Soft, and OWNER-ONLY (D26). The owner check is in the statement rather
-        // than a read-then-decide, so it cannot race with a change of owner.
-        let result = sqlx::query(
-            "UPDATE task SET deleted_at = CURRENT_TIMESTAMP, version = version + 1
-              WHERE id = ? AND version = ? AND deleted_at IS NULL
-                AND owner_user_id = ?
-                AND (project_id = ? OR project_id LIKE ?)",
+        call.run(
+            async move {
+                let scope = scope_of(&req.scope)?;
+
+                // Soft, and OWNER-ONLY (D26). The owner check is in the statement rather
+                // than a read-then-decide, so it cannot race with a change of owner.
+                let result = sqlx::query(
+                    "UPDATE task SET deleted_at = CURRENT_TIMESTAMP, version = version + 1
+                  WHERE id = ? AND version = ? AND deleted_at IS NULL
+                    AND owner_user_id = ?
+                    AND (project_id = ? OR project_id LIKE ?)",
+                )
+                .bind(&req.id)
+                .bind(req.expect_version)
+                .bind(&scope.user_id)
+                .bind(&scope.project_id)
+                .bind(subtree(&scope.project_id))
+                .execute(&self.pool)
+                .await
+                .map_err(internal)?;
+
+                if result.rows_affected() == 0 {
+                    return Err(Status::failed_precondition(
+                        "version mismatch, not the owner, or no such task in this scope",
+                    ));
+                }
+                // Nothing to measure — an empty response. Recorded anyway: a delete
+                // still costs time and still belongs in the count.
+                Ok(DeleteTaskResponse {})
+            },
+            |r| Outcome {
+                status: "OK",
+                payload: format!("{r:?}"),
+                encoded_bytes: Some(prost::Message::encoded_len(r) as u64),
+                class: Class::Envelope,
+                // DeleteTaskResponse is empty — nothing to measure. Still
+                // recorded: a delete costs time and belongs in the count.
+                rows: 1,
+                ..Default::default()
+            },
+            status_name,
         )
-        .bind(&req.id)
-        .bind(req.expect_version)
-        .bind(&scope.user_id)
-        .bind(&scope.project_id)
-        .bind(subtree(&scope.project_id))
-        .execute(&self.pool)
         .await
-        .map_err(internal)?;
-
-        if result.rows_affected() == 0 {
-            return Err(Status::failed_precondition(
-                "version mismatch, not the owner, or no such task in this scope",
-            ));
-        }
-        // Nothing to measure — an empty response. Recorded anyway: a delete
-        // still costs time and still belongs in the count.
-        call.finish(Outcome {
-            status: "OK",
-            rows: 1,
-            ..Default::default()
-        });
-        Ok(Response::new(DeleteTaskResponse {}))
+        .map(Response::new)
     }
 }
 
