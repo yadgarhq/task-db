@@ -2213,7 +2213,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "yadgar-store"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/store.git?rev=3b5fe6f5a4bcb7fbd6d5ee9d0005c2e39279eb2b#3b5fe6f5a4bcb7fbd6d5ee9d0005c2e39279eb2b"
+source = "git+https://github.com/yadgarhq/store.git?rev=76caf925da16f1dbb10ba68f79c22efb439a18ff#76caf925da16f1dbb10ba68f79c22efb439a18ff"
 dependencies = [
  "sqlx",
  "thiserror",
