@@ -24,7 +24,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 # The shared instrumentation seam (D67), pinned by revision like every in-org crate.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "117d889aa3d3ac3803b96b166cb335319572f991" }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = ["grpc"] }
 sqlx = { version = "0.9", default-features = false, features = [
   "runtime-tokio",
   "tls-rustls-ring",
