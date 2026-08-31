@@ -4,78 +4,28 @@
 //! panics rather than skips without an engine, for the reason D69 gives: a suite
 //! that quietly passes with nothing behind it is the failure it exists to catch.
 
-use sqlx::Connection;
+mod support;
+
+use support::{World, P_A, U1, U2};
 use tonic::Request;
-use yadgar_task_db::pb::yadgar::common::v1::Scope;
+use yadgar_task_db::pb::yadgar::common::v1::{Meta, Visibility};
 use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbService as _;
 use yadgar_task_db::pb::yadgar::task::v1::*;
-use yadgar_task_db::{schema, service::TaskDb};
 
-fn dsn() -> String {
-    std::env::var("YADGAR_TEST_DSN")
-        .expect("YADGAR_TEST_DSN is unset; these tests assert what a real MariaDB does")
-}
-
-async fn fresh(db: &str) -> TaskDb {
-    let mut root = sqlx::MySqlConnection::connect(&dsn())
-        .await
-        .expect("connect");
-    for stmt in [
-        format!("DROP DATABASE IF EXISTS {db}"),
-        format!("CREATE DATABASE {db}"),
-    ] {
-        // AUDIT: `db` is a literal in this file.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
-            .execute(&mut root)
-            .await
-            .expect("ddl");
-    }
-    let base = dsn()
-        .rsplit_once('/')
-        .expect("dsn has a database")
-        .0
-        .to_string();
-    let pool = sqlx::MySqlPool::connect(&format!("{base}/{db}"))
-        .await
-        .expect("pool");
-    yadgar_store::migrate::apply(&pool, &schema::migrations().expect("set"))
-        .await
-        .expect("migrate");
-    TaskDb::new(pool)
-}
-
-fn scope(project: &str, user: &str) -> Option<Scope> {
-    Some(Scope {
-        user_id: user.into(),
-        project_id: project.into(),
-        team_ids: vec![],
-        instance_id: "i-1".into(),
-        request_id: "r-1".into(),
-    })
-}
-
-fn new_task(title: &str) -> Option<Task> {
-    Some(Task {
+fn new_task(title: &str) -> Task {
+    Task {
         title: title.into(),
         body: "b".into(),
         status: TaskStatus::Open as i32,
         ..Default::default()
-    })
+    }
 }
 
 #[tokio::test]
 async fn numbers_are_per_project_and_start_at_one() {
-    let db = fresh("td_number").await;
+    let w = World::fresh("td_number").await;
     for (project, expected) in [("acme/a", 1), ("acme/a", 2), ("acme/b", 1)] {
-        let r = db
-            .create_task(Request::new(CreateTaskRequest {
-                scope: scope(project, "u1"),
-                task: new_task("t"),
-                idempotency: None,
-            }))
-            .await
-            .expect("create")
-            .into_inner();
+        let r = w.try_create(project, U1, "t").await.expect("create");
         assert_eq!(r.number, expected, "number is per-project, not global");
     }
 }
@@ -85,46 +35,22 @@ async fn numbers_are_per_project_and_start_at_one() {
 /// empty store rather than a scoping bug.
 #[tokio::test]
 async fn an_ancestor_scope_sees_descendant_tasks() {
-    let db = fresh("td_scope").await;
-    db.create_task(Request::new(CreateTaskRequest {
-        scope: scope("acme/qwfm/forecast", "u1"),
-        task: new_task("deep"),
-        idempotency: None,
-    }))
-    .await
-    .expect("create");
-
-    let listed = db
-        .list_tasks(Request::new(ListTasksRequest {
-            scope: scope("acme/qwfm", "u1"),
-            statuses: vec![],
-            page_size: 0,
-            page_token: String::new(),
-        }))
-        .await
-        .expect("list")
-        .into_inner();
-    assert_eq!(listed.tasks.len(), 1, "ancestor must reach the subtree");
+    let w = World::fresh("td_scope").await;
+    w.create("acme/qwfm/forecast", U1, "deep").await;
+    assert_eq!(
+        w.list("acme/qwfm", U1).await.len(),
+        1,
+        "ancestor must reach the subtree"
+    );
 }
 
 #[tokio::test]
 async fn another_project_cannot_read_the_task() {
-    let db = fresh("td_isolate").await;
-    let created = db
-        .create_task(Request::new(CreateTaskRequest {
-            scope: scope("acme/a", "u1"),
-            task: new_task("secret"),
-            idempotency: None,
-        }))
-        .await
-        .expect("create")
-        .into_inner();
+    let w = World::fresh("td_isolate").await;
+    let id = w.create(P_A, U1, "secret").await;
 
-    let err = db
-        .get_task(Request::new(GetTaskRequest {
-            scope: scope("other/z", "u1"),
-            key: Some(get_task_request::Key::Id(created.meta.unwrap().id)),
-        }))
+    let err = w
+        .read("other/z", U1, &id)
         .await
         .expect_err("a foreign project must not read this task");
     assert_eq!(err.code(), tonic::Code::NotFound);
@@ -133,34 +59,14 @@ async fn another_project_cannot_read_the_task() {
 /// D8: compare-and-set. A stale writer must be refused, not silently win.
 #[tokio::test]
 async fn a_stale_version_is_refused() {
-    let db = fresh("td_cas").await;
-    let id = db
-        .create_task(Request::new(CreateTaskRequest {
-            scope: scope("acme/a", "u1"),
-            task: new_task("t"),
-            idempotency: None,
-        }))
-        .await
-        .expect("create")
-        .into_inner()
-        .meta
-        .unwrap()
-        .id;
+    let w = World::fresh("td_cas").await;
+    let id = w.create(P_A, U1, "t").await;
 
-    let upd = |v: u64| UpdateTaskRequest {
-        scope: scope("acme/a", "u1"),
-        id: id.clone(),
-        expect_version: v,
-        task: new_task("changed"),
-        update_mask: None,
-        idempotency: None,
-    };
-
-    db.update_task(Request::new(upd(1)))
+    w.edit_as(&w.scope(P_A, U1), &id, "changed")
         .await
         .expect("first update wins");
-    let err = db
-        .update_task(Request::new(upd(1)))
+    let err = w
+        .edit_as(&w.scope(P_A, U1), &id, "changed again")
         .await
         .expect_err("the second writer at version 1 is stale");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -169,45 +75,28 @@ async fn a_stale_version_is_refused() {
 /// D26: delete is owner-only and soft.
 #[tokio::test]
 async fn only_the_owner_may_delete_and_the_row_survives() {
-    let db = fresh("td_delete").await;
-    let id = db
-        .create_task(Request::new(CreateTaskRequest {
-            scope: scope("acme/a", "owner"),
-            task: new_task("t"),
-            idempotency: None,
-        }))
-        .await
-        .expect("create")
-        .into_inner()
-        .meta
-        .unwrap()
-        .id;
+    let w = World::fresh("td_delete").await;
+    let id = w.create(P_A, U1, "t").await;
 
-    let err = db
-        .delete_task(Request::new(DeleteTaskRequest {
-            scope: scope("acme/a", "someone-else"),
-            id: id.clone(),
-            expect_version: 1,
-            idempotency: None,
-        }))
-        .await
-        .expect_err("a non-owner must not delete");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-
-    db.delete_task(Request::new(DeleteTaskRequest {
-        scope: scope("acme/a", "owner"),
+    let del = |user: &str| DeleteTaskRequest {
+        scope: w.scope(P_A, user),
         id: id.clone(),
         expect_version: 1,
         idempotency: None,
-    }))
-    .await
-    .expect("the owner may delete");
+    };
 
-    let err = db
-        .get_task(Request::new(GetTaskRequest {
-            scope: scope("acme/a", "owner"),
-            key: Some(get_task_request::Key::Id(id)),
-        }))
+    let err =
+        w.db.delete_task(Request::new(del(U2)))
+            .await
+            .expect_err("a non-owner must not delete");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    w.db.delete_task(Request::new(del(U1)))
+        .await
+        .expect("the owner may delete");
+
+    let err = w
+        .read(P_A, U1, &id)
         .await
         .expect_err("a soft-deleted task is not returned");
     assert_eq!(err.code(), tonic::Code::NotFound);
@@ -217,25 +106,168 @@ async fn only_the_owner_may_delete_and_the_row_survives() {
 /// that presents as an empty store rather than as a caller that forgot a field.
 #[tokio::test]
 async fn an_unset_page_size_returns_a_default_page() {
-    let db = fresh("td_page").await;
+    let w = World::fresh("td_page").await;
     for i in 0..3 {
-        db.create_task(Request::new(CreateTaskRequest {
-            scope: scope("acme/a", "u1"),
-            task: new_task(&format!("t{i}")),
+        w.create(P_A, U1, &format!("t{i}")).await;
+    }
+    assert_eq!(w.list(P_A, U1).await.len(), 3);
+}
+
+/// Accepted by the contract, forwarded by the logic service, and dropped on the
+/// floor: there were no columns, and `row_to_task` returned `Vec::new()` for
+/// both. A field a caller can set and never read back is worse than one that
+/// does not exist — it looks like it worked.
+#[tokio::test]
+async fn tags_and_links_round_trip() {
+    let w = World::fresh("td_tags").await;
+    let tags = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+    let links = vec!["yadgar:adr:12".to_string(), "yadgar:task:x".to_string()];
+
+    let id =
+        w.db.create_task(Request::new(CreateTaskRequest {
+            scope: w.scope(P_A, U1),
+            task: Some(Task {
+                tags: tags.clone(),
+                links: links.clone(),
+                ..new_task("tagged")
+            }),
             idempotency: None,
         }))
         .await
-        .expect("create");
-    }
-    let listed = db
-        .list_tasks(Request::new(ListTasksRequest {
-            scope: scope("acme/a", "u1"),
-            statuses: vec![],
-            page_size: 0,
-            page_token: String::new(),
-        }))
+        .expect("create")
+        .into_inner()
+        .meta
+        .expect("meta")
+        .id;
+
+    let read = w.read(P_A, U1, &id).await.expect("read");
+    assert_eq!(read.tags, tags, "order and duplicates must survive");
+    assert_eq!(read.links, links);
+
+    // And on the list path, which assembles rows by a different statement.
+    let listed = w.list(P_A, U1).await;
+    assert_eq!(listed[0].tags, tags);
+}
+
+#[tokio::test]
+async fn an_update_rewrites_tags_and_links() {
+    let w = World::fresh("td_tags_update").await;
+    let id = w.create(P_A, U1, "t").await;
+
+    let write = |tags: Vec<String>, mask: Option<Vec<&str>>, version: u64| UpdateTaskRequest {
+        scope: w.scope(P_A, U1),
+        id: id.clone(),
+        expect_version: version,
+        task: Some(Task {
+            tags,
+            ..new_task("t")
+        }),
+        update_mask: mask.map(|paths| prost_types::FieldMask {
+            paths: paths.into_iter().map(String::from).collect(),
+        }),
+        idempotency: None,
+    };
+
+    w.db.update_task(Request::new(write(
+        vec!["added".into()],
+        Some(vec!["tags"]),
+        1,
+    )))
+    .await
+    .expect("a mask that names tags writes them");
+    assert_eq!(
+        w.read(P_A, U1, &id).await.expect("read").tags,
+        vec!["added".to_string()]
+    );
+
+    // A caller built against the older contract cannot populate `tags`, so its
+    // empty vec is the field's zero value rather than an instruction. Treating
+    // it as one would erase a task's tags on every status change made by a pod
+    // that has not been upgraded yet.
+    w.db.update_task(Request::new(write(vec![], None, 2)))
         .await
-        .expect("list")
-        .into_inner();
-    assert_eq!(listed.tasks.len(), 3);
+        .expect("an unmasked update is still allowed");
+    assert_eq!(
+        w.read(P_A, U1, &id).await.expect("read").tags,
+        vec!["added".to_string()],
+        "an unmasked update must not erase tags it never knew about"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D42: the caller supplies CONTENT, never identity. Every Meta field is
+// assigned by the module.
+// ---------------------------------------------------------------------------
+
+/// Binding `meta.visibility` from the request let a caller publish a record to
+/// the whole organisation, or — via the `unwrap_or(1)` default — persist
+/// `VISIBILITY_UNSPECIFIED`, which common.proto says is never stored.
+#[tokio::test]
+async fn a_caller_supplied_identity_is_refused() {
+    let w = World::fresh("td_meta_vis").await;
+
+    for meta in [
+        Meta {
+            visibility: Visibility::Org as i32,
+            ..Default::default()
+        },
+        Meta {
+            team_id: "someone-elses-team".into(),
+            ..Default::default()
+        },
+        Meta {
+            owner_user_id: U2.into(),
+            ..Default::default()
+        },
+        Meta {
+            id: "yadgar:task:chosen-by-the-caller".into(),
+            ..Default::default()
+        },
+    ] {
+        let err =
+            w.db.create_task(Request::new(CreateTaskRequest {
+                scope: w.scope(P_A, U1),
+                task: Some(Task {
+                    meta: Some(meta.clone()),
+                    ..new_task("t")
+                }),
+                idempotency: None,
+            }))
+            .await
+            .expect_err("identity is assigned by the module, not supplied (D42)");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "for {meta:?}");
+    }
+}
+
+/// The other half, and the one that actually catches the binding: what ends up
+/// in the column. Refusing a populated Meta proves nothing if the accepted path
+/// still takes the caller's word.
+#[tokio::test]
+async fn the_module_assigns_the_most_restrictive_visibility() {
+    let w = World::fresh("td_meta_default").await;
+    let id = w.create(P_A, U1, "t").await;
+
+    assert_eq!(
+        w.stored_visibility(&id).await,
+        Visibility::Private as i8,
+        "D12 defaults to the most restrictive rung, and it is never UNSPECIFIED"
+    );
+    assert_eq!(w.stored_team(&id).await, "");
+}
+
+/// An empty Meta is what the logic service actually sends, and it must stay the
+/// ordinary case rather than tripping the guard above.
+#[tokio::test]
+async fn an_empty_meta_is_accepted() {
+    let w = World::fresh("td_meta_empty").await;
+    w.db.create_task(Request::new(CreateTaskRequest {
+        scope: w.scope(P_A, U1),
+        task: Some(Task {
+            meta: Some(Meta::default()),
+            ..new_task("t")
+        }),
+        idempotency: None,
+    }))
+    .await
+    .expect("an empty Meta carries no identity and is fine");
 }

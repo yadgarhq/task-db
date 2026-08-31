@@ -6,8 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+mod idem;
+mod read;
+mod rows;
 pub mod schema;
 pub mod service;
+mod sql;
+mod write;
 
 /// Generated from the vendored contract (D16, D70).
 ///
