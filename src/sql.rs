@@ -122,11 +122,7 @@ impl Reach {
     /// project, and matching the subtree there would let an ancestor scope find
     /// several different tasks numbered 1 and return whichever came first.
     pub fn visible(&self) -> String {
-        let (private, team, org) = (
-            Visibility::Private as i8,
-            Visibility::Team as i8,
-            Visibility::Org as i8,
-        );
+        let (team, org) = (Visibility::Team as i8, Visibility::Org as i8);
         // An empty team list drops the TEAM arm entirely. Rendering `IN ()` is a
         // syntax error, and rendering the arm without it is worse: `visibility =
         // 2` alone would make every team record visible to everybody.
@@ -136,7 +132,17 @@ impl Reach {
             let holes = vec!["?"; self.teams.len()].join(", ");
             format!(" OR (visibility = {team} AND team_id IN ({holes}))")
         };
-        format!("(visibility = {org} OR (visibility = {private} AND owner_user_id = ?){team_arm})")
+        // The PRIVATE rung is "anything that is not one of the wider two",
+        // rather than `visibility = 1`, and that is the difference between
+        // failing closed and failing INVISIBLE. `unwrap_or(1)` used to accept
+        // VISIBILITY_UNSPECIFIED, so rows carrying 0 may exist; against three
+        // equality arms such a row matches none of them and becomes unreadable
+        // by everyone including its owner — a quiet way to lose data that no
+        // test starting from an empty table can see. Migration 5 heals the rows
+        // themselves; this makes any value nobody anticipated land on the most
+        // restrictive rung that still has an owner, which is what D12 says the
+        // default is.
+        format!("(visibility = {org} OR (visibility NOT IN ({team}, {org}) AND owner_user_id = ?){team_arm})")
     }
 
     /// Bind what [`Reach::predicate`] left holes for, in the same order.

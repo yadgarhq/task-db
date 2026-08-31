@@ -219,8 +219,14 @@ impl World {
     /// Promote a record past PRIVATE. There is no RPC for this on purpose (D42),
     /// so the fixture writes the column directly.
     pub async fn promote(&self, id: &str, visibility: Visibility, team_id: &str) {
+        self.set_visibility(id, visibility as i8, team_id).await
+    }
+
+    /// The same thing without the enum, for the values the enum forbids and the
+    /// old code wrote anyway.
+    pub async fn set_visibility(&self, id: &str, visibility: i8, team_id: &str) {
         sqlx::query("UPDATE task SET visibility = ?, team_id = ? WHERE id = ?")
-            .bind(visibility as i8)
+            .bind(visibility)
             .bind(team_id)
             .bind(id)
             .execute(&self.pool)

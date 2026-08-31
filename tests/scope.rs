@@ -190,6 +190,32 @@ async fn a_caller_in_no_teams_sees_no_team_tasks() {
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
+/// `unwrap_or(1)` accepted `VISIBILITY_UNSPECIFIED`, so rows carrying 0 may
+/// exist in a live store — and nothing noticed, because nothing read the column.
+///
+/// A ladder of three equality arms matches such a row on NONE of them, which
+/// turns the fix for a leak into a quiet loss of access: unreadable by everyone
+/// including its owner, while still looking perfectly present in the table. The
+/// rung is therefore "not one of the wider two" rather than `= 1`, and migration
+/// 5 heals the stored rows so the invariant holds in the table too.
+#[tokio::test]
+async fn a_row_with_an_unrecognised_visibility_falls_back_to_private() {
+    let c = two_projects_two_users("td_vis_zero").await;
+    c.set_visibility(&c.u1_private, 0, "").await;
+
+    let owner = c
+        .read(P_A, U1, &c.u1_private)
+        .await
+        .expect("the owner must not lose a record to a value nobody anticipated");
+    assert_eq!(owner.title, "u1 private");
+
+    let err = c
+        .read(P_A, U2, &c.u1_private)
+        .await
+        .expect_err("and it must fall back to the RESTRICTIVE rung, not the open one");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
 #[tokio::test]
 async fn an_org_task_is_visible_to_everyone_in_the_project() {
     let c = two_projects_two_users("td_vis_org").await;
