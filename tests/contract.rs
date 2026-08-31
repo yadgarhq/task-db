@@ -154,23 +154,43 @@ async fn an_update_rewrites_tags_and_links() {
     let w = World::fresh("td_tags_update").await;
     let id = w.create(P_A, U1, "t").await;
 
-    w.db.update_task(Request::new(UpdateTaskRequest {
+    let write = |tags: Vec<String>, mask: Option<Vec<&str>>, version: u64| UpdateTaskRequest {
         scope: w.scope(P_A, U1),
         id: id.clone(),
-        expect_version: 1,
+        expect_version: version,
         task: Some(Task {
-            tags: vec!["added".into()],
+            tags,
             ..new_task("t")
         }),
-        update_mask: None,
+        update_mask: mask.map(|paths| prost_types::FieldMask {
+            paths: paths.into_iter().map(String::from).collect(),
+        }),
         idempotency: None,
-    }))
-    .await
-    .expect("update");
+    };
 
+    w.db.update_task(Request::new(write(
+        vec!["added".into()],
+        Some(vec!["tags"]),
+        1,
+    )))
+    .await
+    .expect("a mask that names tags writes them");
     assert_eq!(
         w.read(P_A, U1, &id).await.expect("read").tags,
         vec!["added".to_string()]
+    );
+
+    // A caller built against the older contract cannot populate `tags`, so its
+    // empty vec is the field's zero value rather than an instruction. Treating
+    // it as one would erase a task's tags on every status change made by a pod
+    // that has not been upgraded yet.
+    w.db.update_task(Request::new(write(vec![], None, 2)))
+        .await
+        .expect("an unmasked update is still allowed");
+    assert_eq!(
+        w.read(P_A, U1, &id).await.expect("read").tags,
+        vec!["added".to_string()],
+        "an unmasked update must not erase tags it never knew about"
     );
 }
 

@@ -315,6 +315,11 @@ impl Field {
         Field::Links,
     ];
 
+    /// What an update wrote before masks were honoured and before `tags` and
+    /// `links` had columns — which is exactly the set an unmasked caller can
+    /// know about. See [`fields_of`].
+    const BEFORE_THE_MASK: [Field; 3] = [Field::Title, Field::Body, Field::Status];
+
     fn column(self) -> &'static str {
         match self {
             Field::Title => "title",
@@ -344,14 +349,21 @@ impl Field {
     }
 }
 
-/// An absent or empty mask means every field, which is what this service did
-/// before it read the mask at all — so an older caller keeps its behaviour.
+/// An absent or empty mask means the fields an update wrote BEFORE the mask was
+/// honoured — title, body and status — and deliberately not `tags` or `links`.
+///
+/// "Absent means everything" is the obvious reading and it loses data during a
+/// rollout. A caller built against the older contract cannot populate `tags`,
+/// so its request carries the empty vec that is the field's zero value; treating
+/// that as an instruction would erase a task's tags on every status change made
+/// by a pod that has not been upgraded yet. A caller that wants to write them
+/// names them, which an old caller cannot do and a new one always does.
 ///
 /// A mask that NAMES fields is honoured, and that is what lets `EditTask` write
-/// a title without also writing a status it had to read first.
+/// a title without also writing the status it had to read first.
 fn fields_of(mask: Option<&FieldMask>) -> Result<Vec<Field>, Status> {
     let Some(mask) = mask.filter(|m| !m.paths.is_empty()) else {
-        return Ok(Field::ALL.to_vec());
+        return Ok(Field::BEFORE_THE_MASK.to_vec());
     };
     mask.paths
         .iter()
