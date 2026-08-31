@@ -12,13 +12,35 @@
 use yadgar_store::migrate::{Migration, MigrationError, MigrationSet};
 
 pub fn migrations() -> Result<MigrationSet, MigrationError> {
-    MigrationSet::new(vec![
+    MigrationSet::new(all())
+}
+
+/// The same set, truncated at `version`.
+///
+/// **This exists because a data migration is untestable without it.** Migration
+/// 5 heals rows that a database created today cannot contain: a fixture that
+/// only ever builds from the whole set has no way to present the BEFORE state,
+/// so the one migration that touches existing rows was the one migration no
+/// test could reach. Truncating the set is the seam — a test builds a database
+/// at 4, writes the rows the old code wrote, and then runs the ordinary
+/// `apply` against the full set, which is the production path rather than a
+/// second one.
+///
+/// Nothing in the service calls this; the service always migrates to head.
+pub fn migrations_upto(version: u64) -> Result<MigrationSet, MigrationError> {
+    MigrationSet::new(all().into_iter().filter(|m| m.version <= version).collect())
+}
+
+/// One list, in one place, so `migrations` and `migrations_upto` cannot drift
+/// into disagreeing about what the set is.
+fn all() -> Vec<Migration> {
+    vec![
         create_task(),
         task_tags_and_links(),
         task_number_counter(),
         task_write_idempotency(),
         heal_unspecified_visibility(),
-    ])
+    ]
 }
 
 /// `id` is a URN carrying a UUIDv7 (D42) — never the engine's integer key, which
