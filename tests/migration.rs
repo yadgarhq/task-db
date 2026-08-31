@@ -86,10 +86,17 @@ async fn migration_5_heals_only_the_values_the_enum_forbids() {
     );
 }
 
-/// Applying it twice changes nothing further, which is what lets it sit in a
-/// set every replica runs.
+/// A second `apply` runs nothing and moves nothing.
+///
+/// Named for what it PROVES rather than for what it is tempting to claim. This
+/// is the ledger declining to re-run a recorded migration — the migration's own
+/// SQL never executes a second time — so it is not evidence that migration 5 is
+/// idempotent in itself. Executing the statement twice by hand would be the
+/// second apply path this file exists to avoid, so the honest thing is the
+/// narrower name: after migrating to head, migrating again is a no-op, and the
+/// row healed on the first pass is still what it was.
 #[tokio::test]
-async fn migration_5_is_idempotent() {
+async fn a_second_apply_finds_nothing_pending() {
     let w = World::fresh_at("td_mig5_again", 4).await;
     let healed = w.seed_row(P_A, U1, 1, UNSPECIFIED, "").await;
 
@@ -102,7 +109,7 @@ async fn migration_5_is_idempotent() {
     assert_eq!(
         w.stored_visibility(&healed).await,
         Visibility::Private as i8,
-        "the healed value is itself valid, so re-running cannot move it"
+        "and leaves the row the first pass healed alone"
     );
 }
 
