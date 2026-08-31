@@ -66,7 +66,18 @@ pub struct World {
 
 impl World {
     pub async fn fresh(name: &str) -> Self {
-        Self::build(name, None).await
+        Self::build(name, None, None).await
+    }
+
+    /// A database at migration `version` and no further — the state a data
+    /// migration has to be handed in order to be tested at all.
+    ///
+    /// Every other constructor here builds from the WHOLE set, which is why the
+    /// one migration that heals existing rows had no test: the rows it heals
+    /// cannot exist in a database the current set created. This stops short, so
+    /// a test can write the BEFORE state itself and then migrate over it.
+    pub async fn fresh_at(name: &str, version: u64) -> Self {
+        Self::build(name, None, Some(version)).await
     }
 
     /// The same service against a pool that waits one second for a row lock
@@ -74,10 +85,23 @@ impl World {
     /// uses this, and a test that takes fifty seconds to observe it is a test
     /// nobody runs.
     pub async fn impatient(name: &str) -> Self {
-        Self::build(name, Some(1)).await
+        Self::build(name, Some(1), None).await
     }
 
-    async fn build(name: &str, lock_wait_secs: Option<u32>) -> Self {
+    /// Apply whatever is still pending, and answer with the version now
+    /// applied.
+    ///
+    /// The ORDINARY entry point against the FULL set, deliberately: the ledger
+    /// says 4, so `apply` selects migration 5 by itself. Handing it a set
+    /// containing only the migration under test would exercise a path
+    /// production never takes and would prove the test, not the migration.
+    pub async fn migrate_to_head(&self) -> u64 {
+        yadgar_store::migrate::apply(&self.pool, &schema::migrations().expect("set"))
+            .await
+            .expect("migrate")
+    }
+
+    async fn build(name: &str, lock_wait_secs: Option<u32>, upto: Option<u64>) -> Self {
         let mut root = sqlx::MySqlConnection::connect(&dsn())
             .await
             .expect("connect");
@@ -106,7 +130,11 @@ impl World {
             .connect(&format!("{}/{name}", base()))
             .await
             .expect("pool");
-        yadgar_store::migrate::apply(&pool, &schema::migrations().expect("set"))
+        let set = match upto {
+            Some(version) => schema::migrations_upto(version).expect("set"),
+            None => schema::migrations().expect("set"),
+        };
+        yadgar_store::migrate::apply(&pool, &set)
             .await
             .expect("migrate");
         Self {
@@ -262,6 +290,46 @@ impl World {
             .fetch_one(&self.pool)
             .await
             .expect("count")
+    }
+
+    /// One row written straight into the table, with `visibility` as a raw
+    /// integer — including the values the enum forbids and the old code wrote
+    /// anyway. Answers with the id.
+    ///
+    /// Not created through the service and then corrected: the service assigns
+    /// visibility itself (D42), so routing an OLD row through TODAY's writer
+    /// would make the fixture depend on the very behaviour the migration exists
+    /// to compensate for. The row a pre-migration database holds is written the
+    /// way that database's code wrote it.
+    pub async fn seed_row(
+        &self,
+        project: &str,
+        user: &str,
+        number: u32,
+        visibility: i8,
+        team_id: &str,
+    ) -> String {
+        let id = format!("yadgar:task:pre-{project}-{number:05}");
+        sqlx::query(
+            "INSERT INTO task
+               (id, project_id, owner_user_id, team_id, visibility, created_by,
+                updated_by, number, title, body, status, tags, links)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'b', ?, '[]', '[]')",
+        )
+        .bind(&id)
+        .bind(project)
+        .bind(user)
+        .bind(team_id)
+        .bind(visibility)
+        .bind(user)
+        .bind(user)
+        .bind(number)
+        .bind(format!("seeded {number}"))
+        .bind(TaskStatus::Open as i8)
+        .execute(&self.pool)
+        .await
+        .expect("seed row");
+        id
     }
 
     /// Rows inserted straight into the table, for the tests that need more of
