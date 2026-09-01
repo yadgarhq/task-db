@@ -1,4 +1,8 @@
-//! D9: a repeated idempotency key is a REPLAY, never a failure.
+//! D9: a repeated idempotency key is a REPLAY, never a failure — for the
+//! identical retry the rule was written for. As amended, D9 also settles the
+//! case it used to leave open: a repeated key carrying a DIFFERENT payload is
+//! refused with `INVALID_ARGUMENT` rather than replayed, because replaying it
+//! would answer a request nobody made and report success.
 //!
 //! Behind a load balancer with retries a write fires more than once. The second
 //! delivery must return the first one's outcome — not perform the write again,
@@ -10,6 +14,17 @@
 //! that it happened commit together or not at all. A write that fails leaves no
 //! claim, which makes its retry a fresh attempt rather than a replay of
 //! something that never happened.
+//!
+//! This module does not implement the amendment yet. `replay` below refuses a
+//! reused key only when the stored `rpc` differs from the one asked for — a key
+//! reused for the SAME rpc with a different payload still falls through and
+//! replays. `task_write` persists the prior RESPONSE, not the prior request, so
+//! there is nothing here to compare a new payload against; closing the gap
+//! needs a request-fingerprint column and a migration in `src/schema.rs`, and
+//! it DOES touch this file: `claim`'s signature has to take the payload, its
+//! INSERT has to bind the new column, the locking SELECT in `replay` has to
+//! read it back, and the comparison lands beside `if row.0 != rpc`. That is a
+//! known gap, not an oversight, and it is booked as O21 in the decision record.
 
 use prost::Message;
 use sqlx::{MySql, Transaction};
