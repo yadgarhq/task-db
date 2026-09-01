@@ -1,10 +1,32 @@
-//! D9: a repeated key is a REPLAY, never a failure.
+//! D9: a repeated key is a REPLAY, never a failure — for the identical retry
+//! the rule was written for. As amended, D9 also refuses a repeated key
+//! carrying a DIFFERENT payload, with `INVALID_ARGUMENT`, rather than
+//! replaying it.
 //!
 //! Behind a retrying load balancer a write fires more than once, and the second
 //! delivery must return the first one's outcome rather than performing the write
 //! again or reporting an error. Reporting an error is the worse of the two:
 //! under D39 it tells an instance its write failed when the record exists, which
 //! it then "rectifies" by writing a duplicate.
+//!
+//! Every replay test below sends the SAME payload twice, which is the case D9
+//! always covered and this module already handles. None of them exercises the
+//! differing-payload case the amendment adds: `task_write` stores the prior
+//! response, not the prior request, so this module cannot yet compare payloads,
+//! and `a_key_reused_for_a_different_operation_is_refused` still only refuses a
+//! reused key across a DIFFERENT rpc, not a differing payload under the same
+//! one. Do not read `a_replayed_create_returns_the_original_and_writes_once` as
+//! contradicting amended D9 — it asserts the same-payload case, which the
+//! amendment leaves untouched, and "fixing" the contradiction by deleting it
+//! would be wrong. Watch `a_failed_write_leaves_no_claim_behind` more closely:
+//! it reuses `k-fail` under `UpdateTask` with a genuinely DIFFERENT payload
+//! (`expect_version: 99` then `expect_version: 1`, "nope" then "corrected") and
+//! the second call succeeds — surface-identical to what the amendment refuses.
+//! It is not that case: the first call's failure leaves no committed claim, so
+//! the second finds no repeated key to refuse and never reaches `replay` at
+//! all. The gap is known, not an oversight, and it is booked as O21 in the
+//! decision record; see `src/idem.rs` for where the comparison would have to
+//! live.
 
 mod support;
 
