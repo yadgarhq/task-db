@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boot;
 mod idem;
 mod read;
 mod rows;
