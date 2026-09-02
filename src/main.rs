@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // structural rather than tidy: the downgrade this guards against is a
     // listener that opens in cleartext because TLS configuration failed, and
     // with one construction site there is nowhere else to write it.
-    let tls = boot::ServeTls::from_env(boot::SERVE).map_err(|e| e.to_string())?;
+    let tls = boot::ServeTls::from_env(boot::LISTEN).map_err(|e| e.to_string())?;
     let mut server = boot::server(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The credential never arrives as an environment variable — it is a mounted
@@ -111,13 +111,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50051").parse()?;
+
+    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
+    // than an accident of where the line sits. `boot::shutdown` installs both
+    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // the first poll of the future would otherwise take the process's default
+    // disposition and kill it outright, mid-transaction.
+    //
+    // Stringified like every other refusal in this function, for the reason
+    // given above.
+    let shutdown = boot::shutdown().map_err(|e| e.to_string())?;
+
     tracing::info!(%addr, tls = tls.is_some(), "task-db listening");
     server
         .add_service(TaskDbServiceServer::new(TaskDb::new(pool)))
-        .serve_with_shutdown(addr, async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
     Ok(())
