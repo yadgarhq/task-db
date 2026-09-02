@@ -47,6 +47,22 @@ const OBSOLETE_TLS_KEY: &str = "DB_REQUIRE_TLS";
 /// The key that replaced it.
 const SSL_MODE_KEY: &str = "DB_SSL_MODE";
 
+/// The key naming the authority the verifying modes check the engine against.
+///
+/// **`DB_SSL_*` rather than `DB_TLS_*`, and the difference is deliberate.** The
+/// prefix rule this module already follows for [`LISTEN`] gives `DB` either way
+/// — a connection OUT is named for what it reaches. What differs is the middle
+/// word, and the gate decides it. Every `<UPSTREAM>_TLS_*` family in the estate,
+/// including the `TASK_DB_TLS_*` that `task` uses to reach THIS module, is gated
+/// by a boolean `_TLS_ENABLED`. This dial has no such flag: it is gated by
+/// five-valued [`SSL_MODE_KEY`], and this file is meaningful under two of those
+/// values and inert under three. A `DB_TLS_CA_FILE` read beside a `DB_SSL_MODE`
+/// in this same function would be two words for one concept inside one pair of
+/// keys — the defect the naming rule exists to prevent rather than an instance
+/// of it. `SSL` also names what it fills: sqlx's `ssl_ca`, on
+/// [`yadgar_store::pool::PoolConfig::ssl_ca`].
+const SSL_CA_KEY: &str = "DB_SSL_CA_FILE";
+
 /// The environment variables this module's own listener is configured from:
 /// `LISTEN_TLS_ENABLED`, `LISTEN_TLS_CERT_FILE` and `LISTEN_TLS_KEY_FILE`.
 ///
@@ -94,6 +110,17 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
         replicas: env_or(&env, "REPLICAS", "2").parse()?,
         engine_max_connections: env_or(&env, "DB_ENGINE_MAX_CONNECTIONS", "151").parse()?,
         ssl_mode: parse_ssl_mode(&env_or(&env, SSL_MODE_KEY, DEFAULT_SSL_MODE))?,
+        // TRIMMED AND EMPTY-FILTERED, unlike every value above, because this one
+        // is an `Option` and Helm renders an unset value as `""`. Without the
+        // filter that empty string becomes `Some(PathBuf::new())` — a path sqlx
+        // opens and cannot, so a deployment that never asked for certificate
+        // verification fails to boot. Absent and empty must mean the same thing:
+        // no authority named, which is what `None` is. Same shape as
+        // `ServeTls::from_lookup` below, for the same reason.
+        ssl_ca: env(SSL_CA_KEY)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
     })
 }
 
@@ -337,7 +364,11 @@ pub enum BootError {
          an operator who set it is asking for a transport guarantee, and silently \
          substituting a default is the one outcome worse than stopping. \
          DB_REQUIRE_TLS was a boolean and could not ask for certificate \
-         verification at all; verify_ca and verify_identity are why it is gone."
+         verification at all; verify_ca and verify_identity are why it is gone. \
+         Both check the engine's certificate against the authority named by \
+         DB_SSL_CA_FILE; with none named they check the PUBLIC WEB ROOTS instead, \
+         which sign no operator-issued engine certificate. Set both keys together \
+         or neither."
     )]
     ObsoleteRequireTls,
 
@@ -437,6 +468,7 @@ mod tests {
             replicas: 2,
             engine_max_connections: 151,
             ssl_mode: mode,
+            ssl_ca: None,
         }
     }
 
@@ -501,6 +533,49 @@ mod tests {
 
         let config = pool_config(env_of(&[("DB_SSL_MODE", "VERIFY_CA")])).expect("config");
         assert!(matches!(config.ssl_mode, MySqlSslMode::VerifyCa));
+    }
+
+    /// A SENTINEL: nothing in this module or in `store` could produce this path,
+    /// so a test that sees it saw it travel from the environment.
+    const SENTINEL_CA: &str = "/etc/yadgar/pangolin-7c21/engine-authority.pem";
+
+    #[test]
+    fn the_configured_certificate_authority_reaches_the_pool() {
+        // A MODE IS NOT THE CAPABILITY, and the test above pins only the mode.
+        // `verify_ca` and `verify_identity` check a CHAIN, and until this key
+        // existed no value named the authority to check it against — so sqlx
+        // fell back to the public web roots, which sign no operator-issued
+        // engine certificate.
+        let config = pool_config(env_of(&[("DB_SSL_CA_FILE", SENTINEL_CA)])).expect("config");
+
+        assert_eq!(
+            config.ssl_ca.as_deref(),
+            Some(Path::new(SENTINEL_CA)),
+            "the configured authority did not reach the pool configuration"
+        );
+    }
+
+    #[test]
+    fn an_unset_or_empty_authority_is_no_authority_rather_than_an_empty_path() {
+        // UNSET is the shipped deployment and must stay `None`: `Some` here
+        // would name a file sqlx then fails to open, and a default CA path is a
+        // policy this module has no business inventing — an Azure MySQL engine
+        // whose authority IS a public root legitimately configures none.
+        assert_eq!(pool_config(env_of(&[])).expect("config").ssl_ca, None);
+
+        // EMPTY is the same statement written by a chart. Helm renders an unset
+        // value as "", so a naive read turns "no authority" into `PathBuf::new()`
+        // — a path sqlx opens and cannot, failing the boot of every deployment
+        // that never asked for verification at all.
+        for value in ["", " ", "\t", "\n"] {
+            assert_eq!(
+                pool_config(env_of(&[("DB_SSL_CA_FILE", value)]))
+                    .expect("config")
+                    .ssl_ca,
+                None,
+                "{value:?} must mean no authority, not an unopenable path"
+            );
+        }
     }
 
     #[test]
