@@ -77,12 +77,17 @@ async fn migration_5_heals_only_the_values_the_enum_forbids() {
         "an ORG row is already valid and must survive untouched"
     );
 
-    // Last on purpose. It corroborates that migration 5 is what did the above
-    // and asserts nothing about the rows itself, so putting it first would let
-    // a bookkeeping detail be the failure a broken heal reports.
+    // Last on purpose. It corroborates that migration 5 ran at all and asserts
+    // nothing about the rows itself, so putting it first would let a
+    // bookkeeping detail be the failure a broken heal reports.
+    //
+    // `apply` answers with HEAD, not with the last migration this test cares
+    // about, so the number moves whenever one is appended — it was 5 until the
+    // fingerprint column became 6. The heal is still what the assertions above
+    // observe; this one only says the ledger advanced past it.
     assert_eq!(
-        applied, 5,
-        "the fixture stopped at 4, so `apply` had exactly migration 5 to run"
+        applied, 6,
+        "the fixture stopped at 4, so `apply` ran migration 5 and everything appended after it"
     );
 }
 
@@ -103,8 +108,8 @@ async fn a_second_apply_finds_nothing_pending() {
     w.migrate_to_head().await;
     assert_eq!(
         w.migrate_to_head().await,
-        5,
-        "a second apply finds nothing pending and stays at 5"
+        6,
+        "a second apply finds nothing pending and stays at head"
     );
     assert_eq!(
         w.stored_visibility(&healed).await,

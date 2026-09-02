@@ -40,6 +40,7 @@ fn all() -> Vec<Migration> {
         task_number_counter(),
         task_write_idempotency(),
         heal_unspecified_visibility(),
+        task_write_request_fingerprint(),
     ]
 }
 
@@ -171,5 +172,32 @@ fn heal_unspecified_visibility() -> Migration {
         version: 5,
         name: "heal_unspecified_visibility".into(),
         sql: "UPDATE task SET visibility = 1 WHERE visibility NOT IN (1, 2, 3)".into(),
+    }
+}
+
+/// The column D9's amendment needs, and the one O21 books as this module's
+/// debt.
+///
+/// A uniqueness constraint on the key detects a REPEAT; it cannot detect a
+/// DIFFERING repeat. `task_write` kept the prior RESPONSE and never the prior
+/// request, so comparing payloads was structurally impossible here — which is
+/// why a key reused with a different payload was replayed and the operation the
+/// caller actually asked for was discarded.
+///
+/// A SHA-256 digest, so it is exactly 32 bytes and `BINARY(32)` never pads.
+///
+/// **NULLABLE, and that is the load-bearing part.** Every row written before
+/// this migration has no fingerprint, and NULL is the only value that means
+/// "there is nothing to compare against". `NOT NULL DEFAULT ''` would make an
+/// identical retry of a pre-migration key mismatch the empty string and be
+/// REFUSED — D9's core rule regressed by the migration implementing D9's
+/// amendment. An absent fingerprint replays, exactly as it did before.
+fn task_write_request_fingerprint() -> Migration {
+    Migration {
+        version: 6,
+        name: "task_write_request_fingerprint".into(),
+        sql: "ALTER TABLE task_write
+                ADD COLUMN request_fingerprint BINARY(32) NULL DEFAULT NULL"
+            .into(),
     }
 }

@@ -271,3 +271,61 @@ async fn an_empty_meta_is_accepted() {
     .await
     .expect("an empty Meta carries no identity and is fine");
 }
+
+/// The three fields the guard did not name. `Meta` carries `created_at`,
+/// `updated_at` and `deleted_at`, and the check beside them listed the other
+/// nine — so a caller could set any of the three and receive OK.
+///
+/// Nothing wrong reached the columns: `insert` never binds them and the engine
+/// defaults them itself. That is what kept this invisible, and it is not a
+/// defence. The caller asked for something, the module discarded it, and the
+/// answer reported success — the same class as an identity a caller names for
+/// itself, and the same reason D9's amendment refuses a request it would
+/// otherwise silently drop.
+///
+/// The fixture's timestamp is one this module could not have produced: the
+/// first day of the year 2000, long before any of these rows exist.
+#[tokio::test]
+async fn a_caller_supplied_timestamp_is_refused() {
+    let w = World::fresh("td_meta_time").await;
+    let impossible = prost_types::Timestamp {
+        seconds: 946_684_800,
+        nanos: 0,
+    };
+
+    for meta in [
+        Meta {
+            created_at: Some(impossible),
+            ..Default::default()
+        },
+        Meta {
+            updated_at: Some(impossible),
+            ..Default::default()
+        },
+        Meta {
+            deleted_at: Some(impossible),
+            ..Default::default()
+        },
+    ] {
+        let err =
+            w.db.create_task(Request::new(CreateTaskRequest {
+                scope: w.scope(P_A, U1),
+                task: Some(Task {
+                    meta: Some(meta.clone()),
+                    ..new_task("stamped")
+                }),
+                idempotency: None,
+            }))
+            .await
+            .expect_err("timestamps are assigned by this module, not supplied (D42)");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "for {meta:?}");
+    }
+
+    // The half a status code alone cannot prove: a refused create wrote
+    // nothing, so no row carries the year 2000 either.
+    assert_eq!(
+        w.count_titled("stamped").await,
+        0,
+        "a refused create must leave no row behind"
+    );
+}
