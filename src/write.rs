@@ -3,6 +3,7 @@
 //! One RPC is one transaction (D5), and the D9 claim is taken inside it, so a
 //! write and the record that it happened commit together or not at all.
 
+use prost::Message as _;
 use prost_types::FieldMask;
 use sqlx::mysql::MySqlArguments;
 use sqlx::query::Query;
@@ -29,8 +30,14 @@ impl TaskDb {
         assigned_by_the_module(task.meta.as_ref())?;
 
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Claimed::Replay(original) =
-            idem::claim(&mut tx, scope, "CreateTask", req.idempotency.as_ref()).await?
+        if let Claimed::Replay(original) = idem::claim(
+            &mut tx,
+            scope,
+            "CreateTask",
+            req.idempotency.as_ref(),
+            || req.payload(),
+        )
+        .await?
         {
             tx.rollback().await.map_err(internal)?;
             return Ok(original);
@@ -122,8 +129,14 @@ impl TaskDb {
         let reach = Reach::of(scope);
 
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Claimed::Replay(original) =
-            idem::claim(&mut tx, scope, "UpdateTask", req.idempotency.as_ref()).await?
+        if let Claimed::Replay(original) = idem::claim(
+            &mut tx,
+            scope,
+            "UpdateTask",
+            req.idempotency.as_ref(),
+            || req.payload(),
+        )
+        .await?
         {
             tx.rollback().await.map_err(internal)?;
             return Ok(original);
@@ -189,8 +202,14 @@ impl TaskDb {
         let reach = Reach::of(scope);
 
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Claimed::Replay(original) =
-            idem::claim(&mut tx, scope, "DeleteTask", req.idempotency.as_ref()).await?
+        if let Claimed::Replay(original) = idem::claim(
+            &mut tx,
+            scope,
+            "DeleteTask",
+            req.idempotency.as_ref(),
+            || req.payload(),
+        )
+        .await?
         {
             tx.rollback().await.map_err(internal)?;
             return Ok(original);
@@ -230,6 +249,59 @@ impl TaskDb {
         idem::record(&mut tx, scope, req.idempotency.as_ref(), &response).await?;
         tx.commit().await.map_err(internal)?;
         Ok(response)
+    }
+}
+
+/// The bytes D9's fingerprint is taken over.
+///
+/// Which fields count as the payload is per-RPC, and D9 requires that written
+/// down rather than inferred. This module's answer is the same for all three of
+/// its mutating RPCs: **every field of the request except `scope` and
+/// `idempotency`** — see the header of `src/idem.rs` for why those two, and only
+/// those two, are excluded.
+///
+/// Stated as "clear the two, keep the rest" rather than as a list of the fields
+/// to hash. The list would be the same today and would silently stop being
+/// right the day the contract grows a field: a new one nobody added here would
+/// be omitted from the digest, and a request differing only in it would be
+/// replayed. The exclusions are what this module has actually decided about.
+trait Payload {
+    fn payload(&self) -> Vec<u8>;
+}
+
+impl Payload for CreateTaskRequest {
+    fn payload(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.scope = None;
+        canonical.idempotency = None;
+        canonical.encode_to_vec()
+    }
+}
+
+impl Payload for UpdateTaskRequest {
+    fn payload(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.scope = None;
+        canonical.idempotency = None;
+        // A mask is a SET of field names, and its encoding is a sequence. Two
+        // masks naming the same fields in another order, or one naming a field
+        // twice, ask for the identical write — so a digest taken over the bytes
+        // as they arrived would refuse a request that discards nothing. D9's
+        // test is whether a replay would silently discard the difference.
+        if let Some(mask) = canonical.update_mask.as_mut() {
+            mask.paths.sort();
+            mask.paths.dedup();
+        }
+        canonical.encode_to_vec()
+    }
+}
+
+impl Payload for DeleteTaskRequest {
+    fn payload(&self) -> Vec<u8> {
+        let mut canonical = self.clone();
+        canonical.scope = None;
+        canonical.idempotency = None;
+        canonical.encode_to_vec()
     }
 }
 
@@ -277,6 +349,14 @@ async fn insert(
 ///
 /// Refused rather than silently overwritten: a caller that asked for ORG and
 /// received PRIVATE without being told believes the record is shared.
+///
+/// The three TIMESTAMPS are checked for the same reason and were missing from
+/// this list. `insert` never binds them — the engine defaults `created_at` and
+/// `updated_at`, and `deleted_at` is a tombstone D26 places later — so a caller
+/// that set one reached no column and was told OK. Nothing wrong was stored,
+/// and that is not the standard: the caller asked for something, the module
+/// discarded it, and the answer reported success. Every field of `Meta` is
+/// assigned here, so every field of `Meta` is refused here.
 fn assigned_by_the_module(meta: Option<&Meta>) -> Result<(), Status> {
     let Some(meta) = meta else { return Ok(()) };
     let supplied = !meta.id.is_empty()
@@ -287,6 +367,9 @@ fn assigned_by_the_module(meta: Option<&Meta>) -> Result<(), Status> {
         || meta.visibility != 0
         || !meta.created_by.is_empty()
         || !meta.updated_by.is_empty()
+        || meta.created_at.is_some()
+        || meta.updated_at.is_some()
+        || meta.deleted_at.is_some()
         || !meta.derived_from.is_empty();
     if supplied {
         return Err(Status::invalid_argument(

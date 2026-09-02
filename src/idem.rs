@@ -15,18 +15,36 @@
 //! claim, which makes its retry a fresh attempt rather than a replay of
 //! something that never happened.
 //!
-//! This module does not implement the amendment yet. `replay` below refuses a
-//! reused key only when the stored `rpc` differs from the one asked for — a key
-//! reused for the SAME rpc with a different payload still falls through and
-//! replays. `task_write` persists the prior RESPONSE, not the prior request, so
-//! there is nothing here to compare a new payload against; closing the gap
-//! needs a request-fingerprint column and a migration in `src/schema.rs`, and
-//! it DOES touch this file: `claim`'s signature has to take the payload, its
-//! INSERT has to bind the new column, the locking SELECT in `replay` has to
-//! read it back, and the comparison lands beside `if row.0 != rpc`. That is a
-//! known gap, not an oversight, and it is booked as O21 in the decision record.
+//! The amendment needs a mechanism, because a uniqueness constraint detects a
+//! repeat and cannot detect a DIFFERING repeat. `task_write` kept the prior
+//! RESPONSE and never the prior request, so there was nothing here to compare a
+//! new payload against. Migration 6 adds `request_fingerprint`, `claim` takes
+//! the payload and binds its digest, and `replay` reads the column back and
+//! compares. A NULL fingerprint — every row written before that migration —
+//! replays, because an absent digest is not a differing one.
+//!
+//! **Which fields count as the payload is per-RPC**, and D9 requires that
+//! stated per field rather than left to a reader. This module's answer, for all
+//! three of its mutating RPCs: **every field of the request except `scope` and
+//! `idempotency`.**
+//!
+//! - `CreateTask` — `task`.
+//! - `UpdateTask` — `id`, `expect_version`, `task`, `update_mask`.
+//! - `DeleteTask` — `id`, `expect_version`.
+//!
+//! `scope` is excluded because it is already the claim's key: a row is found by
+//! `(project_id, user_id, idem_key)`, so a differing scope reaches a different
+//! row and never a comparison. `idempotency` excludes itself — it carries the
+//! key the comparison is keyed on. Nothing else is excluded, and the test for
+//! whether a field belongs is D9's: whether a replay would silently discard the
+//! difference. Every remaining field fails that test.
+//!
+//! `update_mask.paths` is SORTED before the digest is taken. `["title","body"]`
+//! and `["body","title"]` name the same fields and encode to different bytes, so
+//! an unsorted digest would refuse a request that discards nothing.
 
 use prost::Message;
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, Transaction};
 use tonic::Status;
 
@@ -48,35 +66,57 @@ fn present(idem: Option<&Idempotency>) -> Option<&str> {
     idem.map(|i| i.key.as_str()).filter(|k| !k.is_empty())
 }
 
+/// The digest a claim is compared by. SHA-256, so it is exactly the 32 bytes
+/// `request_fingerprint` holds.
+pub fn fingerprint(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
+}
+
 /// Take the key, or discover it is a replay.
-pub async fn claim<T: Message + Default>(
+///
+/// `payload` is a thunk rather than bytes on purpose: a caller that supplies no
+/// key does not participate, and encoding a request body it will never be
+/// compared against is work nobody asked for.
+pub async fn claim<T, P>(
     tx: &mut Transaction<'_, MySql>,
     scope: &Scope,
     rpc: &str,
     idem: Option<&Idempotency>,
-) -> Result<Claimed<T>, Status> {
+    payload: P,
+) -> Result<Claimed<T>, Status>
+where
+    T: Message + Default,
+    P: FnOnce() -> Vec<u8>,
+{
     let Some(key) = present(idem) else {
         return Ok(Claimed::Proceed);
     };
+    let fingerprint = fingerprint(&payload());
 
     // Claim first and ask questions on collision. The alternative — read, then
     // insert if absent — has a window between the two in which the concurrent
     // retry this exists for lands. Here the second inserter BLOCKS on the unique
     // index until the first commits, then finds the committed outcome.
+    //
+    // The fingerprint is bound HERE rather than in `record`, so it commits with
+    // the claim and inside the caller's transaction. A write that fails leaves
+    // neither, which is what keeps its retry a fresh attempt.
     let claimed = sqlx::query(
-        "INSERT INTO task_write (project_id, user_id, idem_key, rpc, response)
-         VALUES (?, ?, ?, ?, '')",
+        "INSERT INTO task_write
+           (project_id, user_id, idem_key, rpc, response, request_fingerprint)
+         VALUES (?, ?, ?, ?, '', ?)",
     )
     .bind(&scope.project_id)
     .bind(&scope.user_id)
     .bind(key)
     .bind(rpc)
+    .bind(fingerprint.as_slice())
     .execute(&mut **tx)
     .await;
 
     match claimed {
         Ok(_) => Ok(Claimed::Proceed),
-        Err(e) if is_duplicate(&e) => replay(tx, scope, rpc, key).await,
+        Err(e) if is_duplicate(&e) => replay(tx, scope, rpc, key, &fingerprint).await,
         Err(e) => Err(internal(e)),
     }
 }
@@ -86,13 +126,14 @@ async fn replay<T: Message + Default>(
     scope: &Scope,
     rpc: &str,
     key: &str,
+    fingerprint: &[u8; 32],
 ) -> Result<Claimed<T>, Status> {
     // `FOR UPDATE`, and it is not about locking. A plain SELECT here reads this
     // transaction's snapshot, which was taken before the row the other writer
     // just committed — so it would find nothing and the replay would look like a
     // fresh key. A locking read always sees the latest committed version.
-    let row: (String, Vec<u8>) = sqlx::query_as(
-        "SELECT rpc, response FROM task_write
+    let row: (String, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT rpc, response, request_fingerprint FROM task_write
           WHERE project_id = ? AND user_id = ? AND idem_key = ?
           FOR UPDATE",
     )
@@ -108,6 +149,21 @@ async fn replay<T: Message + Default>(
         // succeed and mean nothing, so this is refused rather than guessed at.
         return Err(Status::invalid_argument(
             "this idempotency key was already used for a different operation",
+        ));
+    }
+
+    // D9 as amended. A key reused with a DIFFERENT payload is refused, because
+    // replaying it hands the first request's outcome to a caller who sent a
+    // second: the operation actually asked for is discarded and the answer
+    // reports success. The caller cannot tell, and refusing never lies.
+    //
+    // A NULL fingerprint is a claim recorded before migration 6 and is NOT a
+    // difference — there is nothing to compare, so it replays as it always did.
+    let recorded = row.2;
+    if recorded.is_some_and(|r| r.as_slice() != fingerprint.as_slice()) {
+        return Err(Status::invalid_argument(
+            "this idempotency key was already used for a different request — \
+             a replay would discard what this one asked for",
         ));
     }
 

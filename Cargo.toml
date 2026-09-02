@@ -33,6 +33,13 @@ sqlx = { version = "0.9", default-features = false, features = [
   "macros",
 ] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# D9's differing-payload refusal compares a digest of the prior REQUEST, so the
+# digest has to be one a caller cannot collide. A non-cryptographic hash is
+# cheaper and its collision is the exact lie the rule exists to stop: two
+# different requests fingerprinting alike are replayed, and the caller is told a
+# request nobody performed succeeded. Already in the tree transitively via
+# rustls; named here because this module now depends on it directly.
+sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

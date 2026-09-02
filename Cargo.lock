@@ -2449,6 +2449,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-types",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "tokio",
