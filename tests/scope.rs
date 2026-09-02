@@ -7,7 +7,7 @@
 
 mod support;
 
-use support::{two_projects_two_users, World, OTHER_TEAM, P_A, P_B, TEAM, U1, U2};
+use support::{two_projects_two_users, World, OTHER_TEAM, P_A, P_B, TEAM, U1, U2, U3};
 use yadgar_task_db::pb::yadgar::common::v1::Visibility;
 
 // ---------------------------------------------------------------------------
@@ -175,6 +175,28 @@ async fn a_non_teammate_does_not_see_a_team_task() {
         .await
         .expect_err("a member of another team must not read it");
     assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// THE OWNER'S OWN TEAM RECORD, which nothing here reached.
+///
+/// Every other TEAM test above queries as U1 against a record owned by U3 —
+/// deliberately, so an accidental `OR owner_user_id = ?` cannot carry them. The
+/// consequence is that the owner's own path through the TEAM arm was never
+/// walked by anything, and the arm most people would reach for to "fix" that is
+/// the one `Reach::visible` documents as refusing.
+///
+/// U3 owns `u3_team` and belongs to `TEAM`, so the TEAM rung is what grants the
+/// read. The PRIVATE rung does not and must not: `visibility NOT IN (2, 3)`
+/// excludes a TEAM row whoever owns it.
+#[tokio::test]
+async fn the_owner_of_a_team_task_reads_it_through_the_team_arm() {
+    let c = two_projects_two_users("td_vis_team_owner").await;
+
+    let seen = c
+        .read_as(&c.scope_in(P_A, U3, &[TEAM]), &c.u3_team)
+        .await
+        .expect("the owner, in the named team, may read their own TEAM record");
+    assert_eq!(seen.title, "u3 team");
 }
 
 /// An empty team list must render as "no TEAM arm", never as `IN ()` — which is
