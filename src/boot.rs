@@ -1,11 +1,19 @@
 //! What `main` decides before it opens anything — in a place a test can reach.
 //!
 //! `main` is a binary entry point, so nothing in it is reachable from a test.
-//! That is fine for wiring and not fine for decisions, and three decisions here
+//! That is fine for wiring and not fine for decisions, and four decisions here
 //! are exactly the kind that fail silently: which transport mode the connections
-//! use, what happens to an environment key that no longer means anything, and
-//! which transport this module SERVES on. All three live in this module, and all
-//! three have a test.
+//! use, what happens to an environment key that no longer means anything, which
+//! transport this module SERVES on, and which signals END it. All four live in
+//! this module, and all four have a test.
+//!
+//! The fourth is the newest and is the clearest case for the rule. `main` passed
+//! `tokio::signal::ctrl_c()` to `serve_with_shutdown` and there was no
+//! `signal::unix` handler anywhere in this crate — so the drain ran on SIGINT,
+//! which Kubernetes never sends, and not on SIGTERM, which is the only signal it
+//! does send. It was wrong from the day it was written, it is one line, and
+//! nothing in the repository could see it because the line lived where no test
+//! reaches. [`shutdown`] moves the decision here.
 //!
 //! **The connection options are the point.** D7's capability probe runs on a
 //! connection of its own, before the pool exists. This binary used to build that
@@ -39,15 +47,26 @@ const OBSOLETE_TLS_KEY: &str = "DB_REQUIRE_TLS";
 /// The key that replaced it.
 const SSL_MODE_KEY: &str = "DB_SSL_MODE";
 
-/// The environment variables this module's own listener is configured from.
+/// The environment variables this module's own listener is configured from:
+/// `LISTEN_TLS_ENABLED`, `LISTEN_TLS_CERT_FILE` and `LISTEN_TLS_KEY_FILE`.
 ///
 /// Built from a PREFIX rather than written out three times, so the naming stays
-/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CERT_FILE` and
-/// `<PREFIX>_TLS_KEY_FILE`. `SERVE` rather than the bare names, because `DB_*`
-/// already means "the engine this module talks to" in this process — a bare
-/// `TLS_ENABLED` would be ambiguous between the two directions, and `task` reads
-/// the same `SERVE_` prefix for the same reason.
-pub const SERVE: &str = "SERVE";
+/// mechanical.
+///
+/// **THE PREFIX NAMES THE THING BEING CONFIGURED, and it is derived rather than
+/// chosen.** `LISTEN` is already the variable holding the address this module
+/// binds, so the listener's transport keys extend a name that exists. A
+/// connection OUT is named for what it reaches, which is why `DB_*` means the
+/// engine. `SERVE` — what this constant used to be — invented a second word for
+/// the listener, and so named nothing the process otherwise had. `iam` and
+/// `iam-db` derived `LISTEN` independently for the identical seam; one idea
+/// spelled two ways across the estate is its own defect, and `task` now reads
+/// the same prefix for the same reason.
+///
+/// A bare `TLS_ENABLED` is ambiguous between the two directions, which is what
+/// makes a prefix necessary at all — `the_engines_transport_does_not_configure_the_listener`
+/// pins that half.
+pub const LISTEN: &str = "LISTEN";
 
 fn env_or(env: &impl Fn(&str) -> Option<String>, key: &str, default: &str) -> String {
     env(key).unwrap_or_else(|| default.to_string())
@@ -229,6 +248,69 @@ pub fn server(tls: Option<&ServeTls>) -> Result<Server, BootError> {
         })
 }
 
+/// The future `serve_with_shutdown` drains on: SIGTERM, and SIGINT beside it.
+///
+/// **SIGTERM IS THE ONE THAT MATTERS, and it was the one missing.** Kubernetes
+/// ends a pod by sending SIGTERM and waiting out `terminationGracePeriodSeconds`
+/// before SIGKILL; it never sends SIGINT. This binary listened for `ctrl_c()`
+/// alone, so on every rolling update the drain was never reached — the process
+/// ran until the kill, and whatever was in flight died with it.
+///
+/// **IT COSTS MORE HERE THAN IN THE LOGIC TIER, because this process is the one
+/// holding transactions.** A killed `task` loses requests; a killed `task-db`
+/// loses them mid-write. Nothing is corrupted — an unfinished transaction rolls
+/// back, which is what D8's compare-and-set already depends on — but the caller
+/// is told nothing and has to infer the outcome from a severed stream. D23 sets
+/// the blast radius: `task` reaches this module over ONE long-lived HTTP/2
+/// connection per pod, so what is severed is everything that connection was
+/// carrying rather than a thin slice of it.
+///
+/// SIGINT is kept because it is what a terminal sends, and losing the local
+/// behaviour to fix the deployed one would be a poor trade.
+///
+/// **BOTH HANDLERS ARE REGISTERED BEFORE THIS RETURNS, and that is the reason
+/// this is a function returning a future rather than an `async fn`.** Installing
+/// a handler is what replaces the signal's default disposition, which for
+/// SIGTERM is "terminate the process". An `async fn` registers nothing until it
+/// is first polled, so a signal arriving between spawning the server and the
+/// executor reaching the shutdown future would kill the process outright — the
+/// precise failure this exists to prevent, reintroduced as a race.
+/// `tests/shutdown.rs` raises SIGTERM after this call and before the future is
+/// awaited, so that window is exactly what it measures.
+///
+/// **IN `boot` RATHER THAN IN `main`, for the reason this module exists.** A
+/// decision inside a binary entry point is one no test can reach, and which
+/// signals end this process is exactly the kind that fails silently — it was
+/// wrong from the day it was written and nothing in the repository noticed.
+/// `pool_config`, the obsolete-key refusal and [`ServeTls`] are all here for
+/// that same reason.
+///
+/// A [`BootError`] rather than a bare `io::Error`, so `main` refuses to start on
+/// it the way it refuses every other boot mistake, with a sentence rather than a
+/// `Debug` print. A server that cannot hear SIGTERM cannot drain, and starting
+/// anyway hides that until the next rollout.
+pub fn shutdown() -> Result<impl std::future::Future<Output = ()>, BootError> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let install = |kind: SignalKind, name: &'static str| {
+        signal(kind).map_err(|source| BootError::SignalHandler { name, source })
+    };
+
+    let mut terminate = install(SignalKind::terminate(), "SIGTERM")?;
+    let mut interrupt = install(SignalKind::interrupt(), "SIGINT")?;
+
+    Ok(async move {
+        let signal = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        // NAMED, because the two arrive for different reasons: SIGTERM is a
+        // rollout or an eviction, SIGINT is a person at a terminal. An operator
+        // reading why a pod went away wants to know which.
+        tracing::info!(signal, "draining in-flight requests before shutting down");
+    })
+}
+
 /// Flatten an error and everything under it into one sentence.
 ///
 /// `tonic::transport::Error` displays as "transport error" and keeps what
@@ -300,6 +382,21 @@ pub enum BootError {
         cert: PathBuf,
         key: PathBuf,
         detail: String,
+    },
+
+    #[error(
+        "the {name} handler could not be installed: {source}. This module refuses to \
+         start rather than run without one: Kubernetes ends every pod with SIGTERM, and \
+         a process that cannot hear it is one that never drains — its in-flight writes \
+         are severed by the SIGKILL that follows, on every rolling update, with nothing \
+         in the logs to say so. This is a broken process environment rather than a \
+         configuration mistake, so there is no value to correct; the pod restarting is \
+         the right response."
+    )]
+    SignalHandler {
+        name: &'static str,
+        #[source]
+        source: std::io::Error,
     },
 
     #[error(transparent)]
@@ -431,7 +528,7 @@ mod tests {
     /// around: nothing configured means the cleartext listener, unchanged.
     #[test]
     fn nothing_configured_means_the_listener_serves_cleartext() {
-        assert_eq!(ServeTls::from_lookup(SERVE, env_of(&[])).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&[])).unwrap(), None);
     }
 
     /// A certificate without the flag is the REVERTED state, not an error. The
@@ -439,10 +536,10 @@ mod tests {
     #[test]
     fn a_certificate_alone_does_not_enable_the_listeners_tls() {
         let vars = [
-            ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-            ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
-        assert_eq!(ServeTls::from_lookup(SERVE, env_of(&vars)).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(), None);
     }
 
     /// Anything but "1" is off — the same parse `DB_SSL_MODE`'s predecessor got
@@ -451,12 +548,12 @@ mod tests {
     fn only_exactly_one_enables_the_listeners_tls() {
         for value in ["0", "false", "no", "true", "yes", "", " "] {
             let vars = [
-                ("SERVE_TLS_ENABLED", value),
-                ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-                ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+                ("LISTEN_TLS_ENABLED", value),
+                ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+                ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
             ];
             assert_eq!(
-                ServeTls::from_lookup(SERVE, env_of(&vars)).unwrap(),
+                ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(),
                 None,
                 "{value:?} must not enable TLS"
             );
@@ -469,25 +566,25 @@ mod tests {
     #[test]
     fn asking_the_listener_for_tls_without_the_files_is_an_error() {
         let missing_cert = [
-            ("SERVE_TLS_ENABLED", "1"),
-            ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+            ("LISTEN_TLS_ENABLED", "1"),
+            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
         assert!(
             matches!(
-                ServeTls::from_lookup(SERVE, env_of(&missing_cert)),
-                Err(BootError::NoTlsCertFile("SERVE"))
+                ServeTls::from_lookup(LISTEN, env_of(&missing_cert)),
+                Err(BootError::NoTlsCertFile("LISTEN"))
             ),
             "a missing certificate must be refused, not silently downgraded"
         );
 
         let missing_key = [
-            ("SERVE_TLS_ENABLED", "1"),
-            ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
+            ("LISTEN_TLS_ENABLED", "1"),
+            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ];
         assert!(
             matches!(
-                ServeTls::from_lookup(SERVE, env_of(&missing_key)),
-                Err(BootError::NoTlsKeyFile("SERVE"))
+                ServeTls::from_lookup(LISTEN, env_of(&missing_key)),
+                Err(BootError::NoTlsKeyFile("LISTEN"))
             ),
             "a missing private key must be refused, not silently downgraded"
         );
@@ -498,11 +595,11 @@ mod tests {
     #[test]
     fn the_certificate_and_the_key_both_arrive() {
         let vars = [
-            ("SERVE_TLS_ENABLED", "1"),
-            ("SERVE_TLS_CERT_FILE", SENTINEL_CERT),
-            ("SERVE_TLS_KEY_FILE", SENTINEL_KEY),
+            ("LISTEN_TLS_ENABLED", "1"),
+            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
+            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
-        let tls = ServeTls::from_lookup(SERVE, env_of(&vars))
+        let tls = ServeTls::from_lookup(LISTEN, env_of(&vars))
             .unwrap()
             .expect("a flag, a certificate and a key enable TLS");
         assert_eq!(tls.cert_file(), Path::new(SENTINEL_CERT));
@@ -519,7 +616,7 @@ mod tests {
             ("TLS_ENABLED", "1"),
             ("TLS_CERT_FILE", SENTINEL_CERT),
         ];
-        assert_eq!(ServeTls::from_lookup(SERVE, env_of(&vars)).unwrap(), None);
+        assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(), None);
     }
 
     #[test]
