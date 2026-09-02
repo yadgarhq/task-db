@@ -203,3 +203,57 @@ pub async fn record<T: Message>(
 fn is_duplicate(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::fingerprint;
+
+    fn hex(digest: [u8; 32]) -> String {
+        use std::fmt::Write as _;
+        digest.iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    /// KNOWN-ANSWER, and the answers come from OUTSIDE this crate.
+    ///
+    /// Every property this module is otherwise tested by survives a change of
+    /// algorithm. "The same request fingerprints the same" holds for SHA-512
+    /// truncated to 32 bytes, for BLAKE3, for anything deterministic — so the
+    /// suite stays green while the FORMAT moves. What does not survive is the
+    /// thirty-two bytes already sitting in `task_write.request_fingerprint`,
+    /// written by the code as it was. Move the digest under those rows and
+    /// `replay` compares a fresh digest against a stale one, finds them
+    /// different, and refuses the identical retry D9 exists to replay — the core
+    /// rule regressed by a change nothing failed on.
+    ///
+    /// So the bytes are pinned to literals, and the literals are PUBLISHED
+    /// vectors rather than anything this code printed. Pasting back what the
+    /// implementation emitted would assert the code against its own output and
+    /// pass for any algorithm it happened to be using.
+    ///
+    /// FIPS 180-2 Appendix B.1 gives SHA-256("abc"); the empty-input digest is
+    /// in NIST's CAVP set and in RFC 6234. Reproduce both without Rust:
+    ///
+    /// ```text
+    /// printf 'abc' | sha256sum
+    /// printf ''    | sha256sum
+    /// ```
+    #[test]
+    fn a_fingerprint_is_sha256_and_the_bytes_are_the_published_vectors() {
+        assert_eq!(
+            hex(fingerprint(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "FIPS 180-2 Appendix B.1"
+        );
+        // Reachable rather than academic: a request whose every field is its
+        // zero value encodes to no bytes at all, and that is the input this
+        // function then receives.
+        assert_eq!(
+            hex(fingerprint(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the empty-input vector"
+        );
+    }
+}

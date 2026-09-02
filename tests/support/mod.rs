@@ -284,6 +284,33 @@ impl World {
             .expect("team_id")
     }
 
+    /// The bytes actually in `task_write.request_fingerprint` for one claim.
+    ///
+    /// Read from the COLUMN rather than recomputed, because the storage encoding
+    /// is part of what a known-answer test pins: raw bytes against hex, and a
+    /// digest of some other width silently padded out by `BINARY(32)`, are both
+    /// invisible to an assertion that stops at the function's return value.
+    ///
+    /// `Option` because the column is nullable — a claim recorded before
+    /// migration 6 carries no fingerprint, and absent is not empty.
+    pub async fn stored_fingerprint(
+        &self,
+        project: &str,
+        user: &str,
+        key: &str,
+    ) -> Option<Vec<u8>> {
+        sqlx::query_scalar(
+            "SELECT request_fingerprint FROM task_write
+              WHERE project_id = ? AND user_id = ? AND idem_key = ?",
+        )
+        .bind(project)
+        .bind(user)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await
+        .expect("select request_fingerprint")
+    }
+
     pub async fn count_titled(&self, title: &str) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE title = ?")
             .bind(title)

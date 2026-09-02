@@ -73,10 +73,22 @@ async fn a_stale_version_is_refused() {
 }
 
 /// D26: delete is owner-only and soft.
+///
+/// ALL THREE READ ARMS ARE CHECKED, and that is the point rather than
+/// thoroughness. `deleted_at IS NULL` is written three separate times in
+/// `src/read.rs` — the id arm of `GetTask`, its number arm, and `ListTasks` —
+/// and a tombstone two of them honour is not a tombstone. Only the id arm was
+/// covered, so dropping the predicate from either of the others left this suite
+/// green while a deleted task stayed readable to anyone who asked the other way.
+/// That is the same shape as the visibility leak `the_number_arm_honours_
+/// visibility_too` exists for: a filter added to one arm and not its sibling.
 #[tokio::test]
 async fn only_the_owner_may_delete_and_the_row_survives() {
     let w = World::fresh("td_delete").await;
     let id = w.create(P_A, U1, "t").await;
+    // Read BEFORE the delete, because afterwards no arm will return it — which
+    // is the property under test.
+    let number = w.read(P_A, U1, &id).await.expect("owner reads").number;
 
     let del = |user: &str| DeleteTaskRequest {
         scope: w.scope(P_A, user),
@@ -100,6 +112,23 @@ async fn only_the_owner_may_delete_and_the_row_survives() {
         .await
         .expect_err("a soft-deleted task is not returned");
     assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let err =
+        w.db.get_task(Request::new(GetTaskRequest {
+            scope: w.scope(P_A, U1),
+            key: Some(get_task_request::Key::Number(number)),
+        }))
+        .await
+        .expect_err("nor by its number, which is a separate statement");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    assert!(
+        !w.list(P_A, U1)
+            .await
+            .iter()
+            .any(|t| t.meta.as_ref().is_some_and(|m| m.id == id)),
+        "nor in a list, which is a third statement again"
+    );
 }
 
 /// An unset page_size is 0 on the wire, which must not mean "return nothing" —
