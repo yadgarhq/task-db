@@ -68,6 +68,58 @@ database:
   maxConnections: 8
   engineMaxConnections: 151
 
+# THE OTHER TRANSPORT THIS POD HAS, and the one `database.sslMode` says nothing
+# about. `sslMode` decides how this pod reaches its ENGINE; this decides what
+# `task` gets when it reaches this pod. That hop carries every task body and
+# every scope, and on a flat pod network it is readable by anyone on the network.
+#
+# PATHS AND A FLAG, NEVER AN ISSUER-SPECIFIC RESOURCE (D80). The chart names a
+# Secret and the keys inside it, and the binary is handed two file paths. In the
+# reference deployment cert-manager writes that Secret; on EKS a Secret assembled
+# by hand produces something neither the chart nor the binary can tell apart.
+# Nothing here requires a CRD, an issuer or a mesh.
+tls:
+  # OFF, and the cut-over is a separate, revertible change. `task` can already
+  # dial this pod over TLS and does not by default, so turning this on alone
+  # breaks the hop rather than securing it: the two flags move together, once
+  # certificates exist. The same discipline the attestation cut-over used.
+  #
+  # THERE IS NO SILENT MIDDLE STATE. `true` with a certificate that is missing,
+  # undecodable, or not the partner of its key fails at boot naming the file.
+  # The process NEVER opens a plaintext listener because TLS configuration
+  # failed. `false` with a certificate still configured is the reverted state,
+  # and task-db logs a warning saying it is listening in cleartext, so nobody
+  # has to infer it.
+  enabled: false
+  # The Secret holding this module's OWN certificate and its private key.
+  #
+  # A `kubernetes.io/tls` Secret is what an issuer writes, and it carries
+  # `tls.crt`, `tls.key` and usually `ca.crt` together. The CALLER mounts only
+  # the `ca.crt` out of this same Secret — that is what `task`'s
+  # `taskDb.tls.caSecret` names — while this pod mounts the certificate and the
+  # key. One object, read differently by each side of the hop.
+  #
+  # AN EMPTY VALUE IS A LEGITIMATE DEPLOYMENT RATHER THAN A MISSING ONE. It is
+  # what every deployment looks like until the cut-over, and `enabled: false` is
+  # what makes it legitimate. The requirement is CONDITIONAL — the template asks
+  # for this only when the flag is set — because a chart that demanded a Secret
+  # nobody has issued yet would fail to install on a cluster running perfectly
+  # well without one. The same D80 argument that turned the KEDA ScaledObject
+  # off by default.
+  #
+  # NOT A PEM PASTED INTO THIS FILE, and the reason is stronger than it is for a
+  # CA bundle: this Secret holds a PRIVATE KEY. It also rotates, and a copy in
+  # git is correct only until the rotation nobody remembered to follow.
+  certSecret: task-db-tls
+  # The keys inside that Secret holding the certificate and the private key.
+  # They are mounted as `tls.crt` and `tls.key`.
+  #
+  # Named rather than assumed: those are what a `kubernetes.io/tls` Secret uses,
+  # and a Secret assembled by hand for a deployment cert-manager does not run in
+  # is free to call them something else.
+  certSecretKey: tls.crt
+  keySecretKey: tls.key
+
 # D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
 # waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet
 # exactly when the system is in trouble.

@@ -87,15 +87,45 @@ spec:
             # expression as gateway's YADGAR_MAX_REPLICAS, for the same reason.
             - name: REPLICAS
               value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | quote }}{{ else }}{{ .Values.replicaCount | quote }}{{ end }}
+            {{- if .Values.tls.enabled }}
+            # THE HOP INTO THIS POD, which DB_SSL_MODE above says nothing about:
+            # that one describes the connection out to the engine. Rendered only
+            # when asked for, so a deployment that has not cut over sends the
+            # binary nothing and opens the cleartext listener it always opened.
+            - name: SERVE_TLS_ENABLED
+              value: "1"
+            # PATHS, never an issuer-specific resource (D80). Two of them,
+            # because a certificate and its key are two files — and naming them
+            # separately is what lets the binary say WHICH of the two was missing
+            # when only half of a Secret mounted.
+            - name: SERVE_TLS_CERT_FILE
+              value: /var/run/config/serving-cert/tls.crt
+            - name: SERVE_TLS_KEY_FILE
+              value: /var/run/config/serving-cert/tls.key
+            {{- end }}
           volumeMounts:
             - name: db-password
               mountPath: /var/run/secrets/task-db
               readOnly: true
+            {{- if .Values.tls.enabled }}
+            # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
+            # copy that kubelet never refreshes, so the certificate would freeze
+            # at whatever it was when the pod started — and a serving certificate
+            # that never refreshes EXPIRES, after which every caller refuses this
+            # pod on a date nobody is watching.
+            - name: serving-cert
+              mountPath: /var/run/config/serving-cert
+              readOnly: true
+            {{- end }}
           # NO readiness probe hitting a /health that returns early. The process
           # does not listen until the capability probe and migrations have both
           # succeeded (D69), so "the port is open" already means "ready" — and a
           # probe that passed earlier than that would report ready for a pod that
           # cannot serve, which under D68 is a pod the HPA adds replicas around.
+          #
+          # A tcpSocket probe is still the right one once tls.enabled is set: it
+          # completes a TCP connection and no handshake, so it neither needs a
+          # certificate of its own nor cares which transport the port speaks.
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -111,3 +141,28 @@ spec:
         - name: db-password
           secret:
             secretName: {{ .Values.database.passwordSecret }}
+        {{- if .Values.tls.enabled }}
+        - name: serving-cert
+          secret:
+            secretName: {{ required "tls.certSecret holds the certificate and private key this module presents and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecret }}
+            # OPTIONAL, and that is not laxity — it decides WHICH error the
+            # operator gets. A required mount that cannot be satisfied leaves the
+            # pod in ContainerCreating with a FailedMount event about a volume.
+            # An optional one mounts an empty directory, the binary finds no file
+            # at SERVE_TLS_CERT_FILE, and it exits at boot naming THAT PATH and
+            # saying that TLS was asked for so a plaintext listener is not the
+            # answer. Neither starts; only one of them explains itself. There is
+            # no third outcome in which this pod answers callers over an
+            # unencrypted connection it was told to encrypt.
+            optional: true
+            # NAMED KEYS rather than the whole Secret. An issuer's Secret also
+            # carries `ca.crt`, which this pod has no use for — the CALLER is
+            # what mounts that — and selecting the two keys it does need is also
+            # what renames whatever the issuer called them to the `tls.crt` and
+            # `tls.key` that SERVE_TLS_CERT_FILE and SERVE_TLS_KEY_FILE name.
+            items:
+              - key: {{ required "tls.certSecretKey names the key inside tls.certSecret that holds the certificate and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecretKey | quote }}
+                path: tls.crt
+              - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
+                path: tls.key
+        {{- end }}
