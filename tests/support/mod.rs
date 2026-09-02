@@ -32,6 +32,26 @@ pub const U3: &str = "u3";
 pub const TEAM: &str = "t-platform";
 pub const OTHER_TEAM: &str = "t-billing";
 
+/// The pool every fixture opens, and the reason a fixture states one at all.
+///
+/// **A fixture that says nothing runs at sqlx's default of ten, which is a size
+/// production never ships.** `DB_MAX_CONNECTIONS` defaults to eight, D80 made it
+/// operator-settable, and `check_engine_headroom` steers a constrained operator
+/// DOWNWARDS — so the sizes that matter are small ones, and every engine suite
+/// here was running above all of them. A create that took a SECOND connection
+/// while holding its first was invisible for exactly that reason: at ten
+/// connections and two racers there is always a spare.
+///
+/// Four rather than eight, because what this pins is a RATIO between concurrency
+/// and pool size, and a smaller pool puts the ratio inside a test that finishes.
+/// It is still above `store`'s `MIN_CONNECTIONS` of two, so migration keeps the
+/// two connections it holds at once.
+///
+/// A test that is ABOUT the ratio names its own size through
+/// [`World::with_pool_size`] rather than leaning on this one — an assertion
+/// derived from a default silently stops testing the day the default moves.
+const DEFAULT_POOL_SIZE: u32 = 4;
+
 pub fn dsn() -> String {
     std::env::var("YADGAR_TEST_DSN")
         .expect("YADGAR_TEST_DSN is unset; these tests assert what a real MariaDB does")
@@ -66,7 +86,17 @@ pub struct World {
 
 impl World {
     pub async fn fresh(name: &str) -> Self {
-        Self::build(name, None, None).await
+        Self::build(name, DEFAULT_POOL_SIZE, None, None).await
+    }
+
+    /// The same service against a pool of exactly `max_connections`.
+    ///
+    /// For the tests whose subject IS the pool ceiling. They must name their own
+    /// number: an assertion that reads [`DEFAULT_POOL_SIZE`] and spawns that many
+    /// racers keeps passing when the default changes, while no longer testing the
+    /// ratio it was written for.
+    pub async fn with_pool_size(name: &str, max_connections: u32) -> Self {
+        Self::build(name, max_connections, None, None).await
     }
 
     /// A database at migration `version` and no further — the state a data
@@ -77,7 +107,7 @@ impl World {
     /// cannot exist in a database the current set created. This stops short, so
     /// a test can write the BEFORE state itself and then migrate over it.
     pub async fn fresh_at(name: &str, version: u64) -> Self {
-        Self::build(name, None, Some(version)).await
+        Self::build(name, DEFAULT_POOL_SIZE, None, Some(version)).await
     }
 
     /// The same service against a pool that waits one second for a row lock
@@ -85,7 +115,7 @@ impl World {
     /// uses this, and a test that takes fifty seconds to observe it is a test
     /// nobody runs.
     pub async fn impatient(name: &str) -> Self {
-        Self::build(name, Some(1), None).await
+        Self::build(name, DEFAULT_POOL_SIZE, Some(1), None).await
     }
 
     /// Apply whatever is still pending, and answer with the version now
@@ -101,7 +131,12 @@ impl World {
             .expect("migrate")
     }
 
-    async fn build(name: &str, lock_wait_secs: Option<u32>, upto: Option<u64>) -> Self {
+    async fn build(
+        name: &str,
+        max_connections: u32,
+        lock_wait_secs: Option<u32>,
+        upto: Option<u64>,
+    ) -> Self {
         let mut root = sqlx::MySqlConnection::connect(&dsn())
             .await
             .expect("connect");
@@ -116,6 +151,8 @@ impl World {
                 .expect("ddl");
         }
         let pool = sqlx::mysql::MySqlPoolOptions::new()
+            // STATED, never inherited. See [`DEFAULT_POOL_SIZE`].
+            .max_connections(max_connections)
             .after_connect(move |conn, _| {
                 Box::pin(async move {
                     if let Some(secs) = lock_wait_secs {
