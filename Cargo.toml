@@ -12,13 +12,21 @@ description = "The task module's -db twin: the only writer of its store, serving
 # actions by SHA (D62). Bumped deliberately, never drifting underneath a build.
 yadgar-store = { git = "https://github.com/yadgarhq/store.git", rev = "4a479ddb5f775de718125d67d14fddbfea9bac12" }
 # In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
-# feature on tonic itself. Also no TLS feature here: the gateway terminates
-# outward TLS, and in-cluster hops are plain HTTP/2 today (D23).
+# feature on tonic itself.
 tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "router",
   "server",
   "transport",
+  # `tls-ring`, NOT `tls-aws-lc`. aws-lc-rs needs cmake and a C toolchain, and
+  # this binary builds for x86_64-unknown-linux-musl (D63). It is also the
+  # provider sqlx already uses here — `tls-rustls-ring` below — so there is one
+  # crypto provider in this tree rather than two.
+  #
+  # It adds no crate: `ring` has been in the lock file since sqlx arrived. This
+  # module served plain HTTP/2 until now because nothing in the estate could
+  # speak TLS to it; the flag is opt-in and off, so it still does by default.
+  "tls-ring",
 ] }
 tonic-prost = "0.14"
 prost = "0.14"
@@ -50,6 +58,21 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `tests/serve_tls.rs` proves the serving transport with REAL handshakes, so it
+# needs a gRPC CLIENT to handshake with — which the shipped binary has no use
+# for, since this module only ever answers. A dev-dependency's features do not
+# reach anything that links this crate, so the shipped tree is unchanged.
+tonic = { version = "0.14", default-features = false, features = ["channel"] }
+# `TcpListenerStream` is what lets a listener be BOUND before it is served:
+# picking a port and reopening it leaves a window in which something else can
+# take it, and the rig binds one port on two addresses. Already in the lock file
+# by way of tokio, so this adds no crate to the dependency graph.
+tokio-stream = { version = "0.1", features = ["net"] }
+# Certificates are MINTED PER RUN rather than checked in: a fixture key in the
+# repository is a secret in the repository, and it expires on a date nobody is
+# watching. Same crate and same features yadgar-dial uses for the client half of
+# this seam.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"

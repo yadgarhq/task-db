@@ -46,9 +46,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Every default, every refusal and the transport mode live in `boot`, which
-    // a test can reach. This line is the whole of the configuration decision.
-    let config = boot::pool_config(|key| std::env::var(key).ok())?;
+    // Every default, every refusal and both transport modes live in `boot`,
+    // which a test can reach. These lines are the whole of the configuration
+    // decision.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` put
+    // `ObsoleteRequireTls` on the operator's terminal instead of the paragraph
+    // saying which key to set instead. Every refusal in `boot` is written as a
+    // sentence for somebody reading a crash loop, and Debug threw all of them
+    // away. `task` has stringified for the same reason since its own transport
+    // landed.
+    let config = boot::pool_config(|key| std::env::var(key).ok()).map_err(|e| e.to_string())?;
+
+    // THE LISTENER'S transport, read and CHECKED before anything else — the PEM
+    // decoded, the certificate matched against its key. A deployment that asked
+    // for TLS and got the mount wrong exits here, without opening a socket and
+    // without touching the engine. D69 puts the refusals first, and this one is
+    // cheaper than the probe.
+    //
+    // `boot::server` is the only server construction in this binary, which is
+    // structural rather than tidy: the downgrade this guards against is a
+    // listener that opens in cleartext because TLS configuration failed, and
+    // with one construction site there is nowhere else to write it.
+    let tls = boot::ServeTls::from_env(boot::SERVE).map_err(|e| e.to_string())?;
+    let mut server = boot::server(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The credential never arrives as an environment variable — it is a mounted
     // Secret the operator issued (D58), read through the seam so this module has
@@ -89,8 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50051").parse()?;
-    tracing::info!(%addr, "task-db listening");
-    tonic::transport::Server::builder()
+    tracing::info!(%addr, tls = tls.is_some(), "task-db listening");
+    server
         .add_service(TaskDbServiceServer::new(TaskDb::new(pool)))
         .serve_with_shutdown(addr, async {
             let _ = tokio::signal::ctrl_c().await;
