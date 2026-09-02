@@ -125,6 +125,7 @@ impl TaskDb {
             .task
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("task is required"))?;
+        assigned_by_the_module(task.meta.as_ref())?;
         let fields = fields_of(req.update_mask.as_ref())?;
         let reach = Reach::of(scope);
 
@@ -357,6 +358,14 @@ async fn insert(
 /// and that is not the standard: the caller asked for something, the module
 /// discarded it, and the answer reported success. Every field of `Meta` is
 /// assigned here, so every field of `Meta` is refused here.
+///
+/// **Called from EVERY write path, and `update` did not call it.** The argument
+/// above is about the ANSWER, not about the column, so it does not stop at
+/// create: an update carrying a `Meta` reaches no column either — `Field::ALL`
+/// is title, body, status, tags and links — and was told OK just the same. The
+/// exposure was never the data; it was a request discarded behind a success.
+/// Reading this guard as create-only is what let the update path keep the defect
+/// the create path had already fixed.
 fn assigned_by_the_module(meta: Option<&Meta>) -> Result<(), Status> {
     let Some(meta) = meta else { return Ok(()) };
     let supplied = !meta.id.is_empty()
@@ -373,7 +382,7 @@ fn assigned_by_the_module(meta: Option<&Meta>) -> Result<(), Status> {
         || !meta.derived_from.is_empty();
     if supplied {
         return Err(Status::invalid_argument(
-            "meta is assigned by this module and must be empty on create (D42)",
+            "meta is assigned by this module and must be empty on a write (D42)",
         ));
     }
     Ok(())
