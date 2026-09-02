@@ -329,3 +329,121 @@ async fn a_caller_supplied_timestamp_is_refused() {
         "a refused create must leave no row behind"
     );
 }
+
+/// The same guard, on the OTHER write path. `CreateTask` refuses a caller-supplied
+/// `Meta`; `UpdateTask` did not call the guard at all, so the request was answered
+/// OK and the `Meta` was dropped on the floor.
+///
+/// **State the severity honestly: nothing wrong was stored.** `Field::ALL` is
+/// title, body, status, tags and links, so no `Meta` field has a column an update
+/// could reach. That is exactly the argument the create-path timestamp fix already
+/// rejected — the caller asked for something, the module discarded it, and the
+/// answer said success. This closes the same class on the same module.
+///
+/// Which is why asserting "the stored row does not contain the year 2000" would be
+/// worthless here: it passes against the unfixed code too. The assertion that
+/// carries weight is that the call is REFUSED and the task is UNTOUCHED — same
+/// version, same title — which is what proves the refusal happened before the
+/// write rather than after it.
+///
+/// The fixtures are values this module could not have produced: the first day of
+/// the year 2000, and a version no row ever reaches because a create starts at 1
+/// and every write increments by one.
+#[tokio::test]
+async fn a_caller_supplied_meta_on_update_is_refused() {
+    let w = World::fresh("td_meta_update").await;
+    let id = w.create(P_A, U1, "untouched").await;
+    let impossible = prost_types::Timestamp {
+        seconds: 946_684_800,
+        nanos: 0,
+    };
+
+    for meta in [
+        Meta {
+            version: 9999,
+            ..Default::default()
+        },
+        Meta {
+            created_at: Some(impossible),
+            ..Default::default()
+        },
+        Meta {
+            updated_at: Some(impossible),
+            ..Default::default()
+        },
+        Meta {
+            deleted_at: Some(impossible),
+            ..Default::default()
+        },
+        Meta {
+            visibility: Visibility::Org as i32,
+            ..Default::default()
+        },
+        Meta {
+            owner_user_id: U2.into(),
+            ..Default::default()
+        },
+        Meta {
+            team_id: "someone-elses-team".into(),
+            ..Default::default()
+        },
+        Meta {
+            id: "yadgar:task:chosen-by-the-caller".into(),
+            ..Default::default()
+        },
+    ] {
+        let err =
+            w.db.update_task(Request::new(UpdateTaskRequest {
+                scope: w.scope(P_A, U1),
+                id: id.clone(),
+                expect_version: 1,
+                task: Some(Task {
+                    meta: Some(meta.clone()),
+                    ..new_task("rewritten")
+                }),
+                update_mask: None,
+                idempotency: None,
+            }))
+            .await
+            .expect_err("meta is assigned by this module on every write path (D42)");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "for {meta:?}");
+    }
+
+    // The half a status code cannot prove on its own: the refusal came BEFORE the
+    // statement, so the row still carries the title and the version it had. A
+    // guard that ran after the UPDATE would leave version 2 here.
+    let stored = w.read(P_A, U1, &id).await.expect("read");
+    assert_eq!(stored.title, "untouched", "a refused update wrote nothing");
+    assert_eq!(
+        stored.meta.expect("meta").version,
+        1,
+        "a refused update must not have consumed the version"
+    );
+}
+
+/// The counterpart, and the one that stops the guard breaking real traffic. An
+/// absent `Meta` is what `task` actually sends — `writes::edit_request` and
+/// `writes::transition_request` both build their `Task` from `..Default::default()`
+/// — and an empty one is what any caller that populates the field will send.
+/// Refusing either would turn a working path into `INVALID_ARGUMENT`.
+#[tokio::test]
+async fn an_absent_or_empty_meta_on_update_is_accepted() {
+    let w = World::fresh("td_meta_update_ok").await;
+    let id = w.create(P_A, U1, "t").await;
+
+    for (version, meta) in [(1, None), (2, Some(Meta::default()))] {
+        w.db.update_task(Request::new(UpdateTaskRequest {
+            scope: w.scope(P_A, U1),
+            id: id.clone(),
+            expect_version: version,
+            task: Some(Task {
+                meta,
+                ..new_task("edited")
+            }),
+            update_mask: None,
+            idempotency: None,
+        }))
+        .await
+        .expect("a Meta carrying no identity is the ordinary case");
+    }
+}
