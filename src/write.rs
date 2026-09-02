@@ -64,55 +64,71 @@ impl TaskDb {
         Ok(response)
     }
 
-    /// The next number for a project, allocated under a lock that actually
-    /// exists.
+    /// The next number for a project, allocated ON THE CALLER'S TRANSACTION and
+    /// on nothing else.
     ///
-    /// The counter ROW is created FIRST, in its own autocommitted statement,
-    /// before this transaction takes any lock on that table.
+    /// **ONE `CreateTask` MUST USE ONE CONNECTION.** This took two: it opened
+    /// with an `INSERT IGNORE` executed against `&self.pool` — a second acquire
+    /// from the same pool while `create`'s transaction still held the first. So N
+    /// concurrent creates against a pool of N take every connection with their
+    /// transactions and then all wait for a connection only one of them can
+    /// release. Measured at pool size 4 against MariaDB 11.8: one of four creates
+    /// succeeded and three failed after the full acquire timeout. The production
+    /// default is eight, and D80 made it a value an operator can lower — which
+    /// `check_engine_headroom` actively steers a constrained operator to do.
     ///
-    /// Reading first and creating the row only when the read comes back empty is
-    /// the obvious shape and it self-deadlocks: a `SELECT ... FOR UPDATE` that
-    /// matches nothing leaves a GAP lock behind, and the insert that would fill
-    /// the gap then waits on the very transaction that is about to perform it.
-    /// Measured, not reasoned about — every create hung for the full lock-wait
-    /// timeout.
+    /// The wait is also not a database error, so it never reached the retryable
+    /// arm of [`internal`]: `sqlx::Error::PoolTimedOut` is its own variant and
+    /// answered `INTERNAL`, telling a caller that a transient stall is permanent.
+    /// That arm is fixed there as well, because an unreachable defect is still a
+    /// defect.
     ///
-    /// Two callers racing on a brand-new project are safe here because each
-    /// `INSERT IGNORE` is its own transaction: the second waits for the first to
-    /// commit, finds the row, and ignores its own insert. Two transactions
-    /// inserting the same new key inside their own transactions would instead
-    /// deadlock on each other's insert-intent locks.
+    /// **UPSERT-AND-INCREMENT, in one statement.** `ON DUPLICATE KEY UPDATE`
+    /// takes an EXCLUSIVE lock on the row it collides with, so concurrent
+    /// allocators queue behind each other and the first to commit is the one the
+    /// next reads.
+    ///
+    /// It is deliberately not `INSERT IGNORE` moved onto the transaction, which
+    /// is the smaller-looking change. An `INSERT IGNORE` that collides takes a
+    /// SHARED lock on the duplicate row, and the `SELECT ... FOR UPDATE` after it
+    /// asks to upgrade that shared lock to an exclusive one. With two racers only
+    /// one holds the shared lock and the upgrade succeeds; with THREE OR MORE,
+    /// two hold it and each waits for the other to let go.
+    ///
+    /// MEASURED against MariaDB 11.8, that shape on one transaction, fresh
+    /// project: two racers passed twelve rounds, and FOUR racers failed on round
+    /// zero with a deadlock the engine broke by killing a create. Two racers is
+    /// what this suite had, so two racers is the number that proves nothing.
+    ///
+    /// Reading first and inserting only when the read comes back empty remains
+    /// wrong for the reason it always was: a `SELECT ... FOR UPDATE` matching
+    /// nothing leaves a GAP lock, and the insert meant to fill the gap waits on
+    /// the transaction about to perform it. There is no locking read here at all,
+    /// so that shape cannot come back.
+    ///
+    /// The read-back needs no `FOR UPDATE`. The statement above already holds the
+    /// row exclusively until this transaction commits, and a plain `SELECT` in
+    /// the same transaction sees that transaction's own write.
     async fn allocate_number(
         &self,
         tx: &mut Transaction<'_, MySql>,
         project: &str,
     ) -> Result<u32, Status> {
-        sqlx::query("INSERT IGNORE INTO task_counter (project_id, next_number) VALUES (?, 0)")
-            .bind(project)
-            .execute(&self.pool)
-            .await
-            .map_err(internal)?;
-
-        // A locking read sees the latest committed row rather than this
-        // transaction's snapshot, so the second allocator reads what the first
-        // one wrote instead of the value it started with. THIS is the lock the
-        // old `SELECT MAX(number) + 1 ... FOR UPDATE` failed to take: there were
-        // no rows to lock in an empty project, so it took nothing at all.
-        let last: u32 = sqlx::query_scalar(
-            "SELECT next_number FROM task_counter WHERE project_id = ? FOR UPDATE",
+        sqlx::query(
+            "INSERT INTO task_counter (project_id, next_number) VALUES (?, 1)
+             ON DUPLICATE KEY UPDATE next_number = next_number + 1",
         )
         .bind(project)
-        .fetch_one(&mut **tx)
+        .execute(&mut **tx)
         .await
         .map_err(internal)?;
 
-        let number = last + 1;
-        sqlx::query("UPDATE task_counter SET next_number = ? WHERE project_id = ?")
-            .bind(number)
-            .bind(project)
-            .execute(&mut **tx)
-            .await
-            .map_err(internal)?;
+        let number: u32 =
+            sqlx::query_scalar("SELECT next_number FROM task_counter WHERE project_id = ?")
+                .bind(project)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(internal)?;
         Ok(number)
     }
 
