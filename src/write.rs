@@ -8,7 +8,7 @@ use prost_types::FieldMask;
 use sqlx::mysql::MySqlArguments;
 use sqlx::query::Query;
 use sqlx::types::Json;
-use sqlx::{MySql, Transaction};
+use sqlx::{MySql, Row as _, Transaction};
 use tonic::Status;
 
 use crate::idem::{self, Claimed};
@@ -143,6 +143,57 @@ impl TaskDb {
             return Ok(original);
         }
 
+        // THE PRIOR STATUS, read BEFORE the update and inside the same
+        // transaction. `UpdateTaskResponse.previous_status` promises the status
+        // the row held before this write was applied, and the update itself is
+        // what destroys that value — so it is read here or it is not readable
+        // at all. `iam`-style recomputation is not available to the caller
+        // either: the logic service reads the task first and gets what the
+        // FIRST attempt wrote, which is the defect the field exists to close.
+        //
+        // ON EVERY UPDATE, NOT ONLY ON A STATUS CHANGE. An `update_mask` that
+        // does not name `status` still displaces a status, and the field
+        // carries it — equal to the status the row holds afterwards, which is
+        // the truth rather than an omission. TASK_STATUS_UNSPECIFIED must
+        // therefore have exactly one cause after this ships: an idempotency row
+        // recorded before the field existed. Making a mask that omits `status`
+        // a second cause is what this read exists to prevent.
+        //
+        // `FOR UPDATE`, and the lock is the point rather than the read. It
+        // holds the row from here until commit, so the value recorded is the
+        // one this write actually displaced and not one a concurrent writer
+        // replaced in between. It also sees the latest committed row rather
+        // than this transaction's snapshot.
+        //
+        // AUDIT: the interpolation is this module's own predicate; every caller
+        // value is a bound parameter.
+        let sql = format!(
+            "SELECT status FROM task
+              WHERE id = ? AND version = ? AND deleted_at IS NULL AND {}
+              FOR UPDATE",
+            reach.predicate()
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&req.id)
+            .bind(req.expect_version);
+        let found = reach
+            .bind(query)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?;
+
+        // The same refusal the compare-and-set below reaches, arrived at one
+        // statement earlier. The two conditions are identical — same id, same
+        // version, same reach, same `deleted_at` — so a caller cannot tell
+        // which statement refused, and the message stays the one it was.
+        let Some(row) = found else {
+            tx.rollback().await.map_err(internal)?;
+            return Err(Status::failed_precondition(
+                "version mismatch, or no such task in this scope — re-read and retry",
+            ));
+        };
+        let previous_status = row.try_get::<i8, _>("status").map_err(internal)? as i32;
+
         // Compare-and-set (D8): the version is in the WHERE, so a concurrent
         // writer's update makes this one match zero rows rather than silently
         // overwriting. The D12 ladder is in the same WHERE, so a record the
@@ -182,6 +233,11 @@ impl TaskDb {
             ));
         }
 
+        // `previous_status` is part of the recorded response, so `idem::record`
+        // below persists it and a replay returns the value the FIRST attempt
+        // displaced rather than one recomputed from a row that has since moved.
+        // That is the whole of the replay guarantee the field's comment makes,
+        // and it needs no change to the idempotency ledger.
         let response = UpdateTaskResponse {
             meta: Some(Meta {
                 id: req.id.clone(),
@@ -189,6 +245,7 @@ impl TaskDb {
                 project_id: scope.project_id.clone(),
                 ..Default::default()
             }),
+            previous_status,
         };
         idem::record(&mut tx, scope, req.idempotency.as_ref(), &response).await?;
         tx.commit().await.map_err(internal)?;
