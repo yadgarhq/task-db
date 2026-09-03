@@ -199,6 +199,62 @@ async fn the_owner_of_a_team_task_reads_it_through_the_team_arm() {
     assert_eq!(seen.title, "u3 team");
 }
 
+/// **THE ARM `Reach::visible` REFUSES TO ADD, PINNED BY THE ONLY TEST THAT CAN
+/// SEE IT.** The comment above `visible()` says a blanket `OR owner_user_id = ?`
+/// "would quietly make every TEAM test pass for the wrong reason" — and until
+/// this test, nothing enforced that refusal. Adding the arm to `visible()` and
+/// binding the user twice leaves the ENTIRE suite green: every other visibility
+/// test queries as U1 or U2 against a record owned by U3, deliberately, so
+/// `owner_user_id = <caller>` is false in all of them. Those tests are written
+/// DEFENSIVELY AGAINST the arm; none of them DETECTS it. This one is the owner
+/// querying their own record, which is the single shape the arm changes.
+///
+/// The assertion is in two halves against ONE row and ONE user, because
+/// `NOT_FOUND` is the cheapest vacuous pass in this suite — a garbage id
+/// answers it too. U3 reads `u3_team` successfully while carrying `TEAM`, then
+/// fails to read the SAME record with an empty team list. Team membership is
+/// the only variable between the two calls, so the second half cannot be
+/// passing for a reason the first half does not exclude.
+///
+/// **THIS ASSERTS BEHAVIOUR ADR-0522 HAS ALREADY DECLARED A DEFECT, AND THAT IS
+/// DELIBERATE.** An owner who LEFT the team their record is shared with cannot
+/// read their own record, and ADR-0522 rules that they must. The sanctioned fix
+/// is `src/setting.rs::resolve` — an inherited setting, resolved against the
+/// team of the ROW — which `task-db#28` landed with NO production call site
+/// because `task` still pins proto v1.7.1 and prost discards the unknown field.
+/// So this test states the PRE-ENFORCEMENT behaviour, which is the state the
+/// contract says a `-db` that does not read the field is in.
+///
+/// **When `resolve()` is wired into `Reach`, THIS TEST FAILING IS THE
+/// ENFORCEMENT LANDING, NOT A REGRESSION.** Invert it there — the owner reads
+/// their own record — and keep the two-half shape, because the blanket arm is
+/// still the wrong way to get there: the setting is resolved on the RECORD'S
+/// team, and a blanket arm ignores the setting entirely.
+#[tokio::test]
+async fn an_owner_outside_the_team_does_not_yet_reach_their_own_team_record() {
+    let c = two_projects_two_users("td_vis_team_owner_left").await;
+
+    // Half one: the same owner, the same record, WITH the membership. This is
+    // what makes the refusal below attributable to the team list rather than to
+    // a record that was never readable.
+    let seen = c
+        .read_as(&c.scope_in(P_A, U3, &[TEAM]), &c.u3_team)
+        .await
+        .expect("the owner in the named team reads their own TEAM record");
+    assert_eq!(seen.title, "u3 team");
+
+    // Half two: the owner who has left. The PRIVATE rung is
+    // `visibility NOT IN (2, 3)`, which excludes a TEAM row whoever owns it,
+    // and with no team list the TEAM arm is not rendered at all.
+    let err = c
+        .read_as(&c.scope_in(P_A, U3, &[]), &c.u3_team)
+        .await
+        .expect_err(
+            "pre-enforcement, ownership alone does not reach a TEAM record —              a blanket `OR owner_user_id = ?` arm is what this refuses",
+        );
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
 /// An empty team list must render as "no TEAM arm", never as `IN ()` — which is
 /// a syntax error — and never as "the arm is absent, so everything passes".
 #[tokio::test]
