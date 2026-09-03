@@ -2664,7 +2664,7 @@ dependencies = [
 [[package]]
 name = "yadgar-store"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/store.git?rev=6a6800236607285d2fc3c4f84c08a90cfea7da62#6a6800236607285d2fc3c4f84c08a90cfea7da62"
+source = "git+https://github.com/yadgarhq/store.git?tag=v0.1.0#6a6800236607285d2fc3c4f84c08a90cfea7da62"
 dependencies = [
  "sqlx",
  "thiserror",
@@ -2697,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "yadgar-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/telemetry.git?rev=1694475a7eab9a8332f2955671987c57bf3234e8#1694475a7eab9a8332f2955671987c57bf3234e8"
+source = "git+https://github.com/yadgarhq/telemetry.git?tag=v0.1.0#1694475a7eab9a8332f2955671987c57bf3234e8"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
