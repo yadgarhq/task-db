@@ -12,6 +12,7 @@ mod read;
 mod rows;
 pub mod schema;
 pub mod service;
+pub mod setting;
 mod sql;
 mod write;
 
