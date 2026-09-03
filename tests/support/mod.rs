@@ -191,6 +191,18 @@ impl World {
             team_ids: teams.iter().map(|t| (*t).to_string()).collect(),
             instance_id: "i-1".into(),
             request_id: "r-1".into(),
+            // ABSENT, which is what the wire carries today: the gateway
+            // populates it, `task` pins a contract without field 6, and prost
+            // discards unknown fields on the way through. Every engine-backed
+            // test therefore exercises the PRE-ENFORCEMENT path, which is the
+            // state this service is in.
+            //
+            // The literal stays EXHAUSTIVE rather than taking
+            // `..Default::default()`. It is a tripwire: this line is what made
+            // the proto bump announce itself, and spreading a default here
+            // would silently absorb the next field a contract adds — including
+            // one a read path must consult.
+            owner_reads_own_record: None,
         })
     }
 
