@@ -8,19 +8,21 @@
 //! answer depends on the team of the record being read, which nothing upstream
 //! of the query knows.
 //!
-//! **task-db IS STILL IN THE PRE-ENFORCEMENT STATE, DELIBERATELY, AND THIS
-//! FUNCTION IS NOT CALLED FROM THE REQUEST PATH.** The contract admits exactly
-//! two states and names the discriminator: "WHICH ONE IT IS IN IS DECIDED BY
-//! WHETHER IT READS THIS FIELD… A -db that does not read the field is in the
-//! PRE-ENFORCEMENT state and behaves exactly as it does today — that is what
-//! makes the order above possible at all." Enforcing today would refuse every
-//! read, because the hop between the gateway and this store cannot carry the
-//! field: `task` v0.4.1 pins proto v1.7.1, whose `Scope` has no field 6, and
-//! prost DISCARDS unknown fields rather than round-tripping them. So the
-//! gateway populates a field that is dropped one hop later, and a `Reach` built
-//! on this resolution would see an absent setting on every call and refuse it —
-//! correctly, and catastrophically. Wiring it in is the step AFTER `task`
-//! advances its own pin, and it is a change to `sql.rs`, not to this file.
+//! **task-db IS IN THE ENFORCING STATE, AND THIS MODULE IS WHAT PUT IT THERE.**
+//! The contract admits exactly two states and names the discriminator: "WHICH
+//! ONE IT IS IN IS DECIDED BY WHETHER IT READS THIS FIELD… A -db that reads it
+//! is in the ENFORCING state and the refusal binds it absolutely." `Reach`
+//! reads it, on `GetTask` and `ListTasks`, through [`owner_reach`]. There is no
+//! third state in which this tolerates an unset setting, so a read carrying
+//! none is refused rather than answered from a default.
+//!
+//! **THE BLOCKER THAT KEPT THIS UNWIRED IS GONE, AND IT WAS A CONTRACT PIN
+//! RATHER THAN A POLICY.** `task` v0.4.1 pinned proto v1.7.1, whose `Scope` had
+//! no field 6, and prost DISCARDS unknown fields rather than round-tripping
+//! them — so the gateway populated a field that was erased one hop later, and
+//! enforcing would have refused every read. `task` v0.4.3 vendors the contract
+//! carrying `owner_reads_own_record = 6`, so the field survives the hop and
+//! reaches this store intact.
 //!
 //! **THE PRESENCE CHECK IS RULED BEHAVIOUR THAT NO TEST CAN PIN, AND THAT IS
 //! RECORDED HERE SO NOBODY LATER "SIMPLIFIES" IT AWAY AS DEAD.** Substituting
@@ -115,9 +117,111 @@ fn refusal(what: &str) -> Status {
     ))
 }
 
+/// Which of a caller's OWN records ownership alone reaches, once [`resolve`]
+/// has answered for every team the setting can answer differently for.
+///
+/// **THE RESOLUTION IS PER-RECORD AND A STATEMENT IS PER-QUERY, AND THIS IS
+/// WHAT BRIDGES THEM.** `Reach` builds a `WHERE` clause before any row is
+/// fetched, so it cannot hand [`resolve`] the team of a row it has not read
+/// yet — and reading the row first and filtering afterwards is the leak
+/// `sql.rs` exists to refuse. The domain is finite, though: a setting answers
+/// one value for each team it NAMES and one value for every team it does not,
+/// so resolving each named team plus one team it does not name covers every row
+/// a query could return.
+///
+/// **IT IS A PROJECTION OF [`resolve`], NEVER A SECOND COPY OF THE ALGORITHM.**
+/// Every answer below comes back from [`resolve`] itself; what is added here is
+/// only the enumeration of the domain. The contract's reason applies with full
+/// force — "two normative copies in two files must stay in step for ever, and
+/// the copy that drifts is the one a reader happens to open" — so no branch
+/// here reads `org_locked`, `org_value` or the map's values.
+pub struct OwnerReach {
+    default_on: bool,
+    exceptions: Vec<String>,
+}
+
+impl OwnerReach {
+    /// What the setting answers for every team it does not name.
+    pub fn default_on(&self) -> bool {
+        self.default_on
+    }
+
+    /// The teams whose answer DIFFERS from [`OwnerReach::default_on`], sorted.
+    ///
+    /// SORTED BECAUSE `team_override` IS A HASH MAP. Its iteration order varies
+    /// between processes, so an unsorted list renders a different statement on
+    /// every run — which costs the engine its statement cache and makes a
+    /// failing test unreproducible on the next invocation.
+    pub fn exceptions(&self) -> &[String] {
+        &self.exceptions
+    }
+
+    /// Whether ownership alone reaches NOTHING. That is the pre-ADR-0522
+    /// behaviour, and it is the shape that renders no arm at all rather than an
+    /// arm nothing can satisfy.
+    pub fn reaches_nothing(&self) -> bool {
+        !self.default_on && self.exceptions.is_empty()
+    }
+}
+
+/// Project [`resolve`] onto every row one query could return.
+///
+/// **EVERY REFUSAL THE SETTING CARRIES IS REACHED EAGERLY, INCLUDING ONE FOR A
+/// TEAM THE QUERY MAY NEVER TOUCH.** A team entry holding the zero refuses the
+/// whole read rather than only the rows of that team. The narrower behaviour is
+/// not expressible here and stating why is the point: a row whose team states
+/// nothing must be REFUSED, and a `WHERE` clause can only fail to match it —
+/// which turns the refusal into an invisible absence, the exact silent policy
+/// this setting exists to make unwritable. Refusing wider is loud, and the
+/// write path declares such an entry impossible in the first place.
+pub fn owner_reach(setting: &Option<InheritedSetting>) -> Result<OwnerReach, Status> {
+    let default_on =
+        resolve(setting, &team_the_setting_does_not_name(setting))? == SettingValue::On;
+
+    let mut exceptions = Vec::new();
+    if let Some(present) = setting.as_ref() {
+        for team in present.team_override.keys() {
+            // EVERY named team is resolved, including under a lock that makes
+            // the map inert. That is not wasted work: it is what keeps the
+            // answer coming from `resolve` rather than from a branch here that
+            // decided for itself that the map could be skipped.
+            if (resolve(setting, team)? == SettingValue::On) != default_on {
+                exceptions.push(team.clone());
+            }
+        }
+    }
+    exceptions.sort();
+
+    Ok(OwnerReach {
+        default_on,
+        exceptions,
+    })
+}
+
+/// A team id the setting does NOT name, so that resolving against it yields the
+/// answer every unnamed team gets.
+///
+/// The empty string is the first candidate because it is not a guess: it is
+/// what the `team_id` column holds for every record that is not TEAM-visible,
+/// and `SetInheritedSetting` refuses an empty team id at team scope — so a
+/// well-formed map never names it. A MALFORMED map CAN name it, and the answer
+/// for unnamed teams would then be read off an entry that names one, so the
+/// probe grows until it is genuinely absent rather than assuming a shape the
+/// wire does not enforce.
+fn team_the_setting_does_not_name(setting: &Option<InheritedSetting>) -> String {
+    let mut probe = String::new();
+    while setting
+        .as_ref()
+        .is_some_and(|s| s.team_override.contains_key(&probe))
+    {
+        probe.push('\0');
+    }
+    probe
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve;
+    use super::{owner_reach, resolve};
     use crate::pb::yadgar::common::v1::{InheritedSetting, Scope, SettingValue};
     use tonic::Code;
 
@@ -315,6 +419,218 @@ mod tests {
         let err =
             resolve(&setting, RECORD_TEAM).expect_err("99 names no policy this contract declares");
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // -----------------------------------------------------------------------
+    // The PROJECTION. `resolve` answers for ONE record's team; a statement is
+    // built before any record is read. These pin the bridge between the two,
+    // and every one of them is a claim about what SQL will be rendered.
+    // -----------------------------------------------------------------------
+
+    /// The refusal survives the projection, and it is the case that turns this
+    /// service from PRE-ENFORCEMENT into ENFORCING. An absent setting is what
+    /// the wire carried until `task` v0.4.3, so this is the assertion that
+    /// makes the roll-out order load-bearing rather than advisory.
+    #[test]
+    fn an_absent_setting_refuses_the_whole_read_rather_than_reaching_nothing() {
+        let err = owner_reach(&None)
+            .err()
+            .expect("an absent setting names no policy, and a read may not proceed on one");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// The other wire form of the same case. Refusing only one of the two is
+    /// how a wholly absent setting gets accepted somewhere else.
+    #[test]
+    fn a_present_setting_stating_nothing_refuses_the_whole_read_too() {
+        let setting = Some(org(SettingValue::Unspecified, false, &[]));
+        let err = owner_reach(&setting)
+            .err()
+            .expect("a present message holding the zero still names no policy");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// **The precedence, seen through the projection.** The organisation states
+    /// nothing and the record's own team states ON. An implementation that
+    /// enumerates the map before resolving the organisation answers "this team
+    /// reaches" and never refuses.
+    #[test]
+    fn a_team_override_does_not_rescue_the_projection_of_a_silent_organisation() {
+        let setting = Some(org(
+            SettingValue::Unspecified,
+            false,
+            &[(RECORD_TEAM, SettingValue::On)],
+        ));
+        let err = owner_reach(&setting)
+            .err()
+            .expect("the refusal is the first step of the resolution, and the projection keeps it");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// A team entry holding the representable zero refuses the read, EVEN
+    /// THOUGH no row of that team need be returned. Stated as its own test
+    /// because the eager refusal is a deliberate widening, not a side effect.
+    #[test]
+    fn a_zero_holding_team_entry_refuses_the_read_though_the_query_may_not_touch_that_team() {
+        let setting = Some(org(
+            SettingValue::On,
+            false,
+            &[(OTHER_TEAM, SettingValue::Unspecified)],
+        ));
+        let err = owner_reach(&setting)
+            .err()
+            .expect("a zero-holding override states nothing and cannot be projected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// **THE SHIPPED CONFIGURATION.** `iam-db` migration 12 inserts
+    /// `owner_reads_own_record` as `SETTING_VALUE_ON` with the lock ENGAGED, so
+    /// this is the shape every deployment gets: ownership reaches every record
+    /// the caller owns, and no team is an exception.
+    #[test]
+    fn a_locked_organisation_stating_on_reaches_every_record_the_caller_owns() {
+        let setting = Some(org(SettingValue::On, true, &[]));
+        let reach = owner_reach(&setting).expect("a locked organisation resolves");
+
+        assert!(reach.default_on());
+        assert!(reach.exceptions().is_empty());
+        assert!(!reach.reaches_nothing());
+    }
+
+    /// The lock makes the map INERT, so a contradicting override is not an
+    /// exception — it is nothing at all. An implementation that enumerated the
+    /// map without resolving each key reports `t1` here and renders an arm that
+    /// excludes a team the organisation locked in.
+    #[test]
+    fn a_locked_organisation_projects_no_exception_for_a_contradicting_override() {
+        let setting = Some(org(
+            SettingValue::On,
+            true,
+            &[(RECORD_TEAM, SettingValue::Off)],
+        ));
+        let reach = owner_reach(&setting).expect("a locked organisation resolves");
+
+        assert!(reach.default_on());
+        assert!(
+            reach.exceptions().is_empty(),
+            "the lock makes the map inert; {:?} is not an exception to anything",
+            reach.exceptions()
+        );
+    }
+
+    /// OFF everywhere is the PRE-ENFORCEMENT reach expressed as a policy
+    /// somebody chose, and it must render no arm at all rather than an arm no
+    /// row satisfies.
+    #[test]
+    fn a_locked_organisation_stating_off_reaches_nothing() {
+        let setting = Some(org(SettingValue::Off, true, &[]));
+        let reach = owner_reach(&setting).expect("a locked organisation resolves");
+
+        assert!(!reach.default_on());
+        assert!(reach.reaches_nothing());
+    }
+
+    /// An unlocked OFF organisation with one team saying ON. The default is
+    /// OFF, so the arm names the teams that DO reach — and `t1` is that list.
+    #[test]
+    fn an_unlocked_organisation_stating_off_names_the_teams_that_do_reach() {
+        let setting = Some(org(
+            SettingValue::Off,
+            false,
+            &[(RECORD_TEAM, SettingValue::On)],
+        ));
+        let reach = owner_reach(&setting).expect("an unlocked organisation yields to its team");
+
+        assert!(!reach.default_on());
+        assert_eq!(reach.exceptions(), [RECORD_TEAM.to_string()]);
+        assert!(
+            !reach.reaches_nothing(),
+            "one team states ON, so ownership reaches something"
+        );
+    }
+
+    /// The mirror, and it is a DIFFERENT rendering rather than the same one
+    /// inverted: the default is ON, so the arm names the teams that do NOT
+    /// reach. A projection that only ever emitted an inclusion list would
+    /// answer "only t1 reaches" here, which is the complement of the truth.
+    #[test]
+    fn an_unlocked_organisation_stating_on_names_the_teams_that_do_not_reach() {
+        let setting = Some(org(
+            SettingValue::On,
+            false,
+            &[(RECORD_TEAM, SettingValue::Off)],
+        ));
+        let reach = owner_reach(&setting).expect("an unlocked organisation yields to its team");
+
+        assert!(reach.default_on());
+        assert_eq!(reach.exceptions(), [RECORD_TEAM.to_string()]);
+    }
+
+    /// A team that AGREES with the organisation is not an exception. Listing it
+    /// would render `team_id NOT IN ('t1')` for a team whose answer is ON,
+    /// which excludes exactly the rows the setting includes.
+    #[test]
+    fn a_team_agreeing_with_its_organisation_is_not_an_exception() {
+        let setting = Some(org(
+            SettingValue::On,
+            false,
+            &[
+                (RECORD_TEAM, SettingValue::On),
+                (OTHER_TEAM, SettingValue::Off),
+            ],
+        ));
+        let reach = owner_reach(&setting).expect("an unlocked organisation resolves");
+
+        assert!(reach.default_on());
+        assert_eq!(
+            reach.exceptions(),
+            [OTHER_TEAM.to_string()],
+            "only the team that DISAGREES is an exception"
+        );
+    }
+
+    /// **THE EMPTY TEAM ID IS A REAL KEY, NOT A SENTINEL, AND THIS IS WHY THE
+    /// PROBE GROWS.** `team_id` is `NOT NULL DEFAULT ''`, so every record that
+    /// is not TEAM-visible carries the empty string — and a projection that
+    /// probed the unnamed answer at `""` would read it off THIS entry and
+    /// report OFF as the answer for every team in the deployment.
+    ///
+    /// The organisation states ON and only the empty team disagrees, so the
+    /// correct projection is default ON with `""` as its single exception.
+    #[test]
+    fn an_override_on_the_empty_team_does_not_become_the_answer_for_every_other_team() {
+        let setting = Some(org(SettingValue::On, false, &[("", SettingValue::Off)]));
+        let reach = owner_reach(&setting).expect("an unlocked organisation resolves");
+
+        assert!(
+            reach.default_on(),
+            "the empty team's entry must not be read as the answer for teams the setting does not name"
+        );
+        assert_eq!(reach.exceptions(), [String::new()]);
+    }
+
+    /// The rendered statement must not depend on hash iteration order.
+    #[test]
+    fn the_exceptions_are_sorted_so_one_setting_renders_one_statement() {
+        let setting = Some(org(
+            SettingValue::Off,
+            false,
+            &[
+                ("t-zulu", SettingValue::On),
+                ("t-alpha", SettingValue::On),
+                ("t-mike", SettingValue::On),
+            ],
+        ));
+        let reach = owner_reach(&setting).expect("an unlocked organisation resolves");
+
+        assert_eq!(
+            reach.exceptions(),
+            [
+                "t-alpha".to_string(),
+                "t-mike".to_string(),
+                "t-zulu".to_string()
+            ]
+        );
     }
 
     /// **The team is the RECORD'S, never the CALLER'S.** The defect ADR-0522

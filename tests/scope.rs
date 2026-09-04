@@ -7,8 +7,10 @@
 
 mod support;
 
-use support::{two_projects_two_users, World, OTHER_TEAM, P_A, P_B, TEAM, U1, U2, U3};
-use yadgar_task_db::pb::yadgar::common::v1::Visibility;
+use support::{
+    setting, shipped_setting, two_projects_two_users, World, OTHER_TEAM, P_A, P_B, TEAM, U1, U2, U3,
+};
+use yadgar_task_db::pb::yadgar::common::v1::{SettingValue, Visibility};
 
 // ---------------------------------------------------------------------------
 // The project axis. `subtree()` builds a LIKE pattern out of a project id, and
@@ -199,60 +201,405 @@ async fn the_owner_of_a_team_task_reads_it_through_the_team_arm() {
     assert_eq!(seen.title, "u3 team");
 }
 
-/// **THE ARM `Reach::visible` REFUSES TO ADD, PINNED BY THE ONLY TEST THAT CAN
-/// SEE IT.** The comment above `visible()` says a blanket `OR owner_user_id = ?`
-/// "would quietly make every TEAM test pass for the wrong reason" — and until
-/// this test, nothing enforced that refusal. Adding the arm to `visible()` and
-/// binding the user twice leaves the ENTIRE suite green: every other visibility
-/// test queries as U1 or U2 against a record owned by U3, deliberately, so
-/// `owner_user_id = <caller>` is false in all of them. Those tests are written
-/// DEFENSIVELY AGAINST the arm; none of them DETECTS it. This one is the owner
-/// querying their own record, which is the single shape the arm changes.
+/// **THE ENFORCEMENT LANDING. `task-db#29` WROTE THIS TEST INVERTED AND SAID
+/// SO.** It pinned the PRE-ENFORCEMENT behaviour — an owner outside the team of
+/// their own `TEAM` record was refused — and its doc comment ruled in advance
+/// that "when `resolve()` is wired into `Reach`, THIS TEST FAILING IS THE
+/// ENFORCEMENT LANDING, NOT A REGRESSION. Invert it there… and keep the
+/// two-half shape". This is that inversion.
 ///
-/// The assertion is in two halves against ONE row and ONE user, because
-/// `NOT_FOUND` is the cheapest vacuous pass in this suite — a garbage id
-/// answers it too. U3 reads `u3_team` successfully while carrying `TEAM`, then
-/// fails to read the SAME record with an empty team list. Team membership is
-/// the only variable between the two calls, so the second half cannot be
-/// passing for a reason the first half does not exclude.
+/// The setting is the one `iam-db` migration 12 actually seeds: `ON`, locked.
+/// ADR-0522's defect is the owner who LEFT the team their record is shared
+/// with, and U3 here belongs to no team at all while still owning `u3_team`.
 ///
-/// **THIS ASSERTS BEHAVIOUR ADR-0522 HAS ALREADY DECLARED A DEFECT, AND THAT IS
-/// DELIBERATE.** An owner who LEFT the team their record is shared with cannot
-/// read their own record, and ADR-0522 rules that they must. The sanctioned fix
-/// is `src/setting.rs::resolve` — an inherited setting, resolved against the
-/// team of the ROW — which `task-db#28` landed with NO production call site
-/// because `task` still pins proto v1.7.1 and prost discards the unknown field.
-/// So this test states the PRE-ENFORCEMENT behaviour, which is the state the
-/// contract says a `-db` that does not read the field is in.
+/// **THE TWO HALVES SURVIVE, WITH OWNERSHIP AS THE VARIABLE RATHER THAN
+/// MEMBERSHIP.** A success is not vacuous the way `NOT_FOUND` is, but it can
+/// still pass for the wrong reason — an arm that widened the row to EVERYBODY
+/// satisfies half one exactly as well. So the same record is read twice under
+/// the SAME setting and the SAME empty team list, and the only thing that
+/// changes is who is asking: the owner reaches it, a non-owner does not.
 ///
-/// **When `resolve()` is wired into `Reach`, THIS TEST FAILING IS THE
-/// ENFORCEMENT LANDING, NOT A REGRESSION.** Invert it there — the owner reads
-/// their own record — and keep the two-half shape, because the blanket arm is
-/// still the wrong way to get there: the setting is resolved on the RECORD'S
-/// team, and a blanket arm ignores the setting entirely.
+/// **A BLANKET `OR owner_user_id = ?` IS STILL THE WRONG WAY TO GET HERE, and
+/// this test does not distinguish it — deliberately, because a later test in
+/// this file does.** Under `ON` and locked the setting resolves the same answer
+/// for every team, so a blanket arm selects exactly these rows; it is an
+/// EQUIVALENT mutant under this configuration. The tests that state `OFF`, and
+/// the one that states a team override, are where it dies.
 #[tokio::test]
-async fn an_owner_outside_the_team_does_not_yet_reach_their_own_team_record() {
+async fn an_owner_outside_the_team_reaches_their_own_team_record() {
     let c = two_projects_two_users("td_vis_team_owner_left").await;
+    let policy = Some(shipped_setting());
 
-    // Half one: the same owner, the same record, WITH the membership. This is
-    // what makes the refusal below attributable to the team list rather than to
-    // a record that was never readable.
+    // Half one: the owner who has left. The PRIVATE rung is
+    // `visibility NOT IN (2, 3)`, which excludes a TEAM row whoever owns it,
+    // and with no team list the TEAM arm is not rendered at all — so ADR-0522's
+    // arm is the only thing in the statement that can be returning this row.
     let seen = c
-        .read_as(&c.scope_in(P_A, U3, &[TEAM]), &c.u3_team)
+        .read_as(&c.scope_with(P_A, U3, &[], policy.clone()), &c.u3_team)
         .await
-        .expect("the owner in the named team reads their own TEAM record");
+        .expect("with the setting ON, an owner reads their own record from outside its team");
     assert_eq!(seen.title, "u3 team");
 
-    // Half two: the owner who has left. The PRIVATE rung is
-    // `visibility NOT IN (2, 3)`, which excludes a TEAM row whoever owns it,
-    // and with no team list the TEAM arm is not rendered at all.
+    // Half two: the same record, the same setting, the same empty team list,
+    // and a caller who does not own it. The arm is keyed on ownership, so this
+    // must still be refused — otherwise half one is passing because the row
+    // became visible to everybody.
     let err = c
-        .read_as(&c.scope_in(P_A, U3, &[]), &c.u3_team)
+        .read_as(&c.scope_with(P_A, U1, &[], policy), &c.u3_team)
+        .await
+        .expect_err("the setting widens the OWNER's reach, not everyone's");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// The same record and the same caller under `OFF`, which is `task-db#29`'s
+/// original assertion with the policy now stated rather than absent.
+///
+/// **THIS IS WHERE A BLANKET `OR owner_user_id = ?` DIES.** An arm that ignores
+/// the setting returns `u3_team` to U3 here, and no other test in this file can
+/// see that: every other TEAM test queries as U1 or U2 against a record owned
+/// by U3, deliberately, so `owner_user_id = <caller>` is false in all of them.
+///
+/// The two-half shape is `task-db#29`'s, unchanged, because `NOT_FOUND` is
+/// still the cheapest vacuous pass in this suite: U3 reads `u3_team`
+/// successfully while carrying `TEAM`, then fails to read the SAME record with
+/// an empty team list. Team membership is the only variable between the calls.
+#[tokio::test]
+async fn a_setting_stating_off_leaves_an_owner_outside_the_team_where_they_were() {
+    let c = two_projects_two_users("td_vis_team_owner_off").await;
+    let policy = Some(setting(SettingValue::Off, true, &[]));
+
+    let seen = c
+        .read_as(&c.scope_with(P_A, U3, &[TEAM], policy.clone()), &c.u3_team)
+        .await
+        .expect("the owner in the named team reads their own TEAM record through the TEAM arm");
+    assert_eq!(seen.title, "u3 team");
+
+    let err = c
+        .read_as(&c.scope_with(P_A, U3, &[], policy), &c.u3_team)
         .await
         .expect_err(
-            "pre-enforcement, ownership alone does not reach a TEAM record —              a blanket `OR owner_user_id = ?` arm is what this refuses",
+            "with the setting OFF, ownership alone does not reach a TEAM record — \
+             a blanket `OR owner_user_id = ?` arm is what this refuses",
         );
     assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0522, enforced. `yadgar/common/v1` admits exactly two states for a `-db`
+// and this service is now in the second: "A -db that reads it is in the
+// ENFORCING state and the refusal binds it absolutely." Everything below is
+// that refusal, and the arm it gates.
+// ---------------------------------------------------------------------------
+
+/// **THE REFUSAL, ON THE VERB THAT CARRIES IT.** An absent setting names no
+/// policy, and the contract forbids a store choosing one: "There is no third
+/// state in which a -db reads the field and tolerates it being unset."
+///
+/// This is the request every caller sent until `task` v0.4.3, so it is also the
+/// assertion that makes the roll-out order real rather than advisory.
+#[tokio::test]
+async fn a_read_carrying_no_setting_is_refused_rather_than_answered() {
+    let c = two_projects_two_users("td_setting_absent_get").await;
+
+    let err = c
+        .read_as(&c.scope_with(P_A, U1, &[], None), &c.u1_private)
+        .await
+        .expect_err("an absent setting names no policy, and a store may not pick one");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// The refusal reaches `ListTasks` too. A setting honoured on one read verb and
+/// not the other is a caller who cannot fetch a record it can list, and the
+/// two verbs build their statements separately — which is exactly the shape
+/// that put a visibility filter on one `GetTask` arm and not the other.
+#[tokio::test]
+async fn a_list_carrying_no_setting_is_refused_rather_than_answered() {
+    use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbService as _;
+
+    let c = two_projects_two_users("td_setting_absent_list").await;
+
+    let err =
+        c.db.list_tasks(tonic::Request::new(
+            yadgar_task_db::pb::yadgar::task::v1::ListTasksRequest {
+                scope: c.scope_with(P_A, U1, &[], None),
+                statuses: vec![],
+                page_size: 0,
+                page_token: String::new(),
+            },
+        ))
+        .await
+        .expect_err("ListTasks reads the ladder, so it reads the setting");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// The number arm of `GetTask` is a THIRD statement, built from
+/// `Reach::readable` rather than `Reach::read_predicate`, and a setting applied
+/// to one arm and not the other is precisely the shape of the leak this file
+/// was written for.
+#[tokio::test]
+async fn the_number_arm_carries_adr_0522_as_well() {
+    use tonic::Request;
+    use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbService as _;
+    use yadgar_task_db::pb::yadgar::task::v1::{get_task_request, GetTaskRequest};
+
+    let c = two_projects_two_users("td_setting_number_arm").await;
+    let number = c
+        .read_as(
+            &c.scope_with(P_A, U3, &[TEAM], Some(shipped_setting())),
+            &c.u3_team,
+        )
+        .await
+        .expect("the owner in the team reads their own record")
+        .number;
+
+    // Refused outright when the setting is absent.
+    let err =
+        c.db.get_task(Request::new(GetTaskRequest {
+            scope: c.scope_with(P_A, U3, &[], None),
+            key: Some(get_task_request::Key::Number(number)),
+        }))
+        .await
+        .expect_err("the number arm refuses an unstated setting like the id arm does");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // And widened by it when stated ON, from outside the team.
+    let seen =
+        c.db.get_task(Request::new(GetTaskRequest {
+            scope: c.scope_with(P_A, U3, &[], Some(shipped_setting())),
+            key: Some(get_task_request::Key::Number(number)),
+        }))
+        .await
+        .expect("the number arm honours ADR-0522 too")
+        .into_inner()
+        .task
+        .expect("task");
+    assert_eq!(seen.title, "u3 team");
+}
+
+/// The OTHER wire form of "nothing stated". The two are distinguishable on the
+/// wire, which is exactly why the contract says they are treated alike: "AN
+/// ABSENT MESSAGE AND A PRESENT ONE HOLDING SETTING_VALUE_UNSPECIFIED ARE ONE
+/// CASE, NOT TWO, AND BOTH ARE REFUSED."
+#[tokio::test]
+async fn a_present_setting_stating_nothing_is_refused_like_an_absent_one() {
+    let c = two_projects_two_users("td_setting_zero_get").await;
+
+    let err = c
+        .read_as(
+            &c.scope_with(
+                P_A,
+                U1,
+                &[],
+                Some(setting(SettingValue::Unspecified, false, &[])),
+            ),
+            &c.u1_private,
+        )
+        .await
+        .expect_err("a present message holding the zero still names no policy");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// **THE ORDER OF THE RESOLUTION, VISIBLE FROM THE REQUEST PATH.** The
+/// organisation states nothing and the RECORD'S OWN team states ON. An
+/// implementation that consults the lock or the map before `org_value` finds an
+/// override, answers ON, and refuses nothing — so the refusal is unreachable in
+/// precisely the deployment that has an unconfigured organisation and a team
+/// with an opinion.
+///
+/// The override is on `TEAM`, which is `u3_team`'s own team, on purpose:
+/// written with an empty map or an override on some other team, this is
+/// satisfied by the wrong-order implementation too and pins nothing.
+#[tokio::test]
+async fn an_override_does_not_rescue_a_read_whose_organisation_stated_nothing() {
+    let c = two_projects_two_users("td_setting_precedence").await;
+
+    let err = c
+        .read_as(
+            &c.scope_with(
+                P_A,
+                U3,
+                &[],
+                Some(setting(
+                    SettingValue::Unspecified,
+                    false,
+                    &[(TEAM, SettingValue::On)],
+                )),
+            ),
+            &c.u3_team,
+        )
+        .await
+        .expect_err("the refusal is the FIRST step of the resolution, not a check beside it");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// **THE TEAM IS THE RECORD'S, NEVER THE CALLER'S, AND HERE THE CALLER HAS
+/// NONE.** The organisation states OFF and unlocked; only `u3_team`'s own team
+/// says ON. U3 belongs to no team at all, so an implementation that keyed the
+/// override on `Scope.team_ids` finds nothing and answers OFF — which is the
+/// setting evaporating in exactly the case ADR-0522 exists for.
+#[tokio::test]
+async fn an_override_on_the_records_team_reaches_an_owner_who_is_in_no_team() {
+    let c = two_projects_two_users("td_setting_record_team").await;
+
+    let seen = c
+        .read_as(
+            &c.scope_with(
+                P_A,
+                U3,
+                &[],
+                Some(setting(
+                    SettingValue::Off,
+                    false,
+                    &[(TEAM, SettingValue::On)],
+                )),
+            ),
+            &c.u3_team,
+        )
+        .await
+        .expect("the record's own team states ON, whatever the caller belongs to");
+    assert_eq!(seen.title, "u3 team");
+}
+
+/// The same policy with the override moved to a team the record is NOT in.
+/// Absence in the map is how a team states nothing, so the organisation's OFF
+/// stands — and an implementation that rendered the arm without matching the
+/// row's `team_id` returns the record here.
+#[tokio::test]
+async fn an_override_on_another_team_does_not_reach_this_records_owner() {
+    let c = two_projects_two_users("td_setting_other_team").await;
+
+    let err = c
+        .read_as(
+            &c.scope_with(
+                P_A,
+                U3,
+                &[],
+                Some(setting(
+                    SettingValue::Off,
+                    false,
+                    &[(OTHER_TEAM, SettingValue::On)],
+                )),
+            ),
+            &c.u3_team,
+        )
+        .await
+        .expect_err("the override belongs to another team; this record's team states nothing");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+/// **THE EXCLUSION RENDERING, which is a DIFFERENT statement rather than the
+/// inclusion one inverted.** The organisation states ON and unlocked, and the
+/// record's own team says OFF — so the arm must SUBTRACT that team from an
+/// otherwise blanket reach. A projection that only ever emitted an inclusion
+/// list renders "only t-platform reaches", the exact complement of the policy,
+/// and returns this record.
+#[tokio::test]
+async fn an_override_stating_off_subtracts_its_team_from_an_otherwise_open_setting() {
+    let c = two_projects_two_users("td_setting_subtract").await;
+    let policy = Some(setting(
+        SettingValue::On,
+        false,
+        &[(TEAM, SettingValue::Off)],
+    ));
+
+    let err = c
+        .read_as(&c.scope_with(P_A, U3, &[], policy.clone()), &c.u3_team)
+        .await
+        .expect_err("this record's team states OFF, so its owner does not reach it from outside");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // The second half proves the subtraction is a subtraction rather than the
+    // whole arm going missing: the SAME caller under the SAME setting still
+    // reaches a record whose team the override does not name. `u1_private` is
+    // U1's, so this is U1 reading their own PRIVATE record — which the ladder
+    // grants anyway, and which therefore cannot be what fails.
+    let seen = c
+        .read_as(&c.scope_with(P_A, U1, &[], policy), &c.u1_private)
+        .await
+        .expect("a record whose team the override does not name is unaffected");
+    assert_eq!(seen.title, "u1 private");
+}
+
+/// The lock is what makes an organisation's policy inescapable, and a
+/// contradicting override must be IGNORED rather than merged. An
+/// implementation that merely prefers an override where one exists refuses
+/// this read.
+#[tokio::test]
+async fn a_locked_organisation_ignores_an_override_on_the_records_own_team() {
+    let c = two_projects_two_users("td_setting_locked").await;
+
+    let seen = c
+        .read_as(
+            &c.scope_with(
+                P_A,
+                U3,
+                &[],
+                Some(setting(
+                    SettingValue::On,
+                    true,
+                    &[(TEAM, SettingValue::Off)],
+                )),
+            ),
+            &c.u3_team,
+        )
+        .await
+        .expect("a locked organisation ignores every override rather than merging with it");
+    assert_eq!(seen.title, "u3 team");
+}
+
+/// `ListTasks` widens with the same setting, and it is a separate statement.
+#[tokio::test]
+async fn a_list_carries_the_owners_own_team_record_when_the_setting_states_on() {
+    let c = two_projects_two_users("td_setting_list_widens").await;
+
+    let titles: Vec<_> = c
+        .list_as(&c.scope_with(P_A, U3, &[], Some(shipped_setting())))
+        .await
+        .iter()
+        .map(|t| t.title.clone())
+        .collect();
+
+    assert!(
+        titles.contains(&"u3 team".to_string()),
+        "the owner's own TEAM record must appear in their list: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"u1 private".to_string()),
+        "and the arm must widen the OWNER's reach only: {titles:?}"
+    );
+}
+
+/// **THE SETTING IS NAMED `owner_reads_own_record`, AND THE EDIT PATH IS
+/// DELIBERATELY NOT WIDENED BY IT.** `UpdateTask` builds its statement from
+/// `Reach::predicate`, which carries no ADR-0522 arm, so an absent setting does
+/// not refuse a write and a stated one does not grant edit authority a
+/// read-named setting never promised.
+///
+/// Both halves are asserted because either alone is satisfiable by an accident:
+/// that the write is not REFUSED, and that it is not WIDENED.
+#[tokio::test]
+async fn the_edit_path_neither_refuses_nor_widens_on_this_setting() {
+    let c = two_projects_two_users("td_setting_edit_untouched").await;
+
+    // Not refused: an absent setting is fine for a write, which is what keeps
+    // the enforcement blast radius to the two read verbs.
+    c.edit_as(&c.scope_with(P_A, U1, &[], None), &c.u1_private, "renamed")
+        .await
+        .expect("an absent setting must not refuse an edit; the setting names reads");
+
+    // Not widened: U3 owns `u3_team` and is in no team, so ADR-0522 lets them
+    // READ it — and the edit path still refuses, under the very setting that
+    // grants the read.
+    let policy = Some(shipped_setting());
+    c.read_as(&c.scope_with(P_A, U3, &[], policy.clone()), &c.u3_team)
+        .await
+        .expect("the read is granted, which is what makes the refusal below attributable");
+
+    let err = c
+        .edit_as(&c.scope_with(P_A, U3, &[], policy), &c.u3_team, "hijacked")
+        .await
+        .expect_err("a setting named for reads must not hand out edit authority");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
 /// An empty team list must render as "no TEAM arm", never as `IN ()` — which is
