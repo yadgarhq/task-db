@@ -15,7 +15,7 @@ mod support;
 
 use tonic::Code;
 
-use support::{World, P_A, TEAM, U1, U2, U3};
+use support::{ladder_only, World, P_A, TEAM, U1, U2, U3};
 use yadgar_task_db::pb::yadgar::common::v1::Visibility;
 
 /// What `unwrap_or(1)` accepted from a caller that set nothing: the proto says
@@ -138,6 +138,13 @@ async fn a_second_apply_finds_nothing_pending() {
 /// catches is a migration that heals to something the ladder does not agree
 /// with, in either direction; the column assertions above are what catch its
 /// absence.
+///
+/// **THE OWNER'S TWO ASSERTIONS STATE [`ladder_only`].** The fixture default is
+/// the shipped `ON`, under which ADR-0522's arm returns any record the caller
+/// owns whatever the rung says — so an owner-read left on the default would stop
+/// saying anything about the ladder agreeing with the healed column, which is
+/// the whole subject of this test. The three NON-owner assertions need no such
+/// pin: ownership is false in all of them, so the arm cannot answer.
 #[tokio::test]
 async fn a_healed_row_reads_as_private_through_the_service() {
     let w = World::fresh_at("td_mig5_reads", 4).await;
@@ -148,7 +155,8 @@ async fn a_healed_row_reads_as_private_through_the_service() {
 
     w.migrate_to_head().await;
 
-    w.read(P_A, U1, &healed)
+    let ladder = w.scope_with(P_A, U1, &[], Some(ladder_only()));
+    w.read_as(&ladder, &healed)
         .await
         .expect("the owner must be able to read the row that was healed for them");
 
@@ -166,7 +174,7 @@ async fn a_healed_row_reads_as_private_through_the_service() {
     // The scopes here carry no teams, so the TEAM arm cannot be what makes a
     // read pass — it is dropped from the predicate entirely when the list is
     // empty.
-    let mine = ids(&w.list(P_A, U1).await);
+    let mine = ids(&w.list_as(&ladder).await);
     assert!(
         mine.contains(&healed),
         "the owner's list must carry the healed row: GetTask and ListTasks \
