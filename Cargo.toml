@@ -42,6 +42,18 @@ prost = "0.14"
 prost-types = "0.14"
 # The shared instrumentation seam (D67), pinned by release tag like every in-org crate.
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.0", features = ["grpc"] }
+# WHICH SIGNALS END THIS PROCESS, decided once for the estate rather than once
+# per repository (ADR-0526's pin, D19's rule). `boot::shutdown` was the fifth
+# copy of one function and the only one that did not match the other four, which
+# is how a duplicated decision drifts.
+#
+# `shutdown` and nothing else is used here. The crate also carries ADR-0523's
+# rotation watcher and the `DRAIN_BUDGET`/`drain_within` pair that bounds a
+# self-initiated drain, and neither applies to this service: nothing here ends
+# the serving future on its own, so the only drain that ever happens is the one
+# `terminationGracePeriodSeconds` already bounds. Adopting the budget without
+# the watcher would be a number bounding nothing.
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
 sqlx = { version = "0.9", default-features = false, features = [
   "json",
   "runtime-tokio",
@@ -49,7 +61,11 @@ sqlx = { version = "0.9", default-features = false, features = [
   "mysql",
   "macros",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# NO `signal` FEATURE. It was here for `boot::shutdown`'s own `signal::unix`
+# calls, and those are `yadgar-lifecycle`'s now — that crate declares the feature
+# it needs. Cargo features are additive, so the built tree is unchanged; what is
+# removed is a manifest line claiming this crate handles signals itself.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # D9's differing-payload refusal compares a digest of the prior REQUEST, so the
 # digest has to be one a caller cannot collide. A non-cryptographic hash is
 # cheaper and its collision is the exact lie the rule exists to stop: two

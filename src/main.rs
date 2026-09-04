@@ -119,10 +119,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50051").parse()?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
-    // than an accident of where the line sits. `boot::shutdown` installs both
-    // signal handlers when it is CALLED — a SIGTERM arriving between here and
-    // the first poll of the future would otherwise take the process's default
-    // disposition and kill it outright, mid-transaction.
+    // than an accident of where the line sits. `boot::shutdown` is a `fn`
+    // returning a future rather than an `async fn`, so both signal handlers
+    // install when it is CALLED — a SIGTERM arriving between here and the first
+    // poll of the future would otherwise take the process's default disposition
+    // and kill it outright, mid-transaction.
+    //
+    // The behaviour is `yadgar_lifecycle::shutdown`'s; `boot::shutdown` is the
+    // three lines that turn its `io::Error` into a `BootError`, so this line
+    // reads and fails exactly as it did.
     //
     // Stringified like every other refusal in this function, for the reason
     // given above.

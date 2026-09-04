@@ -1,19 +1,28 @@
 //! What `main` decides before it opens anything — in a place a test can reach.
 //!
 //! `main` is a binary entry point, so nothing in it is reachable from a test.
-//! That is fine for wiring and not fine for decisions, and four decisions here
+//! That is fine for wiring and not fine for decisions, and three decisions here
 //! are exactly the kind that fail silently: which transport mode the connections
-//! use, what happens to an environment key that no longer means anything, which
-//! transport this module SERVES on, and which signals END it. All four live in
-//! this module, and all four have a test.
+//! use, what happens to an environment key that no longer means anything, and
+//! which transport this module SERVES on. All three live in this module, and all
+//! three have a test.
 //!
-//! The fourth is the newest and is the clearest case for the rule. `main` passed
-//! `tokio::signal::ctrl_c()` to `serve_with_shutdown` and there was no
-//! `signal::unix` handler anywhere in this crate — so the drain ran on SIGINT,
+//! **A FOURTH USED TO, AND IT LEFT — WHICH SIGNALS END THIS PROCESS.** `main`
+//! passed `tokio::signal::ctrl_c()` to `serve_with_shutdown` and there was no
+//! `signal::unix` handler anywhere in this crate, so the drain ran on SIGINT,
 //! which Kubernetes never sends, and not on SIGTERM, which is the only signal it
-//! does send. It was wrong from the day it was written, it is one line, and
+//! does send. It was wrong from the day it was written, it was one line, and
 //! nothing in the repository could see it because the line lived where no test
-//! reaches. [`shutdown`] moves the decision here.
+//! reaches. That is the argument this module is built on, and it argues for a
+//! SHARED answer once the same line exists in five repositories: the estate had
+//! five copies of `shutdown` and had to correct four of them separately.
+//! `yadgar-lifecycle` v0.1.0 holds it now (D19, ADR-0526).
+//!
+//! What remains here is [`shutdown`], three lines wrapping that crate so the
+//! refusal reaches an operator as a [`BootError`] sentence like every other
+//! refusal in this module — the ONE thing about it that was ever specific to
+//! `task-db`. `tests/shutdown.rs` still proves the drain against this service's
+//! own listener.
 //!
 //! **The connection options are the point.** D7's capability probe runs on a
 //! connection of its own, before the pool exists. This binary used to build that
@@ -289,67 +298,40 @@ pub fn server(tls: Option<&ServeTls>) -> Result<Server, BootError> {
         })
 }
 
-/// The future `serve_with_shutdown` drains on: SIGTERM, and SIGINT beside it.
+/// The future `serve_with_shutdown` drains on, adapted to this module's error.
 ///
-/// **SIGTERM IS THE ONE THAT MATTERS, and it was the one missing.** Kubernetes
-/// ends a pod by sending SIGTERM and waiting out `terminationGracePeriodSeconds`
-/// before SIGKILL; it never sends SIGINT. This binary listened for `ctrl_c()`
-/// alone, so on every rolling update the drain was never reached — the process
-/// ran until the kill, and whatever was in flight died with it.
+/// **THE BEHAVIOUR IS `yadgar_lifecycle::shutdown`'S AND NOTHING HERE CHANGES
+/// IT.** SIGTERM and SIGINT, both handlers installed before the call returns,
+/// the winning signal named in the log line. What survives in this repository is
+/// three lines of error adaptation, and the paragraph an operator reads.
 ///
-/// **IT COSTS MORE HERE THAN IN THE LOGIC TIER, because this process is the one
-/// holding transactions.** A killed `task` loses requests; a killed `task-db`
-/// loses them mid-write. Nothing is corrupted — an unfinished transaction rolls
-/// back, which is what D8's compare-and-set already depends on — but the caller
-/// is told nothing and has to infer the outcome from a severed stream. D23 sets
-/// the blast radius: `task` reaches this module over ONE long-lived HTTP/2
-/// connection per pod, so what is severed is everything that connection was
-/// carrying rather than a thin slice of it.
+/// **IT COSTS MORE HERE THAN IN THE LOGIC TIER, which is why this module keeps a
+/// wrapper rather than calling the crate from `main` the way `iam-db` does.** A
+/// killed `task` loses requests; a killed `task-db` loses them mid-write.
+/// Nothing is corrupted — an unfinished transaction rolls back, which is what
+/// D8's compare-and-set already depends on — but the caller is told nothing and
+/// has to infer the outcome from a severed stream. D23 sets the blast radius:
+/// `task` reaches this module over ONE long-lived HTTP/2 connection per pod, so
+/// what is severed is everything that connection was carrying rather than a thin
+/// slice of it. Every other refusal in this module reaches the operator as a
+/// SENTENCE, because `main` returns `Box<dyn Error>` and Rust prints that with
+/// `Debug`; a bare `io::Error` here would land in the crash loop as
+/// `Os { code: 24, .. }` and say none of the above.
 ///
-/// SIGINT is kept because it is what a terminal sends, and losing the local
-/// behaviour to fix the deployed one would be a poor trade.
+/// **A `map_err` RATHER THAN A `From` IMPL, deliberately.** [`BootError`] would
+/// need `From<std::io::Error>` for a bare `?` to work, and
+/// [`BootError::TlsUnreadable`] already carries an `io::Error` for an entirely
+/// different reason — so the blanket impl would let any unreadable file become a
+/// signal-handler refusal at whatever call site next wrote `?`. One explicit
+/// conversion at the one place it is correct is the smaller claim.
 ///
-/// **BOTH HANDLERS ARE REGISTERED BEFORE THIS RETURNS, and that is the reason
-/// this is a function returning a future rather than an `async fn`.** Installing
-/// a handler is what replaces the signal's default disposition, which for
-/// SIGTERM is "terminate the process". An `async fn` registers nothing until it
-/// is first polled, so a signal arriving between spawning the server and the
-/// executor reaching the shutdown future would kill the process outright — the
-/// precise failure this exists to prevent, reintroduced as a race.
-/// `tests/shutdown.rs` raises SIGTERM after this call and before the future is
-/// awaited, so that window is exactly what it measures.
+/// # Errors
 ///
-/// **IN `boot` RATHER THAN IN `main`, for the reason this module exists.** A
-/// decision inside a binary entry point is one no test can reach, and which
-/// signals end this process is exactly the kind that fails silently — it was
-/// wrong from the day it was written and nothing in the repository noticed.
-/// `pool_config`, the obsolete-key refusal and [`ServeTls`] are all here for
-/// that same reason.
-///
-/// A [`BootError`] rather than a bare `io::Error`, so `main` refuses to start on
-/// it the way it refuses every other boot mistake, with a sentence rather than a
-/// `Debug` print. A server that cannot hear SIGTERM cannot drain, and starting
-/// anyway hides that until the next rollout.
+/// Registration can fail, and `main` refuses to start on it. A server that
+/// cannot hear SIGTERM cannot drain, and starting anyway hides that until the
+/// next rollout.
 pub fn shutdown() -> Result<impl std::future::Future<Output = ()>, BootError> {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let install = |kind: SignalKind, name: &'static str| {
-        signal(kind).map_err(|source| BootError::SignalHandler { name, source })
-    };
-
-    let mut terminate = install(SignalKind::terminate(), "SIGTERM")?;
-    let mut interrupt = install(SignalKind::interrupt(), "SIGINT")?;
-
-    Ok(async move {
-        let signal = tokio::select! {
-            _ = terminate.recv() => "SIGTERM",
-            _ = interrupt.recv() => "SIGINT",
-        };
-        // NAMED, because the two arrive for different reasons: SIGTERM is a
-        // rollout or an eviction, SIGINT is a person at a terminal. An operator
-        // reading why a pod went away wants to know which.
-        tracing::info!(signal, "draining in-flight requests before shutting down");
-    })
+    yadgar_lifecycle::shutdown().map_err(|source| BootError::SignalHandler { source })
 }
 
 /// Flatten an error and everything under it into one sentence.
@@ -429,17 +411,28 @@ pub enum BootError {
         detail: String,
     },
 
+    // NO `name` FIELD, and its loss is the one thing this module gave up to stop
+    // spelling `shutdown` for itself. `yadgar_lifecycle::shutdown` installs both
+    // handlers and returns one `io::Error`, so WHICH of the two failed is not
+    // knowable here. Naming both is the honest reading and costs the operator
+    // nothing: the sentence below already says there is no value to correct and
+    // that the pod restarting is the right response, so no action was ever keyed
+    // to which handler it was. A fabricated "SIGTERM/SIGINT" in a field that
+    // names one thing would be worse than no field.
+    //
+    // `iam-db`'s `main` has phrased this failure collectively since its own
+    // SIGTERM work — "the SIGTERM and SIGINT handlers could not be installed" —
+    // so this is the estate's existing wording rather than a new one.
     #[error(
-        "the {name} handler could not be installed: {source}. This module refuses to \
-         start rather than run without one: Kubernetes ends every pod with SIGTERM, and \
-         a process that cannot hear it is one that never drains — its in-flight writes \
-         are severed by the SIGKILL that follows, on every rolling update, with nothing \
-         in the logs to say so. This is a broken process environment rather than a \
-         configuration mistake, so there is no value to correct; the pod restarting is \
-         the right response."
+        "the SIGTERM and SIGINT handlers could not be installed: {source}. This module \
+         refuses to start rather than run without them: Kubernetes ends every pod with \
+         SIGTERM, and a process that cannot hear it is one that never drains — its \
+         in-flight writes are severed by the SIGKILL that follows, on every rolling \
+         update, with nothing in the logs to say so. This is a broken process \
+         environment rather than a configuration mistake, so there is no value to \
+         correct; the pod restarting is the right response."
     )]
     SignalHandler {
-        name: &'static str,
         #[source]
         source: std::io::Error,
     },
@@ -761,5 +754,39 @@ mod tests {
             matches!(config.ssl_mode, MySqlSslMode::Required),
             "the default ssl-mode must encrypt without falling back"
         );
+    }
+
+    /// The message is the ONLY thing the lift to `yadgar-lifecycle` changed, so
+    /// it is the only thing worth a new test.
+    ///
+    /// The crate returns one `io::Error` for both handlers, so the variant that
+    /// used to name which one failed cannot any more. What must not be lost with
+    /// it is the paragraph: an operator meeting this in a crash loop has to read
+    /// that BOTH signals are involved, that SIGTERM is the one Kubernetes sends,
+    /// and that there is no configuration value to go and correct. `main` prints
+    /// this through `Display`, so `Display` is where it is asserted.
+    ///
+    /// **The `Err` path itself is not reachable from a test.** Producing it means
+    /// exhausting the process's signal-handler resources, which would break every
+    /// other test in the binary. So this asserts what an operator READS, not that
+    /// the failure occurs.
+    #[test]
+    fn a_handler_that_cannot_be_installed_names_both_signals_and_the_response() {
+        let rendered = BootError::SignalHandler {
+            source: std::io::Error::other("too many signal handlers"),
+        }
+        .to_string();
+
+        for expected in [
+            "SIGTERM",
+            "SIGINT",
+            "too many signal handlers",
+            "no value to correct",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal no longer carries {expected:?}: {rendered}"
+            );
+        }
     }
 }
