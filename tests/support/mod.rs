@@ -60,6 +60,29 @@ pub fn shipped_setting() -> InheritedSetting {
     setting(SettingValue::On, true, &[])
 }
 
+/// The D12 ladder WITHOUT ADR-0522's arm, for the tests whose subject is the
+/// ladder itself.
+///
+/// **A TEST THAT ASSERTS AN OWNER REACHES THEIR OWN RECORD MUST STATE THIS.**
+/// Under the shipped `ON` the arm reaches every record the caller owns, so such
+/// an assertion is answered by ADR-0522 rather than by the rung under test —
+/// and a rung nothing exercises is a rung nothing protects.
+///
+/// MEASURED rather than reasoned: with the fixture default at `ON`, the mutant
+/// that renders the PRIVATE rung as `visibility = 1` instead of
+/// `visibility NOT IN (2, 3)` survives the WHOLE suite. Stating `OFF` at the two
+/// call sites that assert an owner's own read is what kills it again. Three
+/// other ladder mutants — the rung dropping its owner check, the TEAM arm never
+/// rendered, and the ORG arm dropped — die under either default, because each is
+/// seen by a caller who does not own the row.
+///
+/// This is the same discipline `scope_with` states for the other direction: a
+/// test whose subject is the SETTING states its own policy, and so does a test
+/// whose subject is the LADDER. Neither inherits one.
+pub fn ladder_only() -> InheritedSetting {
+    setting(SettingValue::Off, true, &[])
+}
+
 /// The pool every fixture opens, and the reason a fixture states one at all.
 ///
 /// **A fixture that says nothing runs at sqlx's default of ten, which is a size
@@ -213,27 +236,30 @@ impl World {
     }
 
     pub fn scope_in(&self, project: &str, user: &str, teams: &[&str]) -> Option<Scope> {
-        self.scope_with(
-            project,
-            user,
-            teams,
-            Some(setting(SettingValue::Off, true, &[])),
-        )
+        self.scope_with(project, user, teams, Some(shipped_setting()))
     }
 
     /// The same scope carrying a STATED setting of the caller's choosing, for
     /// the tests whose subject is ADR-0522 itself.
     ///
-    /// **THE DEFAULT ABOVE IS `OFF`, LOCKED, AND IT IS DELIBERATELY NOT WHAT
-    /// THE ESTATE SHIPS.** `iam-db` migration 12 seeds `ON` with the lock
-    /// engaged, which resolves to an owner arm reaching every record the caller
-    /// owns — and under that arm the blanket `OR owner_user_id = ?` that
-    /// `Reach::visible` refuses becomes an EQUIVALENT mutant, because it
-    /// selects exactly the same rows. Defaulting the whole suite to the shipped
-    /// value would therefore retire the only test in this repository that can
-    /// see that arm. `OFF` keeps every pre-existing test asserting what it was
-    /// written to assert, and each test whose subject IS the setting states its
-    /// own policy at the assertion site rather than inheriting one.
+    /// **THE DEFAULT ABOVE IS WHAT THE ESTATE SHIPS: `ON`, LOCKED, the value
+    /// `iam-db` migration 12 seeds.** A fixture default that no deployment runs
+    /// regression-covers a configuration nobody has, and every test inheriting
+    /// it asserts against a policy that exists only here.
+    ///
+    /// **THE ARGUMENT FOR `OFF` THAT USED TO STAND HERE WAS WRONG ON ITS OWN
+    /// EVIDENCE, AND THE CORRECTION IS MEASURED.** It held that the shipped
+    /// value would retire the only test that can see the blanket
+    /// `OR owner_user_id = ?` arm `Reach::visible` refuses. It does not:
+    /// `task-db#30`'s own mutation table records that arm (M4) as killed by
+    /// `a_setting_stating_off_leaves_an_owner_outside_the_team_where_they_were`
+    /// and by nothing else, and that test states `OFF` at its own call site. The
+    /// default it inherits was never what killed M4 — re-measured here, M4 still
+    /// dies under this default.
+    ///
+    /// What the flip DOES cost is one rung: see [`ladder_only`], which the two
+    /// tests asserting an owner's own read now state. That cost is paid at those
+    /// two call sites rather than by every test in the suite.
     ///
     /// STATED rather than absent, because absent is now REFUSED: this service
     /// reads the field, so it is in the ENFORCING state and a read carrying no

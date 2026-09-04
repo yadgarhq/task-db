@@ -17,6 +17,29 @@ use crate::pb::yadgar::task::v1::*;
 use crate::service::TaskDb;
 use crate::sql::{internal, scope_of, Reach};
 
+/// What `UpdateTask` says when its compare-and-set matches no row.
+///
+/// **THE ADVICE IS THE LOAD-BEARING HALF, AND ENFORCEMENT BROKE IT.** The
+/// message used to end "re-read and retry", which was followable while the
+/// three causes agreed: a caller who could not edit a record could not read it
+/// either, so the re-read failed and the caller stopped. ADR-0522 grants an
+/// owner outside the team of their own record the READ and deliberately does
+/// not widen the edit ([`Reach::predicate`] carries no ADR-0522 arm), so the
+/// re-read now succeeds and returns the SAME version. A caller obeying the old
+/// advice re-sent an identical request forever.
+///
+/// So the advice is CONDITIONAL on something the caller can observe, and it
+/// covers every outcome a re-read has: the version moved, the version did not,
+/// or there was nothing to return. Only the first is worth retrying.
+///
+/// **IT NAMES A THIRD CAUSE AND CONFIRMS NONE OF THEM.** Three disjuncts
+/// disclose no more than two did: a caller who reaches the record already knows
+/// it exists, and one who does not gets `NOT_FOUND` from the re-read. Whether
+/// the row is there is not decidable from this string.
+const UPDATE_REFUSED: &str = "version mismatch, no such task in this scope, or a task this \
+     caller may read but not edit. Re-read: if the version has moved, retry with the new one. \
+     If the read returns the same version, or returns nothing, retrying will fail identically.";
+
 impl TaskDb {
     pub(crate) async fn create(
         &self,
@@ -201,12 +224,13 @@ impl TaskDb {
         // The same refusal the compare-and-set below reaches, arrived at one
         // statement earlier. The two conditions are identical — same id, same
         // version, same reach, same `deleted_at` — so a caller cannot tell
-        // which statement refused, and the message stays the one it was.
+        // which statement refused, and both render `UPDATE_REFUSED`. It is a
+        // constant rather than two literals for exactly that reason: the
+        // indistinguishability is the property, and two literals are two places
+        // for it to stop being true.
         let Some(row) = found else {
             tx.rollback().await.map_err(internal)?;
-            return Err(Status::failed_precondition(
-                "version mismatch, or no such task in this scope — re-read and retry",
-            ));
+            return Err(Status::failed_precondition(UPDATE_REFUSED));
         };
         let previous_status = row.try_get::<i8, _>("status").map_err(internal)? as i32;
 
@@ -244,9 +268,7 @@ impl TaskDb {
 
         if result.rows_affected() == 0 {
             tx.rollback().await.map_err(internal)?;
-            return Err(Status::failed_precondition(
-                "version mismatch, or no such task in this scope — re-read and retry",
-            ));
+            return Err(Status::failed_precondition(UPDATE_REFUSED));
         }
 
         // `previous_status` is part of the recorded response, so `idem::record`

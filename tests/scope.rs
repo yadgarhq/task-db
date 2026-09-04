@@ -8,7 +8,8 @@
 mod support;
 
 use support::{
-    setting, shipped_setting, two_projects_two_users, World, OTHER_TEAM, P_A, P_B, TEAM, U1, U2, U3,
+    ladder_only, setting, shipped_setting, two_projects_two_users, World, OTHER_TEAM, P_A, P_B,
+    TEAM, U1, U2, U3,
 };
 use yadgar_task_db::pb::yadgar::common::v1::{SettingValue, Visibility};
 
@@ -602,6 +603,64 @@ async fn the_edit_path_neither_refuses_nor_widens_on_this_setting() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
+/// **THE ADVICE IN A REFUSAL MUST BE FOLLOWABLE, AND ENFORCEMENT MADE THIS ONE
+/// A LOOP.** `UpdateTask` said "re-read and retry". Before `task-db#30` that was
+/// consistent: an owner outside the team of their own `TEAM` record could not
+/// read it either, so the re-read failed and the caller stopped. ADR-0522 grants
+/// the read and deliberately does not widen the edit, so the re-read now
+/// SUCCEEDS and returns the same version — and a caller following the advice
+/// sends the identical request forever.
+///
+/// The loop below is characterization: it passes against the old message too,
+/// because the loop is the behaviour rather than the defect. **The assertion
+/// that was RED is the last one**, which pins the advice as one a caller can act
+/// on: retry only where a re-read moves the version.
+///
+/// The message names three causes and confirms none of them. A caller who
+/// reaches the record already knows it exists, and one who does not gets
+/// `NOT_FOUND` on the re-read and learns nothing it could not learn anyway — so
+/// naming "may read but not edit" beside the other two discloses nothing.
+#[tokio::test]
+async fn the_refusal_an_unwidened_edit_reaches_advises_a_retry_that_can_succeed() {
+    let c = two_projects_two_users("td_edit_advice_followable").await;
+    let scope = c.scope_with(P_A, U3, &[], Some(shipped_setting()));
+
+    let before = c
+        .read_as(&scope, &c.u3_team)
+        .await
+        .expect("ADR-0522 grants the owner outside the team their own record");
+    let version = before.meta.expect("meta").version;
+
+    let err = c
+        .edit_as(&scope, &c.u3_team, "renamed")
+        .await
+        .expect_err("the edit path is not widened by a read-named setting");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // THE LOOP, pinned: the re-read the message sends the caller to succeeds and
+    // returns the SAME version, so the retry it advises is byte-identical to the
+    // request that just failed.
+    let after = c
+        .read_as(&scope, &c.u3_team)
+        .await
+        .expect("re-reading still succeeds, which is what makes the advice a loop");
+    assert_eq!(
+        after.meta.expect("meta").version,
+        version,
+        "the version has not moved, so a retry cannot differ from the attempt that failed"
+    );
+
+    // THE ASSERTION THIS TEST EXISTS FOR. The message is an interface a caller
+    // writes a retry loop against, so it is asserted whole rather than by
+    // substring.
+    assert_eq!(
+        err.message(),
+        "version mismatch, no such task in this scope, or a task this caller may read but not \
+         edit. Re-read: if the version has moved, retry with the new one. If the read returns \
+         the same version, or returns nothing, retrying will fail identically."
+    );
+}
+
 /// An empty team list must render as "no TEAM arm", never as `IN ()` — which is
 /// a syntax error — and never as "the arm is absent, so everything passes".
 #[tokio::test]
@@ -623,19 +682,27 @@ async fn a_caller_in_no_teams_sees_no_team_tasks() {
 /// including its owner, while still looking perfectly present in the table. The
 /// rung is therefore "not one of the wider two" rather than `= 1`, and migration
 /// 5 heals the stored rows so the invariant holds in the table too.
+///
+/// **THIS TEST STATES [`ladder_only`], AND IT IS THE ONE TEST IN THE SUITE THAT
+/// HAD TO START DOING SO.** The caller here OWNS the row, so under the shipped
+/// `ON` ADR-0522's arm returns it whatever the rung says — measured: rendering
+/// the rung as `visibility = 1` instead of `visibility NOT IN (2, 3)` then
+/// survives the whole suite. Stating `OFF` removes the arm and leaves the rung
+/// as the only thing in the statement that can answer.
 #[tokio::test]
 async fn a_row_with_an_unrecognised_visibility_falls_back_to_private() {
     let c = two_projects_two_users("td_vis_zero").await;
     c.set_visibility(&c.u1_private, 0, "").await;
+    let ladder = Some(ladder_only());
 
     let owner = c
-        .read(P_A, U1, &c.u1_private)
+        .read_as(&c.scope_with(P_A, U1, &[], ladder.clone()), &c.u1_private)
         .await
         .expect("the owner must not lose a record to a value nobody anticipated");
     assert_eq!(owner.title, "u1 private");
 
     let err = c
-        .read(P_A, U2, &c.u1_private)
+        .read_as(&c.scope_with(P_A, U2, &[], ladder), &c.u1_private)
         .await
         .expect_err("and it must fall back to the RESTRICTIVE rung, not the open one");
     assert_eq!(err.code(), tonic::Code::NotFound);
