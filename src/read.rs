@@ -21,15 +21,19 @@ impl TaskDb {
         // difference matters the day someone logs the pre-filter result.
         let row = match req.key {
             Some(get_task_request::Key::Id(id)) => {
+                // `read_predicate` rather than `predicate`: this is a READ, so
+                // ADR-0522's setting applies and an unstated one refuses the
+                // call before any statement is built.
+                let clause = reach.read_predicate()?;
                 let sql = format!(
                     "SELECT {COLUMNS} FROM task
                       WHERE id = ? AND deleted_at IS NULL AND {}",
-                    reach.predicate()
+                    clause.sql()
                 );
                 // AUDIT: the interpolation is this module's own predicate; every
                 // caller value is a bound parameter.
-                reach
-                    .bind(sqlx::query(sqlx::AssertSqlSafe(sql)).bind(id))
+                clause
+                    .bind(reach.bind(sqlx::query(sqlx::AssertSqlSafe(sql)).bind(id)))
                     .fetch_optional(&self.pool)
                     .await
             }
@@ -37,18 +41,23 @@ impl TaskDb {
                 // A number is unique WITHIN a project, so this arm pins the
                 // project by equality. The visibility axis still applies: a
                 // filter added to one arm and not the other is precisely the
-                // shape of the leak this replaced.
+                // shape of the leak this replaced — and ADR-0522's arm is part
+                // of that axis, so this arm takes it too or the setting holds
+                // on one key and not the other.
+                let clause = reach.readable()?;
                 let sql = format!(
                     "SELECT {COLUMNS} FROM task
                       WHERE number = ? AND deleted_at IS NULL AND project_id = ? AND {}",
-                    reach.visible()
+                    clause.sql()
                 );
                 // AUDIT: as above.
-                reach
-                    .bind_visible(
-                        sqlx::query(sqlx::AssertSqlSafe(sql))
-                            .bind(number)
-                            .bind(reach.project()),
+                clause
+                    .bind(
+                        reach.bind_visible(
+                            sqlx::query(sqlx::AssertSqlSafe(sql))
+                                .bind(number)
+                                .bind(reach.project()),
+                        ),
                     )
                     .fetch_optional(&self.pool)
                     .await
@@ -69,9 +78,13 @@ impl TaskDb {
         let limit = page_size(req.page_size);
         let statuses = statuses(&req.statuses)?;
 
+        // A READ, so ADR-0522 applies here exactly as it does to `GetTask`. A
+        // setting honoured on one read verb and not the other is a caller who
+        // cannot fetch a record it can list.
+        let clause = reach.read_predicate()?;
         let mut sql = format!(
             "SELECT {COLUMNS} FROM task WHERE deleted_at IS NULL AND {}",
-            reach.predicate()
+            clause.sql()
         );
         if !statuses.is_empty() {
             let holes = vec!["?"; statuses.len()].join(", ");
@@ -91,7 +104,10 @@ impl TaskDb {
 
         // AUDIT: the interpolations are this module's predicate and a count of
         // `?` placeholders; every caller value is bound.
-        let mut query = reach.bind(sqlx::query(sqlx::AssertSqlSafe(sql)));
+        // ADR-0522's parameters come immediately after the ladder's, because the
+        // arm is appended to the ladder — before the status filter, which is a
+        // later clause in the same statement.
+        let mut query = clause.bind(reach.bind(sqlx::query(sqlx::AssertSqlSafe(sql))));
         for status in &statuses {
             query = query.bind(status);
         }

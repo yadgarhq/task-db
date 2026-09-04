@@ -12,7 +12,7 @@
 
 use sqlx::{Connection, MySqlPool, Row};
 use tonic::{Request, Status};
-use yadgar_task_db::pb::yadgar::common::v1::{Scope, Visibility};
+use yadgar_task_db::pb::yadgar::common::v1::{InheritedSetting, Scope, SettingValue, Visibility};
 use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbService as _;
 use yadgar_task_db::pb::yadgar::task::v1::*;
 use yadgar_task_db::{schema, service::TaskDb};
@@ -31,6 +31,34 @@ pub const U3: &str = "u3";
 
 pub const TEAM: &str = "t-platform";
 pub const OTHER_TEAM: &str = "t-billing";
+
+/// One `InheritedSetting`, built the way a store would: the organisation's
+/// value, its lock, and zero or more team overrides.
+///
+/// Every ADR-0522 test states its own rather than inheriting one, so the policy
+/// under test is readable beside the assertion instead of in this file.
+pub fn setting(
+    value: SettingValue,
+    locked: bool,
+    overrides: &[(&str, SettingValue)],
+) -> InheritedSetting {
+    InheritedSetting {
+        org_value: value as i32,
+        org_locked: locked,
+        team_override: overrides
+            .iter()
+            .map(|(team, v)| ((*team).to_string(), *v as i32))
+            .collect(),
+    }
+}
+
+/// What `iam-db` migration 12 actually seeds: `SETTING_VALUE_ON`, locked.
+///
+/// Named so a test asserting the SHIPPED behaviour cannot drift from it by
+/// restating the two values and getting one wrong.
+pub fn shipped_setting() -> InheritedSetting {
+    setting(SettingValue::On, true, &[])
+}
 
 /// The pool every fixture opens, and the reason a fixture states one at all.
 ///
@@ -185,24 +213,50 @@ impl World {
     }
 
     pub fn scope_in(&self, project: &str, user: &str, teams: &[&str]) -> Option<Scope> {
+        self.scope_with(
+            project,
+            user,
+            teams,
+            Some(setting(SettingValue::Off, true, &[])),
+        )
+    }
+
+    /// The same scope carrying a STATED setting of the caller's choosing, for
+    /// the tests whose subject is ADR-0522 itself.
+    ///
+    /// **THE DEFAULT ABOVE IS `OFF`, LOCKED, AND IT IS DELIBERATELY NOT WHAT
+    /// THE ESTATE SHIPS.** `iam-db` migration 12 seeds `ON` with the lock
+    /// engaged, which resolves to an owner arm reaching every record the caller
+    /// owns — and under that arm the blanket `OR owner_user_id = ?` that
+    /// `Reach::visible` refuses becomes an EQUIVALENT mutant, because it
+    /// selects exactly the same rows. Defaulting the whole suite to the shipped
+    /// value would therefore retire the only test in this repository that can
+    /// see that arm. `OFF` keeps every pre-existing test asserting what it was
+    /// written to assert, and each test whose subject IS the setting states its
+    /// own policy at the assertion site rather than inheriting one.
+    ///
+    /// STATED rather than absent, because absent is now REFUSED: this service
+    /// reads the field, so it is in the ENFORCING state and a read carrying no
+    /// setting is an `INVALID_ARGUMENT` rather than a pre-enforcement read.
+    ///
+    /// The literal stays EXHAUSTIVE rather than taking `..Default::default()`.
+    /// It is a tripwire: this line is what made the proto bump announce itself,
+    /// and spreading a default here would silently absorb the next field a
+    /// contract adds — including one a read path must consult.
+    pub fn scope_with(
+        &self,
+        project: &str,
+        user: &str,
+        teams: &[&str],
+        owner_reads_own_record: Option<InheritedSetting>,
+    ) -> Option<Scope> {
         Some(Scope {
             user_id: user.into(),
             project_id: project.into(),
             team_ids: teams.iter().map(|t| (*t).to_string()).collect(),
             instance_id: "i-1".into(),
             request_id: "r-1".into(),
-            // ABSENT, which is what the wire carries today: the gateway
-            // populates it, `task` pins a contract without field 6, and prost
-            // discards unknown fields on the way through. Every engine-backed
-            // test therefore exercises the PRE-ENFORCEMENT path, which is the
-            // state this service is in.
-            //
-            // The literal stays EXHAUSTIVE rather than taking
-            // `..Default::default()`. It is a tripwire: this line is what made
-            // the proto bump announce itself, and spreading a default here
-            // would silently absorb the next field a contract adds — including
-            // one a read path must consult.
-            owner_reads_own_record: None,
+            owner_reads_own_record,
         })
     }
 

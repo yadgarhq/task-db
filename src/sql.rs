@@ -11,7 +11,8 @@ use sqlx::query::Query;
 use sqlx::MySql;
 use tonic::Status;
 
-use crate::pb::yadgar::common::v1::{Scope, Visibility};
+use crate::pb::yadgar::common::v1::{InheritedSetting, Scope, Visibility};
+use crate::setting::owner_reach;
 
 /// The gateway attests scope from credentials; it is never supplied by the
 /// caller (D12). An absent scope is a programming error upstream, not a
@@ -83,6 +84,10 @@ pub struct Reach {
     subtree: String,
     user: String,
     teams: Vec<String>,
+    /// ADR-0522's setting, carried UNRESOLVED. The answer depends on the team
+    /// of the row, so the inputs travel this far and are resolved by
+    /// [`Reach::readable`] and nowhere else.
+    setting: Option<InheritedSetting>,
 }
 
 impl Reach {
@@ -92,14 +97,42 @@ impl Reach {
             subtree: subtree(&scope.project_id),
             user: scope.user_id.clone(),
             teams: scope.team_ids.clone(),
+            setting: scope.owner_reads_own_record.clone(),
         }
     }
 
-    /// The predicate for both axes. Its parameters are bound by [`Reach::bind`],
-    /// in this order, so it belongs LAST in any statement that carries other
-    /// bindings.
+    /// The predicate for both axes, WITHOUT ADR-0522's widening.
+    ///
+    /// **THIS IS THE EDIT PATH'S PREDICATE AND `UpdateTask` IS ITS ONLY CALLER.
+    /// A READ WANTS [`Reach::read_predicate`].** The setting is named
+    /// `owner_reads_own_record` and `Scope` scopes it to reads — "whether an
+    /// owner READS their own record" — so widening an UPDATE with it would hand
+    /// out edit authority from a setting whose name promises a read. That is
+    /// the same class of silent widening the setting exists to prevent, one
+    /// step worse, so the edit path keeps the ladder it had.
+    ///
+    /// The invariant `UpdateTask` states — "a record the caller may not see is
+    /// also one it cannot edit" — is one-directional and survives: reads
+    /// widening while edits do not SHRINKS the unseeable set, and everything
+    /// unseeable is still uneditable. D26 already makes `DeleteTask` narrower
+    /// than the ladder, so a mutating path narrower than a read is this
+    /// module's existing shape rather than a new one.
     pub fn predicate(&self) -> String {
         format!("{} AND {}", self.within(), self.visible())
+    }
+
+    /// The predicate for both axes AS A READ SEES THEM, which is where
+    /// ADR-0522 applies.
+    ///
+    /// Fallible because the setting can name no policy, and a store may not
+    /// choose one on its behalf. Its parameters are bound by [`Reach::bind`]
+    /// FOLLOWED BY [`Readable::bind`], in that order.
+    pub fn read_predicate(&self) -> Result<Readable, Status> {
+        let readable = self.readable()?;
+        Ok(Readable {
+            sql: format!("{} AND {}", self.within(), readable.sql),
+            binds: readable.binds,
+        })
     }
 
     /// The project axis ALONE, for `DeleteTask`. D26 makes delete owner-only,
@@ -113,10 +146,16 @@ impl Reach {
     /// The D12 ladder: PRIVATE is the owner's, TEAM is the named team's, ORG is
     /// everyone's.
     ///
-    /// There is deliberately NO `OR owner_user_id = ?` arm spanning the whole
-    /// clause. It reads like a safe addition — surely an owner may see their own
-    /// record — and it would quietly make every TEAM test pass for the wrong
-    /// reason. The PRIVATE rung already grants the owner what the owner needs.
+    /// There is STILL deliberately no unconditional `OR owner_user_id = ?` arm
+    /// spanning the whole clause, and ADR-0522 did not make one safe. It reads
+    /// like a safe addition — surely an owner may see their own record — and it
+    /// would quietly make every TEAM test pass for the wrong reason. What
+    /// ADR-0522 adds is an arm the SETTING gates, resolved against the team of
+    /// the ROW, and it is added by [`Reach::readable`] rather than here: a
+    /// blanket arm reaches the same rows in the shipped configuration and
+    /// reaches them for a reason nobody stated, which is why `tests/scope.rs`
+    /// still pins it as refused.
+    ///
     /// The visibility axis ALONE, for the one statement that pins the project
     /// by equality rather than by subtree: a `number` is unique within its own
     /// project, and matching the subtree there would let an ancestor scope find
@@ -143,6 +182,65 @@ impl Reach {
         // restrictive rung that still has an owner, which is what D12 says the
         // default is.
         format!("(visibility = {org} OR (visibility NOT IN ({team}, {org}) AND owner_user_id = ?){team_arm})")
+    }
+
+    /// The visibility axis AS A READ SEES IT: the D12 ladder, plus ADR-0522's
+    /// arm where the setting grants one.
+    ///
+    /// **THIS IS THE CALL SITE THAT PUTS THIS SERVICE IN THE ENFORCING STATE.**
+    /// `yadgar/common/v1` admits exactly two states and names the
+    /// discriminator — "WHICH ONE IT IS IN IS DECIDED BY WHETHER IT READS THIS
+    /// FIELD" — and this reads it. The refusal therefore binds absolutely: an
+    /// absent setting and a present one stating nothing are one case, both
+    /// refused, and there is no third state in which this tolerates an unset
+    /// one. A default substituted here is the silent wrong policy the whole
+    /// setting exists to prevent.
+    ///
+    /// **THE ARM IS COMPOSED ONTO THE LADDER, NEVER A SECOND LADDER.** The
+    /// clause is literally [`Reach::visible`] with one `OR` appended, so there
+    /// is one statement of D12 in this module and an additive exception beside
+    /// it. Two ladders would be two answers to one question, and the one that
+    /// drifts is the one a reader happens to open.
+    ///
+    /// **THE ARM IS KEYED ON THE ROW'S `team_id`, WHICH IS THE WHOLE POINT.**
+    /// `owner_reach` answers for every team the setting can answer differently
+    /// for, and the answer is rendered against the COLUMN — never against the
+    /// caller's `team_ids`, because the defect ADR-0522 fixes is an owner who
+    /// has LEFT the team, whose membership list no longer names it.
+    pub fn readable(&self) -> Result<Readable, Status> {
+        let reach = owner_reach(&self.setting)?;
+        let ladder = self.visible();
+
+        // Three shapes, and the empty one is a shape rather than an omission:
+        // a setting that grants nothing must render NO arm, not an arm no row
+        // can satisfy — `OR (owner_user_id = ? AND team_id IN ())` is a syntax
+        // error for the same reason the TEAM arm above is dropped when the
+        // caller belongs to no team.
+        let (arm, binds) = if reach.reaches_nothing() {
+            (String::new(), Vec::new())
+        } else if reach.exceptions().is_empty() {
+            (" OR owner_user_id = ?".to_string(), vec![self.user.clone()])
+        } else {
+            // The exceptions are the teams whose answer DIFFERS from the one
+            // every unnamed team gets, so the operator follows that default:
+            // where ownership reaches by default the arm SUBTRACTS them, and
+            // where it does not the arm is the only thing that grants them.
+            // Rendering an inclusion list in both directions would return the
+            // complement of the policy in one of them.
+            let holes = vec!["?"; reach.exceptions().len()].join(", ");
+            let operator = if reach.default_on() { "NOT IN" } else { "IN" };
+            let mut binds = vec![self.user.clone()];
+            binds.extend(reach.exceptions().iter().cloned());
+            (
+                format!(" OR (owner_user_id = ? AND team_id {operator} ({holes}))"),
+                binds,
+            )
+        };
+
+        Ok(Readable {
+            sql: format!("({ladder}{arm})"),
+            binds,
+        })
     }
 
     /// Bind what [`Reach::predicate`] left holes for, in the same order.
@@ -175,6 +273,42 @@ impl Reach {
 
     pub fn project(&self) -> &str {
         &self.project
+    }
+}
+
+/// A read's visibility clause together with the parameters ADR-0522's arm
+/// added, which is why they are ONE value rather than two.
+///
+/// **THE SQL AND ITS BINDINGS CANNOT DRIFT APART BECAUSE NOTHING CAN PRODUCE
+/// ONE WITHOUT THE OTHER.** Every other clause in this module renders holes in
+/// one method and fills them in another, which works only while both read the
+/// same fields — and this arm's hole count depends on a RESOLUTION, so a second
+/// method would have to resolve the setting again and agree. A binding that
+/// silently disagrees with its statement is how a caller's user id lands in a
+/// team column.
+pub struct Readable {
+    sql: String,
+    binds: Vec<String>,
+}
+
+impl Readable {
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// The parameters ADR-0522's arm added, in the order it rendered them.
+    ///
+    /// These come LAST: after [`Reach::bind_within`] and [`Reach::bind_visible`],
+    /// because the arm is appended to the end of the ladder.
+    pub fn bind<'q>(
+        &'q self,
+        query: Query<'q, MySql, MySqlArguments>,
+    ) -> Query<'q, MySql, MySqlArguments> {
+        let mut query = query;
+        for value in &self.binds {
+            query = query.bind(value);
+        }
+        query
     }
 }
 
