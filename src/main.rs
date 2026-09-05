@@ -26,8 +26,38 @@ fn required() -> CapabilitySet {
     CapabilitySet::from([Capability::Transactions, Capability::RowLocking])
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// A knob this process reads from ONE source, refusing rather than inventing.
+///
+/// It replaces `env_or(key, default)`, and deleting the `default` parameter is
+/// more of the point than the rename: while the helper took one, every knob in
+/// this binary had somewhere for a fallback to live, and a fallback is invisible
+/// at the point of use, survives an upgrade unnoticed, and makes the effective
+/// setting depend on which layer a reader happens to inspect (ADR-0569).
+///
+/// AN EMPTY VALUE REFUSES TOO, AND WITH ITS OWN MESSAGE. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week: Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit.
+///
+/// The same helper in the shape `boot::pool_config` needs — a lookup passed in
+/// rather than `std::env` read directly — is `boot::env_required`. Two functions
+/// rather than one because nothing in a binary entry point is reachable from a
+/// test, so the knobs that must be testable are read through the lookup.
+fn env_required(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        Err(_) => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
+    }
 }
 
 #[tokio::main]
@@ -81,8 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // below, and the rotation watch set. `Secret` deliberately holds the VALUE
     // and not where it came from, so the path has to be named once here rather
     // than recovered from the secret afterwards.
-    let db_password_file: PathBuf =
-        env_or("DB_PASSWORD_FILE", "/var/run/secrets/task-db/password").into();
+    //
+    // NO COMPILED-IN PATH BEHIND IT ANY MORE (ADR-0569). The chart renders
+    // DB_PASSWORD_FILE beside the `db-password` mount that puts the file there,
+    // so the path is stated once where a reader meets the mount rather than
+    // twice, in two repositories, with only luck keeping them equal.
+    let db_password_file: PathBuf = env_required("DB_PASSWORD_FILE")?.into();
     let secret: Secret = CredentialSource::SecretFile(db_password_file.clone()).resolve()?;
 
     // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
@@ -168,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
     // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090").parse()?;
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -179,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shows the loaded leaf ageing out.
     tls_inputs.export_not_after();
 
-    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50051").parse()?;
+    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `boot::shutdown` is a `fn`
@@ -257,4 +291,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_required;
+
+    // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
+    // runs these on threads of one process, so tests sharing a variable name
+    // would pass or fail depending on scheduling.
+
+    /// The case a naive test omits, and the only one that proves the value is
+    /// USED. A test that merely asserts "boot succeeds" passes just as happily
+    /// with a compiled-in default still in place behind the read.
+    #[test]
+    fn a_set_value_is_returned_verbatim() {
+        std::env::set_var("YADGAR_TEST_TASK_DB_PRESENT", "0.0.0.0:50051");
+        assert_eq!(
+            env_required("YADGAR_TEST_TASK_DB_PRESENT").as_deref(),
+            Ok("0.0.0.0:50051")
+        );
+    }
+
+    #[test]
+    fn an_absent_knob_refuses_and_names_itself() {
+        std::env::remove_var("YADGAR_TEST_TASK_DB_ABSENT");
+        let err = env_required("YADGAR_TEST_TASK_DB_ABSENT").unwrap_err();
+        assert!(
+            err.contains("YADGAR_TEST_TASK_DB_ABSENT"),
+            "the refusal must name the knob, got: {err}"
+        );
+        assert!(err.contains("NOT SET"), "got: {err}");
+    }
+
+    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so
+    /// a nulled chart value arrives here as set-but-empty rather than as absent.
+    /// An implementation that collapses the two into one branch is the defect
+    /// this estate found three separate times in one week, so the messages are
+    /// asserted to DIFFER rather than merely to exist.
+    #[test]
+    fn an_empty_knob_refuses_with_its_own_message() {
+        std::env::set_var("YADGAR_TEST_TASK_DB_EMPTY", "");
+        std::env::remove_var("YADGAR_TEST_TASK_DB_EMPTY_ABSENT");
+        let empty = env_required("YADGAR_TEST_TASK_DB_EMPTY").unwrap_err();
+        let absent = env_required("YADGAR_TEST_TASK_DB_EMPTY_ABSENT").unwrap_err();
+        assert!(empty.contains("set but EMPTY"), "got: {empty}");
+        assert!(
+            empty.replace("YADGAR_TEST_TASK_DB_EMPTY", "K")
+                != absent.replace("YADGAR_TEST_TASK_DB_EMPTY_ABSENT", "K"),
+            "empty and absent must not share one message"
+        );
+    }
 }
