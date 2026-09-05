@@ -299,9 +299,16 @@ fn an_unconfigured_engine_authority_contributes_nothing_rather_than_a_missing_fi
 
 // ---------------------------------------------------------------------------
 // THE CHART AND THE BINARY HAVE TO AGREE, and nothing else in CI checks that.
-// The two below read the deployment template at COMPILE TIME, so a chart edit
-// that breaks the agreement turns a test red here rather than a pod red in the
-// cluster, and a rename inside `yadgar-lifecycle` turns this red instead.
+// The test below reads the deployment template at COMPILE TIME, so a chart
+// edit that breaks the agreement turns a test red here rather than a pod red
+// in the cluster, and a rename inside `yadgar-lifecycle` turns this red
+// instead.
+//
+// STEP 2B (MIGRATION_NOTES.md, ADR-0569/ADR-0570) deleted the chart's two
+// TLS_ROTATION_* environment variables, and with them the guard test that kept
+// the chart rendering both for the OLD binary while this release's digest was
+// still in flight to `yadgarhq/argocd`. That guard's job ended the moment the
+// digest landed; it is not a coupling this binary needs to keep passing.
 // ---------------------------------------------------------------------------
 
 /// The template this service is deployed from, read at COMPILE TIME so this can
@@ -326,30 +333,5 @@ fn the_chart_mounts_the_shared_configmap_where_this_binary_looks_for_it() {
          this chart's deployment.yaml names {shared_dir} as its mountPath — a pod would exit \
          at boot naming a path this chart never mounts",
         mounted.path().display()
-    );
-}
-
-/// STEP 2A KEEPS BOTH SOURCES LIVE (MIGRATION_NOTES.md, ADR-0569/ADR-0570).
-///
-/// This binary no longer reads `TLS_ROTATION_POLL_SECS` or
-/// `TLS_ROTATION_SPLAY_MAX_SECS` — it reads `rotate::Configuration::mounted()`
-/// instead. What still has to hold is that the chart goes on rendering BOTH
-/// variables under their established names: Argo takes this chart from HEAD
-/// the moment this pull request merges, while the image is pinned by digest
-/// minutes later from a separate pipeline, so a pod can roll onto the OLD
-/// binary — which still reads these two variables and has no other source.
-/// Deleting either is step 2b, and only after that digest has landed in
-/// `yadgarhq/argocd`.
-#[test]
-fn the_chart_still_renders_the_tls_rotation_variables_for_the_old_binary() {
-    assert!(
-        DEPLOYMENT.contains("name: TLS_ROTATION_POLL_SECS"),
-        "a pod that rolls onto the old binary before this release's digest reaches \
-         yadgarhq/argocd reads its poll interval from this variable and no other source"
-    );
-    assert!(
-        DEPLOYMENT.contains("name: TLS_ROTATION_SPLAY_MAX_SECS"),
-        "a pod that rolls onto the old binary before this release's digest reaches \
-         yadgarhq/argocd reads its splay ceiling from this variable and no other source"
     );
 }
