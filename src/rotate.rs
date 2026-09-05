@@ -26,7 +26,7 @@
 //!
 //! ADR-0523's rule is about PROVENANCE rather than payload: a file this process
 //! read once, out of a mount that can be rewritten underneath it, is watched
-//! whatever the bytes mean. Three materials:
+//! whatever the bytes mean. Four materials:
 //!
 //! - the listener's certificate AND its private key — both halves, or the pair
 //!   rotates half-watched;
@@ -37,7 +37,11 @@
 //!   which may be hours later, in a pod nobody is looking at, as a wave of
 //!   failures with no cause attached;
 //! - the CA the engine's own certificate is verified against, when a deployment
-//!   names one.
+//!   names one;
+//! - **the mounted configuration document** (step 2a, ADR-0569, ADR-0570) —
+//!   `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared` ConfigMap,
+//!   read for the rotation schedule itself. An operator editing that file
+//!   restarts this pod exactly as editing a CA bundle would.
 //!
 //! # The property every change here must keep
 //!
@@ -51,8 +55,8 @@
 use std::path::Path;
 
 pub use yadgar_lifecycle::rotate::{
-    watch, File, Inputs, Material, Presented, Schedule, ScheduleError, CERTIFICATE_NOT_AFTER,
-    WATCHED_FILES_UNREADABLE,
+    watch, Configuration, File, Inputs, Material, Presented, Schedule, ScheduleError,
+    CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
 use crate::boot::ServeTls;
@@ -80,6 +84,17 @@ impl Material for ServeTls {
 /// set that admitted only TLS files would be EMPTY in the deployment this estate
 /// actually runs today, and an empty set means no watch at all.
 ///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE FOURTH MEMBER (step 2a).**
+/// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
+/// ConfigMap, and it is a [`Material`] like the other three: `Configuration`
+/// implements the trait by returning the one file it read its schedule from
+/// (`yadgar_lifecycle::rotate::Configuration::files`), so folding it in here
+/// joins the document to the ADR-0523 watch set through the exact same
+/// `Inputs::also` path the other three members already take. It is `&Configuration`
+/// rather than `Option`, because every deployment mounts it — there is no
+/// cleartext-style absence to model. An operator editing `shared.yaml` restarts
+/// this pod exactly as editing a CA bundle would.
+///
 /// **THE LIST IS THE ASSERTION.** It used to be a run of builder calls in
 /// `main.rs`, in every service that had a watcher, where no test could reach
 /// them — so deleting one compiled, passed everything, and shipped a process
@@ -95,6 +110,7 @@ pub fn watch_set(
     listener: Option<&ServeTls>,
     db_password: &Path,
     db_ssl_ca: Option<&Path>,
+    config: &Configuration,
 ) -> Inputs {
-    Inputs::of(SERVICE, &[&listener, &db_password, &db_ssl_ca])
+    Inputs::of(SERVICE, &[&listener, &db_password, &db_ssl_ca, config])
 }

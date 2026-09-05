@@ -15,11 +15,15 @@
 //! that would never notice that file rotating. Every case below goes through
 //! [`yadgar_task_db::rotate::watch_set`], the SAME function `main.rs` calls.
 //!
-//! **TWO OF THE THREE MATERIALS ARE NOT TRANSPORT.** The database password is
+//! **THREE OF THE FOUR MATERIALS ARE NOT TRANSPORT.** The database password is
 //! not a certificate and the engine's CA is not one this process presents; both
 //! are read once at boot out of mounts that rotate, and ADR-0523's rule is about
-//! provenance rather than payload. A watch set admitting only TLS files would be
-//! EMPTY in the cleartext deployment this estate runs today.
+//! provenance rather than payload. The mounted configuration document (step 2a,
+//! ADR-0569, ADR-0570) is the fourth, and it is unconditional rather than
+//! `Option`-shaped like the CA — every deployment mounts it. A watch set
+//! admitting only TLS files would be EMPTY in the cleartext deployment this
+//! estate runs today; it no longer can be, now that the password and the
+//! mounted document are both unconditional members.
 //!
 //! CERTIFICATES ARE MINTED PER RUN, for the reason `tests/serve_tls.rs` gives: a
 //! fixture key in the repository is a secret in the repository, and it expires
@@ -39,7 +43,7 @@ use rcgen::{
 };
 
 use yadgar_task_db::boot::{self, ServeTls};
-use yadgar_task_db::rotate::{self, Presented};
+use yadgar_task_db::rotate::{self, Configuration, Presented};
 
 /// The leaf's expiry, and the issuing authority's — DELIBERATELY DIFFERENT and
 /// deliberately a decade apart. cert-manager writes the leaf first and the chain
@@ -115,6 +119,28 @@ fn mount() -> Mount {
     ])
 }
 
+/// The mounted document `yadgarhq/config` renders into the `shared` ConfigMap
+/// (step 2a) — under its OWN root, never [`mount`]'s, because the two
+/// ConfigMaps land in separate directories in the real deployment and nothing
+/// here should suggest otherwise.
+fn configuration() -> Configuration {
+    let root = std::env::temp_dir().join(format!(
+        "yadgar-task-db-assembly-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("shared")).unwrap();
+    std::fs::write(
+        root.join("shared").join("shared.yaml"),
+        "tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n",
+    )
+    .unwrap();
+    Configuration::under(root)
+}
+
 /// The listener's transport built the way a DEPLOYMENT builds it — out of the
 /// three variables — rather than by assembling the struct. A test that bypassed
 /// `from_lookup` would leave the reading of those names unproven.
@@ -159,17 +185,34 @@ fn watched(inputs: &rotate::Inputs) -> Vec<String> {
 fn a_fully_configured_task_db_watches_every_file_it_read() {
     let mount = mount();
     let listener = listener(&mount);
+    let config = configuration();
 
     let inputs = rotate::watch_set(
         Some(&listener),
         &mount.at("password"),
         Some(&mount.at("db-ca.pem")),
+        &config,
     );
 
     assert_eq!(
         watched(&inputs),
-        vec!["db-ca.pem", "password", "tls-key.pem", "tls.pem"],
-        "four files were read at boot, so four files are watched"
+        vec![
+            "db-ca.pem",
+            "password",
+            "shared.yaml",
+            "tls-key.pem",
+            "tls.pem"
+        ],
+        "five files were read at boot, so five files are watched — the fourth transport-or-not \
+         member being the mounted configuration document (step 2a)"
+    );
+    assert_eq!(
+        inputs.watched().last().copied(),
+        Some(config.path()),
+        "the mounted configuration document is folded LAST into `Inputs::of`, and is read from \
+         the exact path `Configuration` names — `watched` above compares BASENAMES, so on its \
+         own it would not catch a fold-order regression, nor a `Configuration` pointed at the \
+         wrong root: `shared.yaml` matches whatever directory it came from"
     );
     assert!(
         inputs.unread_at_boot().is_empty(),
@@ -185,8 +228,9 @@ fn the_private_key_is_watched_beside_its_certificate() {
     // pass unnoticed, and this is the assertion that says so out loud.
     let mount = mount();
     let listener = listener(&mount);
+    let config = configuration();
 
-    let inputs = rotate::watch_set(Some(&listener), &mount.at("password"), None);
+    let inputs = rotate::watch_set(Some(&listener), &mount.at("password"), None, &config);
 
     assert!(watched(&inputs).contains(&"tls-key.pem".to_string()));
     assert!(watched(&inputs).contains(&"tls.pem".to_string()));
@@ -199,8 +243,9 @@ fn the_leaf_is_what_the_expiry_gauge_would_carry_and_never_the_issuer() {
     // expiry a decade out — a plausible number, and the wrong one.
     let mount = mount();
     let listener = listener(&mount);
+    let config = configuration();
 
-    let inputs = rotate::watch_set(Some(&listener), &mount.at("password"), None);
+    let inputs = rotate::watch_set(Some(&listener), &mount.at("password"), None, &config);
 
     assert_eq!(
         inputs.not_after(Presented::Serving),
@@ -213,17 +258,19 @@ fn the_leaf_is_what_the_expiry_gauge_would_carry_and_never_the_issuer() {
 fn a_cleartext_task_db_still_watches_its_database_password() {
     // **THE DEPLOYMENT THIS ESTATE ACTUALLY RUNS.** The listener's TLS is opt-in
     // and off by every chart default, so a watch set admitting only transport
-    // material would be EMPTY here — and an empty set means `rotate::watch` never
-    // resolves and nothing is watched at all.
+    // material would hold only the mounted configuration document here (step
+    // 2a) — never nothing, now that both the password and that document are
+    // unconditional members.
     //
     // The password is the member with no other signal: it is read once and baked
     // into a pool that outlives every reconnect, so a rotated Secret breaks
     // nothing until some later reconnect, in a pod nobody is looking at.
     let mount = mount();
+    let config = configuration();
 
-    let inputs = rotate::watch_set(None, &mount.at("password"), None);
+    let inputs = rotate::watch_set(None, &mount.at("password"), None, &config);
 
-    assert_eq!(watched(&inputs), vec!["password"]);
+    assert_eq!(watched(&inputs), vec!["password", "shared.yaml"]);
     assert!(
         !inputs.is_empty(),
         "a cleartext deployment must still be watching something"
@@ -236,10 +283,73 @@ fn an_unconfigured_engine_authority_contributes_nothing_rather_than_a_missing_fi
     // names none. `Option<&Path>: Material` folds an absent one to nothing, so
     // there is no branch at the call site and no phantom path in the set.
     let mount = mount();
+    let config = configuration();
 
-    let with = rotate::watch_set(None, &mount.at("password"), Some(&mount.at("db-ca.pem")));
-    let without = rotate::watch_set(None, &mount.at("password"), None);
+    let with = rotate::watch_set(
+        None,
+        &mount.at("password"),
+        Some(&mount.at("db-ca.pem")),
+        &config,
+    );
+    let without = rotate::watch_set(None, &mount.at("password"), None, &config);
 
-    assert_eq!(watched(&with), vec!["db-ca.pem", "password"]);
-    assert_eq!(watched(&without), vec!["password"]);
+    assert_eq!(watched(&with), vec!["db-ca.pem", "password", "shared.yaml"]);
+    assert_eq!(watched(&without), vec!["password", "shared.yaml"]);
+}
+
+// ---------------------------------------------------------------------------
+// THE CHART AND THE BINARY HAVE TO AGREE, and nothing else in CI checks that.
+// The two below read the deployment template at COMPILE TIME, so a chart edit
+// that breaks the agreement turns a test red here rather than a pod red in the
+// cluster, and a rename inside `yadgar-lifecycle` turns this red instead.
+// ---------------------------------------------------------------------------
+
+/// The template this service is deployed from, read at COMPILE TIME so this can
+/// run in any environment `cargo test` does.
+const DEPLOYMENT: &str = include_str!("../chart/templates/deployment.yaml");
+
+#[test]
+fn the_chart_mounts_the_shared_configmap_where_this_binary_looks_for_it() {
+    let mounted = Configuration::mounted();
+    let shared_dir = mounted
+        .path()
+        .parent()
+        .expect("the mounted document has a parent directory")
+        .display()
+        .to_string();
+
+    assert!(
+        DEPLOYMENT
+            .lines()
+            .any(|line| line.trim() == format!("mountPath: {shared_dir}")),
+        "yadgar_lifecycle::rotate::Configuration::mounted() reads {}, but no volumeMount in \
+         this chart's deployment.yaml names {shared_dir} as its mountPath — a pod would exit \
+         at boot naming a path this chart never mounts",
+        mounted.path().display()
+    );
+}
+
+/// STEP 2A KEEPS BOTH SOURCES LIVE (MIGRATION_NOTES.md, ADR-0569/ADR-0570).
+///
+/// This binary no longer reads `TLS_ROTATION_POLL_SECS` or
+/// `TLS_ROTATION_SPLAY_MAX_SECS` — it reads `rotate::Configuration::mounted()`
+/// instead. What still has to hold is that the chart goes on rendering BOTH
+/// variables under their established names: Argo takes this chart from HEAD
+/// the moment this pull request merges, while the image is pinned by digest
+/// minutes later from a separate pipeline, so a pod can roll onto the OLD
+/// binary — which still reads these two variables and has no other source.
+/// Deleting either is step 2b, and only after that digest has landed in
+/// `yadgarhq/argocd`.
+#[test]
+fn the_chart_still_renders_the_tls_rotation_variables_for_the_old_binary() {
+    assert!(
+        DEPLOYMENT.contains("name: TLS_ROTATION_POLL_SECS"),
+        "a pod that rolls onto the old binary before this release's digest reaches \
+         yadgarhq/argocd reads its poll interval from this variable and no other source"
+    );
+    assert!(
+        DEPLOYMENT.contains("name: TLS_ROTATION_SPLAY_MAX_SECS"),
+        "a pod that rolls onto the old binary before this release's digest reaches \
+         yadgarhq/argocd reads its splay ceiling from this variable and no other source"
+    );
 }
