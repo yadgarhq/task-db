@@ -9,6 +9,7 @@
 pub mod boot;
 mod idem;
 mod read;
+pub mod rotate;
 mod rows;
 pub mod schema;
 pub mod service;

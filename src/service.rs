@@ -18,6 +18,11 @@ use crate::pb::yadgar::task::v1::task_db_service_server::TaskDbService;
 use crate::pb::yadgar::task::v1::*;
 use crate::sql::tel_scope;
 
+/// This service's name, on every telemetry record and on the rotation watcher's
+/// gauges. ONE spelling, because a dashboard selects on it — it was eleven
+/// string literals until `rotate::watch_set` needed the same word.
+pub const SERVICE: &str = "task-db";
+
 pub struct TaskDb {
     pub(crate) pool: MySqlPool,
 }
@@ -49,7 +54,7 @@ impl TaskDbService for TaskDb {
         request: Request<CreateTaskRequest>,
     ) -> Result<Response<CreateTaskResponse>, Status> {
         let req = request.into_inner();
-        let call = Call::start("task-db", "CreateTask", Kind::Write, tel_scope(&req.scope));
+        let call = Call::start(SERVICE, "CreateTask", Kind::Write, tel_scope(&req.scope));
 
         call.run(
             async move { self.create(req).await },
@@ -65,7 +70,7 @@ impl TaskDbService for TaskDb {
         request: Request<GetTaskRequest>,
     ) -> Result<Response<GetTaskResponse>, Status> {
         let req = request.into_inner();
-        let call = Call::start("task-db", "GetTask", Kind::Read, tel_scope(&req.scope));
+        let call = Call::start(SERVICE, "GetTask", Kind::Read, tel_scope(&req.scope));
 
         call.run(
             async move { self.get(req).await },
@@ -81,7 +86,7 @@ impl TaskDbService for TaskDb {
         request: Request<ListTasksRequest>,
     ) -> Result<Response<ListTasksResponse>, Status> {
         let req = request.into_inner();
-        let call = Call::start("task-db", "ListTasks", Kind::Read, tel_scope(&req.scope));
+        let call = Call::start(SERVICE, "ListTasks", Kind::Read, tel_scope(&req.scope));
 
         call.run(
             async move { self.list(req).await },
@@ -97,7 +102,7 @@ impl TaskDbService for TaskDb {
         request: Request<UpdateTaskRequest>,
     ) -> Result<Response<UpdateTaskResponse>, Status> {
         let req = request.into_inner();
-        let call = Call::start("task-db", "UpdateTask", Kind::Write, tel_scope(&req.scope));
+        let call = Call::start(SERVICE, "UpdateTask", Kind::Write, tel_scope(&req.scope));
 
         call.run(
             async move { self.update(req).await },
@@ -113,7 +118,7 @@ impl TaskDbService for TaskDb {
         request: Request<DeleteTaskRequest>,
     ) -> Result<Response<DeleteTaskResponse>, Status> {
         let req = request.into_inner();
-        let call = Call::start("task-db", "DeleteTask", Kind::Write, tel_scope(&req.scope));
+        let call = Call::start(SERVICE, "DeleteTask", Kind::Write, tel_scope(&req.scope));
 
         // DeleteTaskResponse is empty — nothing to measure. Recorded anyway: a
         // delete costs time and belongs in the count, and omitting it would make
