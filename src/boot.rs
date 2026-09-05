@@ -35,17 +35,23 @@
 //!
 //! **The listener is the same argument, one hop further out.** `DB_SSL_MODE`
 //! decides how this module reaches its engine; [`ServeTls`] decides what `task`
-//! gets when it reaches this module. Both default to the transport the reference
-//! deployment already runs, both refuse rather than downgrade when asked for
-//! something they cannot deliver, and neither names an issuer, a CRD or a mesh
-//! (D80) — a flag and file paths is the whole of the configuration.
+//! gets when it reaches this module. NEITHER DEFAULTS ANY MORE: `DB_SSL_MODE` is
+//! required and refuses the boot when unset (ADR-0569), and the listener's
+//! transport is a flag that is either set or absent. Both refuse rather than
+//! downgrade when asked for something they cannot deliver, and neither names an
+//! issuer, a CRD or a mesh (D80) — a flag and file paths is the whole of the
+//! configuration.
 
 use std::path::{Path, PathBuf};
 
 use sqlx::mysql::MySqlConnectOptions;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use yadgar_store::credentials::Secret;
-use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError, DEFAULT_SSL_MODE};
+// NO `DEFAULT_SSL_MODE`. It was the fallback `pool_config` handed
+// `parse_ssl_mode` when DB_SSL_MODE was unset, and under ADR-0569 there is no
+// such position to hand anything to. The constant still exists in
+// `yadgar-store` and this module is simply no longer one of its readers.
+use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError};
 
 /// The key this module used to read, and no longer does.
 ///
@@ -93,8 +99,39 @@ const SSL_CA_KEY: &str = "DB_SSL_CA_FILE";
 /// pins that half.
 pub const LISTEN: &str = "LISTEN";
 
-fn env_or(env: &impl Fn(&str) -> Option<String>, key: &str, default: &str) -> String {
-    env(key).unwrap_or_else(|| default.to_string())
+/// A knob read from ONE source, refusing rather than inventing (ADR-0569).
+///
+/// It replaces `env_or(env, key, default)`, and deleting the `default` parameter
+/// is more of the point than the rename: while the helper took one, every knob
+/// in [`pool_config`] had somewhere for a fallback to live, and a fallback is
+/// invisible at the point of use, survives an upgrade unnoticed, and makes the
+/// effective setting depend on which layer a reader happens to inspect.
+///
+/// AN EMPTY VALUE REFUSES TOO, AND WITH ITS OWN MESSAGE. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week. Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit. It also has to be caught HERE
+/// rather than by the parse: `"".parse::<u16>()` is a `ParseIntError` that names
+/// no key at all, so an operator reading a crash loop would learn that some
+/// number was unreadable and never which one.
+///
+/// THE LOOKUP IS PASSED IN, for the reason [`pool_config`] gives — a test states
+/// a whole environment without mutating the process.
+fn env_required(env: &impl Fn(&str) -> Option<String>, key: &str) -> Result<String, String> {
+    match env(key) {
+        Some(value) if !value.is_empty() => Ok(value),
+        Some(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        None => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
+    }
 }
 
 /// Read the pool configuration, refusing rather than guessing.
@@ -110,15 +147,39 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
         return Err(BootError::ObsoleteRequireTls);
     }
 
+    // EVERY ONE OF THE EIGHT IS REQUIRED, and every one is rendered by this
+    // repository's chart — which is the half that makes the requirement safe
+    // rather than a pod that will not boot. `map_err` at each site rather than a
+    // signature change: this function's error type is `BootError` and its callers
+    // read it, so the refusal joins the enum as one more sentence instead of
+    // becoming a second error type beside it.
     Ok(PoolConfig {
-        host: env_or(&env, "DB_HOST", "127.0.0.1"),
-        port: env_or(&env, "DB_PORT", "3306").parse()?,
-        database: env_or(&env, "DB_NAME", "task"),
-        username: env_or(&env, "DB_USER", "task"),
-        max_connections: env_or(&env, "DB_MAX_CONNECTIONS", "8").parse()?,
-        replicas: env_or(&env, "REPLICAS", "2").parse()?,
-        engine_max_connections: env_or(&env, "DB_ENGINE_MAX_CONNECTIONS", "151").parse()?,
-        ssl_mode: parse_ssl_mode(&env_or(&env, SSL_MODE_KEY, DEFAULT_SSL_MODE))?,
+        host: env_required(&env, "DB_HOST").map_err(BootError::MissingKnob)?,
+        port: env_required(&env, "DB_PORT")
+            .map_err(BootError::MissingKnob)?
+            .parse()?,
+        database: env_required(&env, "DB_NAME").map_err(BootError::MissingKnob)?,
+        username: env_required(&env, "DB_USER").map_err(BootError::MissingKnob)?,
+        max_connections: env_required(&env, "DB_MAX_CONNECTIONS")
+            .map_err(BootError::MissingKnob)?
+            .parse()?,
+        replicas: env_required(&env, "REPLICAS")
+            .map_err(BootError::MissingKnob)?
+            .parse()?,
+        engine_max_connections: env_required(&env, "DB_ENGINE_MAX_CONNECTIONS")
+            .map_err(BootError::MissingKnob)?
+            .parse()?,
+        ssl_mode: parse_ssl_mode(
+            &env_required(&env, SSL_MODE_KEY).map_err(BootError::MissingKnob)?,
+        )?,
+        // STILL AN OPTIONAL READ, and deliberately NOT converted to
+        // `env_required` with the rest (ADR-0569). The chart renders
+        // DB_SSL_CA_FILE only under `database.sslCaSecret`, so requiring it would
+        // refuse the boot of every deployment that never asked for certificate
+        // verification — the rule's own failure mode, pointed the other way. An
+        // absent authority is a correct system, which is exactly the shape
+        // ADR-0569's revisit trigger names.
+        //
         // TRIMMED AND EMPTY-FILTERED, unlike every value above, because this one
         // is an `Option` and Helm renders an unset value as `""`. Without the
         // filter that empty string becomes `Some(PathBuf::new())` — a path sqlx
@@ -437,6 +498,19 @@ pub enum BootError {
         source: std::io::Error,
     },
 
+    // ONE VARIANT FOR ALL EIGHT KNOBS, carrying the sentence `env_required`
+    // wrote. It is `#[error("{0}")]` rather than a wrapper phrase because the
+    // string already names the key, says there is no compiled-in default, and
+    // says the chart renders it — a prefix here would only push the key further
+    // from the start of the line an operator reads in a crash loop.
+    //
+    // A `String` payload rather than a `&'static str` key plus a rendered
+    // reason: the empty and absent cases MUST read differently (Helm renders an
+    // unset value as `""`), and a variant carrying only the key could not tell
+    // them apart without becoming two variants that say the same thing twice.
+    #[error("{0}")]
+    MissingKnob(String),
+
     #[error(transparent)]
     Pool(#[from] PoolError),
 
@@ -453,6 +527,54 @@ mod tests {
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
             pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// EVERY KNOB `pool_config` REQUIRES, WITH THE VALUE THE CHART WOULD RENDER.
+    ///
+    /// There is no such thing as a partial environment for this function any
+    /// more, which is the whole of ADR-0569 restated as a fixture: a test that
+    /// used to pass `&[]` was asserting the defaults, and the defaults are gone.
+    ///
+    /// THE VALUES ARE SENTINELS, not plausible ones. Nothing in this module, in
+    /// `store`, or in sqlx would arrive at `engine.example.invalid`, port 13306
+    /// or `verify-identity` on its own — so a field carrying one of these got it
+    /// from the lookup rather than from a fallback somebody left behind. The
+    /// former defaults (`127.0.0.1`, `3306`, `task`, `8`, `2`, `151`,
+    /// `required`) are deliberately absent from this list: a fixture repeating
+    /// them could not tell a read from a leftover default.
+    const RENDERED: [(&str, &str); 8] = [
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "137"),
+        ("DB_SSL_MODE", "verify-identity"),
+    ];
+
+    /// The rendered environment, with `overrides` winning over it.
+    fn env_with<'a>(overrides: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            overrides
+                .iter()
+                .chain(RENDERED.iter())
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// The rendered environment with ONE knob deleted — an unrendered variable.
+    fn env_without(omitted: &str) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| {
+            if key == omitted {
+                return None;
+            }
+            RENDERED
                 .iter()
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.to_string())
@@ -510,7 +632,7 @@ mod tests {
         // value most likely to be sitting in a deployment right now — and the
         // one whose silent removal changes nothing visible while removing the
         // guarantee the operator wrote down.
-        let err = pool_config(env_of(&[("DB_REQUIRE_TLS", "true")]))
+        let err = pool_config(env_with(&[("DB_REQUIRE_TLS", "true")]))
             .expect_err("a set DB_REQUIRE_TLS must refuse the boot");
 
         assert!(matches!(err, BootError::ObsoleteRequireTls));
@@ -522,7 +644,7 @@ mod tests {
     fn the_obsolete_key_is_refused_before_any_other_value_is_parsed() {
         // The refusal must win against a second, unrelated fault. Otherwise the
         // operator fixes the port, boots, and never learns the key is inert.
-        let err = pool_config(env_of(&[
+        let err = pool_config(env_with(&[
             ("DB_REQUIRE_TLS", "true"),
             ("DB_PORT", "not-a-port"),
         ]))
@@ -536,7 +658,7 @@ mod tests {
         // The reason the boolean had to go: no value of DB_REQUIRE_TLS could
         // ask the engine to prove who it is. The hyphen spelling is the one a
         // chart writes; sqlx writes the underscore.
-        let config = pool_config(env_of(&[("DB_SSL_MODE", "verify-identity")])).expect("config");
+        let config = pool_config(env_with(&[("DB_SSL_MODE", "verify-identity")])).expect("config");
         assert!(matches!(config.ssl_mode, MySqlSslMode::VerifyIdentity));
 
         // THE PARSE IS STILL THE WHOLE OF WHAT THIS ASSERTS FOR `verify_ca`,
@@ -545,7 +667,7 @@ mod tests {
         // configuration carrying it is still assembled without complaint, and
         // rewriting this into a refusal would assert something `pool_config`
         // does not do. The refusal has its own test below.
-        let config = pool_config(env_of(&[("DB_SSL_MODE", "VERIFY_CA")])).expect("config");
+        let config = pool_config(env_with(&[("DB_SSL_MODE", "VERIFY_CA")])).expect("config");
         assert!(matches!(config.ssl_mode, MySqlSslMode::VerifyCa));
     }
 
@@ -597,7 +719,7 @@ mod tests {
         // existed no value named the authority to check it against — so sqlx
         // fell back to the public web roots, which sign no operator-issued
         // engine certificate.
-        let config = pool_config(env_of(&[("DB_SSL_CA_FILE", SENTINEL_CA)])).expect("config");
+        let config = pool_config(env_with(&[("DB_SSL_CA_FILE", SENTINEL_CA)])).expect("config");
 
         assert_eq!(
             config.ssl_ca.as_deref(),
@@ -612,7 +734,7 @@ mod tests {
         // would name a file sqlx then fails to open, and a default CA path is a
         // policy this module has no business inventing — an Azure MySQL engine
         // whose authority IS a public root legitimately configures none.
-        assert_eq!(pool_config(env_of(&[])).expect("config").ssl_ca, None);
+        assert_eq!(pool_config(env_with(&[])).expect("config").ssl_ca, None);
 
         // EMPTY is the same statement written by a chart. Helm renders an unset
         // value as "", so a naive read turns "no authority" into `PathBuf::new()`
@@ -620,7 +742,7 @@ mod tests {
         // that never asked for verification at all.
         for value in ["", " ", "\t", "\n"] {
             assert_eq!(
-                pool_config(env_of(&[("DB_SSL_CA_FILE", value)]))
+                pool_config(env_with(&[("DB_SSL_CA_FILE", value)]))
                     .expect("config")
                     .ssl_ca,
                 None,
@@ -631,11 +753,12 @@ mod tests {
 
     #[test]
     fn an_unrecognised_ssl_mode_refuses_the_boot_rather_than_falling_back() {
-        // `yes` is not arbitrary. Under the expression this replaces —
-        // `env_or("DB_REQUIRE_TLS", "true") == "true"` — it evaluated FALSE and
-        // selected an unencrypted connection, silently. Failing open on a
-        // transport question is the class of bug, not one spelling of it.
-        let err = pool_config(env_of(&[("DB_SSL_MODE", "yes")]))
+        // `yes` is not arbitrary. Under the boolean expression this replaces —
+        // DB_REQUIRE_TLS read with a compiled-in `"true"` behind it and compared
+        // against `"true"` — it evaluated FALSE and selected an unencrypted
+        // connection, silently. Failing open on a transport question is the class
+        // of bug, not one spelling of it.
+        let err = pool_config(env_with(&[("DB_SSL_MODE", "yes")]))
             .expect_err("an unrecognised mode must refuse the boot");
 
         assert!(
@@ -745,15 +868,105 @@ mod tests {
         assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(), None);
     }
 
+    /// THE PROPERTY THAT USED TO BE CALLED "the default encrypts", now that
+    /// there is no default to name.
+    ///
+    /// What it guarded was never the value `required` — it was that an
+    /// unconfigured deployment could not silently arrive at `Preferred`, which
+    /// sqlx documents as falling back to an unencrypted connection. That
+    /// guarantee is STRUCTURAL now rather than a value: an environment naming no
+    /// mode does not reach `parse_ssl_mode` at all, it refuses the boot and names
+    /// DB_SSL_MODE. A default of `required` was the WEAKER form of the same
+    /// promise, because it also silently overrode an operator who meant to set a
+    /// mode and mistyped the variable's name.
     #[test]
-    fn the_default_encrypts_and_does_not_fall_back() {
-        // An empty environment is the shipped deployment. `Preferred` here would
-        // mean the fix reintroduced the defect through the default.
-        let config = pool_config(env_of(&[])).expect("config");
-        assert!(
-            matches!(config.ssl_mode, MySqlSslMode::Required),
-            "the default ssl-mode must encrypt without falling back"
-        );
+    fn an_unset_ssl_mode_refuses_the_boot_rather_than_encrypting_by_default() {
+        let err = pool_config(env_without(SSL_MODE_KEY))
+            .expect_err("an unset ssl-mode must refuse the boot, not fall back to a value");
+
+        let message = err.to_string();
+        assert!(matches!(err, BootError::MissingKnob(_)), "{message}");
+        assert!(message.contains(SSL_MODE_KEY), "{message}");
+
+        // And the mode still travels when it IS named, so the refusal above is
+        // not simply this function having stopped reading the variable.
+        let config = pool_config(env_with(&[("DB_SSL_MODE", "required")])).expect("config");
+        assert!(matches!(config.ssl_mode, MySqlSslMode::Required), "{err}");
+    }
+
+    /// EVERY KNOB IS PROVED REQUIRED, ONE AT A TIME.
+    ///
+    /// A single test on one variable would pass while seven others kept a
+    /// fallback nobody could see, so the loop is the assertion. The refusal has
+    /// to NAME the knob: three of these are numbers, and an empty or absent
+    /// number that reached `.parse()` would produce a `ParseIntError` saying
+    /// "cannot parse integer from empty string" and naming nothing at all — the
+    /// operator would learn only that some value was unreadable.
+    #[test]
+    fn every_rendered_knob_is_required_and_the_refusal_names_it() {
+        for (key, _) in RENDERED {
+            let err = pool_config(env_without(key)).err().unwrap_or_else(|| {
+                panic!("{key} is not required: pool_config built a configuration without it")
+            });
+
+            let message = err.to_string();
+            assert!(
+                matches!(err, BootError::MissingKnob(_)),
+                "{key} refused, but not as a missing knob: {message}"
+            );
+            assert!(
+                message.contains(key),
+                "the refusal must name the knob it wants; {key} produced: {message}"
+            );
+        }
+    }
+
+    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so a
+    /// nulled chart value arrives as set-but-empty rather than as absent. An
+    /// implementation collapsing the two into one branch is a defect this estate
+    /// found three separate times in one week, so the two messages are asserted
+    /// to DIFFER rather than merely to exist.
+    #[test]
+    fn an_empty_knob_refuses_with_a_message_of_its_own() {
+        for (key, _) in RENDERED {
+            let empty = pool_config(env_with(&[(key, "")]))
+                .expect_err("an empty knob must refuse the boot")
+                .to_string();
+            let absent = pool_config(env_without(key))
+                .expect_err("an absent knob must refuse the boot")
+                .to_string();
+
+            assert!(
+                empty.contains(key),
+                "the empty refusal must name {key}: {empty}"
+            );
+            assert!(empty.contains("set but EMPTY"), "{empty}");
+            assert!(absent.contains("NOT SET"), "{absent}");
+            assert_ne!(
+                empty, absent,
+                "{key}: empty and absent must not share one message"
+            );
+        }
+    }
+
+    /// The case a naive test omits, and the only one that proves a value is USED.
+    /// A test asserting only that `pool_config` SUCCEEDS passes just as happily
+    /// with a compiled-in default still sitting behind every read.
+    ///
+    /// The fixture holds none of the seven values this function used to default
+    /// to, so each assertion below fails if any one of them came back.
+    #[test]
+    fn every_rendered_value_reaches_the_pool_configuration_verbatim() {
+        let config = pool_config(env_with(&[])).expect("config");
+
+        assert_eq!(config.host, "engine.example.invalid");
+        assert_eq!(config.port, 13306);
+        assert_eq!(config.database, "task_fixture");
+        assert_eq!(config.username, "task_fixture_user");
+        assert_eq!(config.max_connections, 4);
+        assert_eq!(config.replicas, 3);
+        assert_eq!(config.engine_max_connections, 137);
+        assert!(matches!(config.ssl_mode, MySqlSslMode::VerifyIdentity));
     }
 
     /// The message is the ONLY thing the lift to `yadgar-lifecycle` changed, so

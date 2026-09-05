@@ -67,6 +67,38 @@ spec:
             - name: grpc
               containerPort: 50051
           env:
+            # THE THREE KNOBS THE BINARY GAINED A REQUIREMENT FOR (ADR-0569).
+            # None of them was rendered before, because each had a compiled-in
+            # default behind it; the defaults are deleted, so a pod without these
+            # lines refuses to start naming the variable. They are rendered as
+            # LITERALS rather than as chart values deliberately — nothing about a
+            # deployment makes them per-installation, and a value with no reason
+            # to vary is a knob this chart has no business inventing.
+            #
+            # `50051` IS THE `containerPort` ABOVE, said twice. Kubernetes needs
+            # it in the port declaration for the Service and the readiness probe
+            # to name; the process needs it to bind. Nothing in Kubernetes
+            # connects the two, so changing one alone gives a pod listening
+            # somewhere the probe never looks.
+            - name: LISTEN
+              value: "0.0.0.0:50051"
+            # `9090` IS THE `prometheus.io/port` ANNOTATION, said twice, and the
+            # same coupling: the annotation tells Prometheus where to scrape and
+            # this tells the process where to export. A change to one is a change
+            # to both.
+            - name: METRICS_LISTEN
+              value: "0.0.0.0:9090"
+            # `/var/run/secrets/task-db` IS THE `db-password` VOLUME MOUNT below,
+            # said twice — a directory the kubelet mounts and a path the process
+            # opens, with nothing in Kubernetes relating them.
+            #
+            # THE `password` BASENAME IS NOT THIS CHART'S TO CHOOSE. The volume
+            # mounts the Secret whole, with no `items:`, so each KEY inside
+            # `database.passwordSecret` becomes a file of that name. This value
+            # names the key `password`; a Secret storing the credential under any
+            # other key needs this path changed to match it.
+            - name: DB_PASSWORD_FILE
+              value: "/var/run/secrets/task-db/password"
             - name: DB_HOST
               value: {{ .Values.database.host | quote }}
             - name: DB_PORT
@@ -174,6 +206,10 @@ spec:
             - name: config-task-db
               mountPath: /etc/yadgar/config/task-db
               readOnly: true
+            # THE OTHER HALF OF `DB_PASSWORD_FILE` in the env block above. This
+            # mountPath and that value's directory are one path written twice, and
+            # since ADR-0569 deleted the binary's compiled-in path there is no
+            # third copy — but these two must still be changed together.
             - name: db-password
               mountPath: /var/run/secrets/task-db
               readOnly: true
