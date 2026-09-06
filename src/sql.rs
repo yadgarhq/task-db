@@ -260,6 +260,11 @@ impl Reach {
     }
 
     /// The parameters of [`Reach::visible`], in the same order.
+    ///
+    /// **THE `self.user` BOUND HERE AND THE ONE [`Reach::readable`] PUTS FIRST
+    /// IN ITS [`Readable`] ARE THE SAME VALUE.** A read therefore binds this
+    /// user id twice, in two positions that cannot be told apart by any test.
+    /// [`Readable::bind`] carries the reason and the measurement.
     pub fn bind_visible<'q>(
         &'q self,
         query: Query<'q, MySql, MySqlArguments>,
@@ -300,6 +305,49 @@ impl Readable {
     ///
     /// These come LAST: after [`Reach::bind_within`] and [`Reach::bind_visible`],
     /// because the arm is appended to the end of the ladder.
+    ///
+    /// **THE FIRST OF THESE AND [`Reach::bind_visible`]'S FIRST ARE THE SAME
+    /// VALUE, SO SWAPPING THEM IS AN EQUIVALENT MUTANT RATHER THAN AN UNTESTED
+    /// ONE.** A read binds `self.user` twice — once for the ladder's PRIVATE
+    /// rung, once for this arm's `owner_user_id` — and the swapped program
+    /// hands the engine a byte-identical argument list. NO fixture discriminates
+    /// the two positions. One with several teams and a distinct exception per
+    /// team does not either: the swap is invisible because the two values are
+    /// equal, not because the suite is thin. This is written down because the
+    /// observation reads like a test gap and has been filed as one; ADR-0598
+    /// asks that a claim of unreachability carry the evidence that establishes
+    /// it, and the rest of this comment is that evidence.
+    ///
+    /// **BOTH HOLES ARE LIVE, WHICH IS THE PART A READER CANNOT TAKE ON
+    /// TRUST.** Measured 2026-09-06 against `mariadb:11.8.9`, one sentinel at a
+    /// time, whole suite green before each. Replacing THIS binding's value with
+    /// a literal reddens
+    /// `an_owner_outside_the_team_reaches_their_own_team_record` — "with the
+    /// setting ON, an owner reads their own record from outside its team:
+    /// Status { code: NotFound }" — and six tests with it. Replacing
+    /// [`Reach::bind_visible`]'s `self.user` instead reddens the TWO tests that
+    /// state `ladder_only` and only those:
+    /// `a_row_with_an_unrecognised_visibility_falls_back_to_private` in
+    /// `tests/scope.rs` and `a_healed_row_reads_as_private_through_the_service`
+    /// in `tests/migration.rs`. Under `ladder_only` the setting states OFF and
+    /// locked, so `OwnerReach::reaches_nothing` holds, this arm renders nothing
+    /// and this value binds nothing — the ladder's hole is the only one left to
+    /// fill. `tests/migration.rs` stays GREEN under the first sentinel and goes
+    /// RED under the second, so the two holes are told apart on two independent
+    /// test binaries rather than on one. Neither hole is carried by the other.
+    ///
+    /// **AND THE ALIGNMENT BETWEEN THE TWO VARIABLE-LENGTH LISTS IS ALREADY
+    /// PINNED, so no fixture is owed for that either.** Binding this group
+    /// BEFORE [`Reach::bind_visible`] — the one misalignment a single edit can
+    /// express, since the caller's teams and the setting's exceptions otherwise
+    /// never meet — reddens `a_teammate_sees_a_team_task`,
+    /// `the_owner_of_a_team_task_reads_it_through_the_team_arm`,
+    /// `an_override_on_the_records_team_reaches_an_owner_who_is_in_no_team` and
+    /// `the_number_arm_carries_adr_0522_as_well`. The lists cannot cross any
+    /// other way: [`Reach::bind_visible`] reads `self.teams` and never sees the
+    /// exceptions, which [`Reach::readable`] resolves and hands straight to this
+    /// value, and each clause counts its holes off the same field its binder
+    /// iterates.
     pub fn bind<'q>(
         &'q self,
         query: Query<'q, MySql, MySqlArguments>,
