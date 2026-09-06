@@ -52,6 +52,13 @@ use yadgar_store::credentials::Secret;
 // such position to hand anything to. The constant still exists in
 // `yadgar-store` and this module is simply no longer one of its readers.
 use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError};
+// THE ONE ERROR-CHAIN FLATTENER FOR THE ESTATE (ADR-0591). The body that used to
+// sit above `BootError` in this file was one of five — `iam`, `iam-db`, `task`,
+// `project-db` and here — byte-identical apart from local names, under TWO
+// names: `chain` in the first two and `describe` in the other three. It is
+// deleted rather than left beside the shared one, because a consolidation that
+// adds a sixth copy without removing the five is worse than none.
+use yadgar_telemetry::diagnose::chain;
 
 /// The key this module used to read, and no longer does.
 ///
@@ -355,7 +362,7 @@ pub fn server(tls: Option<&ServeTls>) -> Result<Server, BootError> {
         .map_err(|e| BootError::TlsUnusable {
             cert: tls.cert_file.clone(),
             key: tls.key_file.clone(),
-            detail: describe(&e),
+            detail: chain(&e),
         })
 }
 
@@ -393,23 +400,6 @@ pub fn server(tls: Option<&ServeTls>) -> Result<Server, BootError> {
 /// next rollout.
 pub fn shutdown() -> Result<impl std::future::Future<Output = ()>, BootError> {
     yadgar_lifecycle::shutdown().map_err(|source| BootError::SignalHandler { source })
-}
-
-/// Flatten an error and everything under it into one sentence.
-///
-/// `tonic::transport::Error` displays as "transport error" and keeps what
-/// actually went wrong in its source — so the message an operator needs is the
-/// CHAIN, not the head of it. Losing it is the same class of mistake as printing
-/// `Debug` from `main`.
-fn describe(error: &dyn std::error::Error) -> String {
-    let mut out = error.to_string();
-    let mut source = error.source();
-    while let Some(next) = source {
-        out.push_str(": ");
-        out.push_str(&next.to_string());
-        source = next.source();
-    }
-    out
 }
 
 #[derive(Debug, thiserror::Error)]
