@@ -317,6 +317,7 @@ impl ServeTls {
 }
 
 fn read_pem(path: &Path, what: &'static str) -> Result<Vec<u8>, BootError> {
+    // ADR-0523-WATCHED: ServeTls
     std::fs::read(path).map_err(|source| BootError::TlsUnreadable {
         what,
         path: path.to_path_buf(),
