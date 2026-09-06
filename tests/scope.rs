@@ -191,14 +191,54 @@ async fn a_non_teammate_does_not_see_a_team_task() {
 /// U3 owns `u3_team` and belongs to `TEAM`, so the TEAM rung is what grants the
 /// read. The PRIVATE rung does not and must not: `visibility NOT IN (2, 3)`
 /// excludes a TEAM row whoever owns it.
+///
+/// **THE SECOND HALF STATES [`ladder_only`], AND WITHOUT IT THIS TEST STOPPED
+/// SAYING WHAT ITS NAME SAYS.** `task-db#33` flipped the fixture default to the
+/// shipped `ON`, under which `Reach::readable` renders a blanket
+/// `OR owner_user_id = ?` for a caller with no team exceptions — so the arm, not
+/// the rung, returns this row. MEASURED against `mariadb:11.8.9`: rendering the
+/// TEAM arm as `(visibility = 2 AND team_id IN (?) AND 1 = 0)` — the rung
+/// disabled with its hole count preserved — left the first half GREEN while
+/// `a_teammate_sees_a_team_task`, `a_setting_stating_off_leaves_an_owner_
+/// outside_the_team_where_they_were` and `a_healed_row_reads_as_private_
+/// through_the_service` all reddened. The second half is what makes that mutant
+/// die HERE, in the test named for it.
+///
+/// **THE FIRST HALF STAYS ON THE SHIPPED DEFAULT RATHER THAN MOVING TO
+/// `ladder_only`, and that is load-bearing rather than inertia.** Under
+/// `ladder_only` the setting reaches nothing, so ADR-0522's arm renders no holes
+/// and `Readable::bind` binds nothing — which makes the bind-misordering mutant
+/// `Readable::bind` documents an EQUIVALENT one for a `ladder_only` call site.
+/// `src/sql.rs` records this test in that mutant's kill set; re-pinning the
+/// existing call site instead of adding beside it would have removed it from
+/// that set silently. MEASURED: binding ADR-0522's group before
+/// [`Reach::bind_visible`] reddens the first half and not the second.
 #[tokio::test]
 async fn the_owner_of_a_team_task_reads_it_through_the_team_arm() {
     let c = two_projects_two_users("td_vis_team_owner").await;
 
+    // Half one: the shipped policy. This is the configuration the estate runs,
+    // and it is the half that carries the bind-ordering assertion.
     let seen = c
         .read_as(&c.scope_in(P_A, U3, &[TEAM]), &c.u3_team)
         .await
         .expect("the owner, in the named team, may read their own TEAM record");
+    assert_eq!(seen.title, "u3 team");
+
+    // Half two: the same record, the same caller, the same team list, with
+    // ADR-0522's arm removed by the setting. The TEAM rung is then the only
+    // thing in the statement that can answer, which is what this test is named
+    // for.
+    let seen = c
+        .read_as(
+            &c.scope_with(P_A, U3, &[TEAM], Some(ladder_only())),
+            &c.u3_team,
+        )
+        .await
+        .expect(
+            "with ADR-0522's arm gone, the ladder's TEAM rung must still reach \
+             the owner of the record it is shared with",
+        );
     assert_eq!(seen.title, "u3 team");
 }
 

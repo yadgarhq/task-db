@@ -70,11 +70,29 @@ pub fn shipped_setting() -> InheritedSetting {
 ///
 /// MEASURED rather than reasoned: with the fixture default at `ON`, the mutant
 /// that renders the PRIVATE rung as `visibility = 1` instead of
-/// `visibility NOT IN (2, 3)` survives the WHOLE suite. Stating `OFF` at the two
+/// `visibility NOT IN (2, 3)` survives the WHOLE suite. Stating `OFF` at the
 /// call sites that assert an owner's own read is what kills it again. Three
 /// other ladder mutants — the rung dropping its owner check, the TEAM arm never
 /// rendered, and the ORG arm dropped — die under either default, because each is
 /// seen by a caller who does not own the row.
+///
+/// **THE TEAM RUNG NEEDS THIS TOO, AND FOR THE SAME REASON THE PRIVATE RUNG
+/// DOES.** Re-measured 2026-09-06 against `mariadb:11.8.9`: disabling the TEAM
+/// arm with its hole count preserved left
+/// `the_owner_of_a_team_task_reads_it_through_the_team_arm` — the test named for
+/// exactly that rung — GREEN, because under `ON` ADR-0522's blanket arm returned
+/// the row instead. That test now states this at a second call site of its own.
+///
+/// WHICH MUTANT EACH CALL SITE KILLS DIFFERS, so they are not interchangeable:
+/// the PRIVATE-rung mutant above dies only at
+/// `a_row_with_an_unrecognised_visibility_falls_back_to_private`. NO COUNT IS
+/// WRITTEN HERE, and that is the same discipline `World::scope_with` states for
+/// the same reason — a count is what went stale last time. It would also be
+/// wrong on its own terms: `a_setting_stating_off_leaves_an_owner_outside_the_
+/// team_where_they_were` pins this identical arm-free ladder by restating
+/// `setting(SettingValue::Off, true, &[])` inline rather than calling this
+/// helper, so grepping for the helper under-counts the tests that state the
+/// policy.
 ///
 /// This is the same discipline `scope_with` states for the other direction: a
 /// test whose subject is the SETTING states its own policy, and so does a test
@@ -257,9 +275,11 @@ impl World {
     /// default it inherits was never what killed M4 — re-measured here, M4 still
     /// dies under this default.
     ///
-    /// What the flip DOES cost is one rung: see [`ladder_only`], which the two
-    /// tests asserting an owner's own read now state. That cost is paid at those
-    /// two call sites rather than by every test in the suite.
+    /// What the flip DOES cost is the rungs: see [`ladder_only`], which the
+    /// tests asserting an owner's own read state. That cost is paid at those
+    /// call sites rather than by every test in the suite — and the accounting
+    /// was short by one until ledger 475 measured the TEAM rung, so the count is
+    /// deliberately not written down here again.
     ///
     /// STATED rather than absent, because absent is now REFUSED: this service
     /// reads the field, so it is in the ENFORCING state and a read carrying no
