@@ -325,11 +325,14 @@ impl Readable {
     /// `an_owner_outside_the_team_reaches_their_own_team_record` — "with the
     /// setting ON, an owner reads their own record from outside its team:
     /// Status { code: NotFound }" — and six tests with it. Replacing
-    /// [`Reach::bind_visible`]'s `self.user` instead reddens the TWO tests that
-    /// state `ladder_only` and only those:
+    /// [`Reach::bind_visible`]'s `self.user` instead reddens
     /// `a_row_with_an_unrecognised_visibility_falls_back_to_private` in
     /// `tests/scope.rs` and `a_healed_row_reads_as_private_through_the_service`
-    /// in `tests/migration.rs`. Under `ladder_only` the setting states OFF and
+    /// in `tests/migration.rs`. Both state `ladder_only`; a third test states it
+    /// too — `the_owner_of_a_team_task_reads_it_through_the_team_arm`'s second
+    /// half, added by ledger 475 — and stays green here, because its row is TEAM
+    /// and the TEAM arm answers it without the PRIVATE rung's owner hole.
+    /// Under `ladder_only` the setting states OFF and
     /// locked, so `OwnerReach::reaches_nothing` holds, this arm renders nothing
     /// and this value binds nothing — the ladder's hole is the only one left to
     /// fill. `tests/migration.rs` stays GREEN under the first sentinel and goes
