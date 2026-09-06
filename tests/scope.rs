@@ -212,7 +212,11 @@ async fn a_non_teammate_does_not_see_a_team_task() {
 /// `src/sql.rs` records this test in that mutant's kill set; re-pinning the
 /// existing call site instead of adding beside it would have removed it from
 /// that set silently. MEASURED: binding ADR-0522's group before
-/// [`Reach::bind_visible`] reddens the first half and not the second.
+/// [`Reach::bind_visible`] reds this test at the FIRST half. The second half
+/// cannot red under that mutant, and this is DERIVED rather than measured —
+/// `Reach::readable` takes its `reaches_nothing` branch under `ladder_only`, so
+/// `binds` is empty, `Readable::bind` iterates nothing, and the two orderings
+/// are the same sequence of calls.
 #[tokio::test]
 async fn the_owner_of_a_team_task_reads_it_through_the_team_arm() {
     let c = two_projects_two_users("td_vis_team_owner").await;
