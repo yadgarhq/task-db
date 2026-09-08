@@ -19,7 +19,7 @@ description = "The task module's -db twin: the only writer of its store, serving
 # perform: it accepted any publicly-trusted certificate for any name. Nothing in
 # this estate runs it, so the refusal changes no deployment; `verify_identity`
 # is the mode that binds the connection to the engine it names.
-yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.2.5" }
+yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.2.6" }
 # In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
 # feature on tonic itself.
 tonic = { version = "0.14", default-features = false, features = [
@@ -41,7 +41,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 # The shared instrumentation seam (D67), pinned by release tag like every in-org crate.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.9", features = ["grpc"] }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.10", features = ["grpc"] }
 # WHICH SIGNALS END THIS PROCESS, decided once for the estate rather than once
 # per repository (ADR-0526's pin, D19's rule). `boot::shutdown` was the fifth
 # copy of one function and the only one that did not match the other four, which
@@ -65,7 +65,7 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # signal handler, so once the rotation arm wins the `select!` a later SIGTERM is
 # swallowed and only SIGKILL remains — the watcher WITHOUT `drain_within` is the
 # bug, not half the fix.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.9" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.10" }
 sqlx = { version = "0.9", default-features = false, features = [
   "json",
   "runtime-tokio",
