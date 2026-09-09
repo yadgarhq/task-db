@@ -22,7 +22,7 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.18.3
     hooks:
       - id: gitleaks
       - id: prettier
@@ -36,6 +36,38 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # LEDGER 659, and the rev above moves to v1.18.3 FOR THESE TWO. The
+      # `complexity` script gained its `tests.rs` exemption in actions#69, which
+      # only v1.18.3 carries. The v1.18.2..v1.18.3 diff touches
+      # `hooks/complexity.py` and its own test file and nothing else, so no
+      # other hook's behaviour moves with the bump.
+      #
+      # THE BUMP IS NOT WHAT MAKES THIS TREE PASS, and saying so would be
+      # untrue: v1.18.2's script, run over this tree, also exits 0. It passes by
+      # ACCIDENT — under v1.18.2 the two `src/<mod>/tests.rs` files here are
+      # measured as production code, and they clear the ceiling only because
+      # they happen to be 483 and 443 lines. Seventeen more test lines in either
+      # and the ceiling would refuse a test module, which is the outcome
+      # actions#69 exists to prevent. v1.18.3 is what makes the layout the gate's
+      # own docstring recommends actually safe to adopt.
+      #
+      # ADOPTED HERE BECAUSE THIS REPOSITORY IS NOW CLEAN, measured rather than
+      # hoped. Before this PR `complexity.py` reported three files over the
+      # 500-line ceiling (boot.rs 996, setting.rs 667, write.rs 563) and two
+      # functions over 120 (`main` 231, `update` 134) — the same 3-and-2 the
+      # estate-wide measurement recorded for this repository. It now reports
+      # nothing, and `cargo clippy --all-targets --all-features -- -W
+      # clippy::cognitive_complexity -W clippy::too_many_arguments -D warnings`
+      # exited 0 both before and after, so `cargo-clippy-complexity` is adopted
+      # having never been breached here.
+      #
+      # A published hook nobody references gates nothing (ADR-0577), and these
+      # two were referenced by one repository in the estate until ledger 659.
+      # The two are complementary and neither replaces the other: a line count
+      # cannot see nesting, and cognitive complexity cannot see a 2000-line file
+      # of short functions.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint
