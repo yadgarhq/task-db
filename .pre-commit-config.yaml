@@ -46,10 +46,10 @@ repos:
       # untrue: v1.18.2's script, run over this tree, also exits 0. It passes by
       # ACCIDENT — under v1.18.2 the two `src/<mod>/tests.rs` files here are
       # measured as production code, and they clear the ceiling only because
-      # they happen to be 483 and 443 lines. Seventeen more test lines in either
-      # and the ceiling would refuse a test module, which is the outcome
-      # actions#69 exists to prevent. v1.18.3 is what makes the layout the gate's
-      # own docstring recommends actually safe to adopt.
+      # they happen to be 483 and 443 lines. EIGHTEEN more test lines in
+      # `src/boot/tests.rs` and v1.18.2 would refuse a test module, which is the
+      # outcome actions#69 exists to prevent. v1.18.3 is what makes the layout
+      # the gate's own docstring recommends actually safe to adopt.
       #
       # ADOPTED HERE BECAUSE THIS REPOSITORY IS NOW CLEAN, measured rather than
       # hoped. Before this PR `complexity.py` reported three files over the
