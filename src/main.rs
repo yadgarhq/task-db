@@ -10,10 +10,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use sqlx::Connection;
+use sqlx::{Connection, MySqlPool};
+use tonic::transport::Server;
 use yadgar_lifecycle::{drain_within, Drain, DRAIN_BUDGET};
 use yadgar_store::capability::{Capability, CapabilitySet};
 use yadgar_store::credentials::{CredentialSource, Secret};
+use yadgar_store::pool::PoolConfig;
 use yadgar_store::{migrate, probe};
 
 use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbServiceServer;
@@ -62,6 +64,136 @@ fn env_required(key: &str) -> Result<String, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+
+    // EVERY REFUSAL THIS PROCESS CAN REACH BEFORE IT TOUCHES THE ENGINE, in one
+    // call. Destructured rather than carried as a value, so each name below
+    // reads exactly as it did when these lines stood here.
+    let Configured {
+        config,
+        tls,
+        mut server,
+        secret,
+        tls_inputs,
+        schedule,
+    } = configure()?;
+
+    // 1. PROBE and 2. MIGRATE, in that order and neither optional. The whole of
+    //    D7 and of the migration refusal is in `probe_and_migrate`.
+    let pool = probe_and_migrate(&config, &secret).await?;
+
+    // 3. SERVE. Only now.
+    // The BINARY installs the exporter, never the library — a library that
+    // installs one picks the backend for every service linking it. A failure here
+    // is logged and ignored: a service that cannot export metrics should still
+    // serve traffic, which is D25's rule applied to the metrics path too.
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+
+    // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
+    // recorder is a value nobody ever sees. This is the half of the rotation work
+    // that makes a failure LOUD — if the watcher below dies, this gauge still
+    // shows the loaded leaf ageing out.
+    tls_inputs.export_not_after();
+
+    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
+
+    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
+    // than an accident of where the line sits. `boot::shutdown` is a `fn`
+    // returning a future rather than an `async fn`, so both signal handlers
+    // install when it is CALLED — a SIGTERM arriving between here and the first
+    // poll of the future would otherwise take the process's default disposition
+    // and kill it outright, mid-transaction.
+    //
+    // The behaviour is `yadgar_lifecycle::shutdown`'s; `boot::shutdown` is the
+    // three lines that turn its `io::Error` into a `BootError`, so this line
+    // reads and fails exactly as it did.
+    //
+    // Stringified like every other refusal in this function, for the reason
+    // given above.
+    let signals = boot::shutdown().map_err(|e| e.to_string())?;
+
+    // `watching` is recorded for the reason `tls` is: a zero there is a process
+    // that will notice nothing, and it must be answerable from the boot log
+    // rather than inferred from which variables somebody believes they set.
+    tracing::info!(
+        %addr,
+        tls = tls.is_some(),
+        watching = tls_inputs.watched().len(),
+        rotation_poll_secs = schedule.poll().as_secs(),
+        rotation_splay_max_secs = schedule.splay_max().as_secs(),
+        drain_budget_secs = DRAIN_BUDGET.as_secs(),
+        "task-db listening"
+    );
+
+    // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
+    // happens OUTSIDE it. `drain_within` starts the budget's clock when shutdown
+    // is REQUESTED; a `timeout` wrapped round the serving future itself would fix
+    // its deadline at boot and end the process a few seconds later on every boot,
+    // having asked nothing to stop.
+    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(
+        server
+            .add_service(TaskDbServiceServer::new(TaskDb::new(pool)))
+            // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
+            // accepting and lets in-flight calls finish, so the rotation exit gets
+            // the same drain a signal does rather than a second mechanism beside
+            // it.
+            .serve_with_shutdown(addr, async {
+                let _ = stop_requested.await;
+            }),
+    );
+
+    // WHAT ENDS THE SERVE, and nothing else does — see `stop_when`. Built here
+    // and polled by `drain_within` below, exactly as the inline `async` block it
+    // replaces was: an `async fn` runs nothing until something polls it.
+    let stop = stop_when(signals, tls_inputs, schedule);
+
+    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+        Drain::Finished(result) => result?,
+        // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
+        // an error in the log, not a CrashLoopBackOff on top of it.
+        Drain::Overran => tracing::error!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
+            "the drain did not finish within its budget; ending anyway with calls still in \
+             flight. A request blocked this long is the thing to look at"
+        ),
+    }
+
+    Ok(())
+}
+
+/// What ends the serve, and nothing else does.
+///
+/// **THE BUDGET IS PART OF THIS RATHER THAN A FOLLOW-UP TO IT.** tokio never
+/// unregisters a libc signal handler, so once the rotation arm wins this
+/// `select!` a later SIGTERM is SWALLOWED and only SIGKILL remains. A watcher
+/// added without `drain_within` would trade an expired certificate for a pod
+/// that cannot be stopped politely — which is why the caller hands the future
+/// this returns to `drain_within` and never awaits it directly.
+async fn stop_when(
+    signals: impl std::future::Future<Output = ()>,
+    tls_inputs: rotate::Inputs,
+    schedule: rotate::Schedule,
+) {
+    tokio::select! {
+        // SIGTERM and SIGINT, already armed by the caller. SIGTERM is the one
+        // Kubernetes sends.
+        () = signals => {}
+        // `rotate::watch` resolves ONLY when it has read a change, and never
+        // at all when there is nothing to watch.
+        () = rotate::watch(tls_inputs, schedule) => {}
+    }
+}
+
+/// The subscriber every line of this boot sequence is written to.
+///
+/// FIRST, and before `configure` — `boot::ServeTls` warns when a certificate is
+/// configured beside a flag that is not "1", and a warning emitted before the
+/// subscriber exists is one nobody ever reads.
+fn init_tracing() {
     tracing_subscriber::fmt()
         .json()
         // A DEFAULT, because from_default_env() with RUST_LOG unset enables
@@ -77,7 +209,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
 
+/// Everything this process reads and CHECKS before it opens a socket or reaches
+/// the engine.
+///
+/// **A `Server` IS IN HERE, and that is ordering rather than tidiness.**
+/// `boot::server` is the step that decodes the PEM and matches the certificate
+/// against its key, so a deployment that asked for TLS and got the mount wrong
+/// must exit on it BEFORE the credential is read and long before the probe.
+/// D69 puts the refusals first; carrying the built server out of this function
+/// is how that order survives the extraction.
+///
+/// **`LISTEN` AND `METRICS_LISTEN` ARE NOT HERE.** Both are read after the
+/// migration in `main`, exactly where they were, because moving them forward
+/// would change which refusal an operator sees first for a broken environment.
+struct Configured {
+    config: PoolConfig,
+    tls: Option<boot::ServeTls>,
+    server: Server,
+    secret: Secret,
+    tls_inputs: rotate::Inputs,
+    schedule: rotate::Schedule,
+}
+
+/// Read the environment and the mounted files, refusing rather than guessing.
+///
+/// The order of the reads is the contract: an operator must meet the same first
+/// refusal for the same broken input, so nothing here is reordered or made lazy.
+fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
     // Every default, every refusal and both transport modes live in `boot`,
     // which a test can reach. These lines are the whole of the configuration
     // decision.
@@ -102,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // listener that opens in cleartext because TLS configuration failed, and
     // with one construction site there is nowhere else to write it.
     let tls = boot::ServeTls::from_env(boot::LISTEN).map_err(|e| e.to_string())?;
-    let mut server = boot::server(tls.as_ref()).map_err(|e| e.to_string())?;
+    let server = boot::server(tls.as_ref()).map_err(|e| e.to_string())?;
 
     // The credential never arrives as an environment variable — it is a mounted
     // Secret the operator issued (D58), read through the seam so this module has
@@ -171,6 +331,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the boot instead of becoming a hot loop nobody would see.
     let schedule = rotation_config.schedule().map_err(|e| e.to_string())?;
 
+    Ok(Configured {
+        config,
+        tls,
+        server,
+        secret,
+        tls_inputs,
+        schedule,
+    })
+}
+
+/// Steps 1 and 2 of the boot order, and the pool that survives them.
+///
+/// They are one function because they are one decision: the probe runs on a
+/// connection of its own and BEFORE the pool exists, and nothing may reach the
+/// engine between them.
+async fn probe_and_migrate(
+    config: &PoolConfig,
+    secret: &Secret,
+) -> Result<MySqlPool, Box<dyn std::error::Error>> {
     // 1. PROBE, on a connection of its own and before the pool exists. Refusing
     //    here is the whole point of D7.
     //
@@ -185,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    paragraph naming the mode to use instead. A bare `?` would Debug-print
     //    `SslModeCannotVerify { .. }` into the crash loop and throw the sentence
     //    away.
-    let options = boot::probe_connect_options(&config, &secret).map_err(|e| e.to_string())?;
+    let options = boot::probe_connect_options(config, secret).map_err(|e| e.to_string())?;
     let mut conn = sqlx::MySqlConnection::connect_with(&options).await?;
     let report = probe::run(&mut conn).await?;
     report.satisfies(&required())?;
@@ -193,104 +372,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("engine satisfies the required capabilities");
 
     // 2. MIGRATE. Refuses outright if the database is ahead of this binary.
-    let pool = yadgar_store::pool::connect(&config, &secret).await?;
+    let pool = yadgar_store::pool::connect(config, secret).await?;
     let applied = migrate::apply(&pool, &schema::migrations()?).await?;
     tracing::info!(applied, "schema at migration {applied}");
 
-    // 3. SERVE. Only now.
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure here
-    // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
-
-    // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
-    // recorder is a value nobody ever sees. This is the half of the rotation work
-    // that makes a failure LOUD — if the watcher below dies, this gauge still
-    // shows the loaded leaf ageing out.
-    tls_inputs.export_not_after();
-
-    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
-
-    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
-    // than an accident of where the line sits. `boot::shutdown` is a `fn`
-    // returning a future rather than an `async fn`, so both signal handlers
-    // install when it is CALLED — a SIGTERM arriving between here and the first
-    // poll of the future would otherwise take the process's default disposition
-    // and kill it outright, mid-transaction.
-    //
-    // The behaviour is `yadgar_lifecycle::shutdown`'s; `boot::shutdown` is the
-    // three lines that turn its `io::Error` into a `BootError`, so this line
-    // reads and fails exactly as it did.
-    //
-    // Stringified like every other refusal in this function, for the reason
-    // given above.
-    let signals = boot::shutdown().map_err(|e| e.to_string())?;
-
-    // `watching` is recorded for the reason `tls` is: a zero there is a process
-    // that will notice nothing, and it must be answerable from the boot log
-    // rather than inferred from which variables somebody believes they set.
-    tracing::info!(
-        %addr,
-        tls = tls.is_some(),
-        watching = tls_inputs.watched().len(),
-        rotation_poll_secs = schedule.poll().as_secs(),
-        rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = DRAIN_BUDGET.as_secs(),
-        "task-db listening"
-    );
-
-    // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
-    // happens OUTSIDE it. `drain_within` starts the budget's clock when shutdown
-    // is REQUESTED; a `timeout` wrapped round the serving future itself would fix
-    // its deadline at boot and end the process a few seconds later on every boot,
-    // having asked nothing to stop.
-    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(
-        server
-            .add_service(TaskDbServiceServer::new(TaskDb::new(pool)))
-            // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
-            // accepting and lets in-flight calls finish, so the rotation exit gets
-            // the same drain a signal does rather than a second mechanism beside
-            // it.
-            .serve_with_shutdown(addr, async {
-                let _ = stop_requested.await;
-            }),
-    );
-
-    // WHAT ENDS THE SERVE, and nothing else does.
-    //
-    // **THE BUDGET IS PART OF THIS CHANGE RATHER THAN A FOLLOW-UP TO IT.** tokio
-    // never unregisters a libc signal handler, so once the rotation arm wins this
-    // `select!` a later SIGTERM is SWALLOWED and only SIGKILL remains. A watcher
-    // added without `drain_within` would trade an expired certificate for a pod
-    // that cannot be stopped politely.
-    let stop = async {
-        tokio::select! {
-            // SIGTERM and SIGINT, already armed above. SIGTERM is the one
-            // Kubernetes sends.
-            () = signals => {}
-            // `rotate::watch` resolves ONLY when it has read a change, and never
-            // at all when there is nothing to watch.
-            () = rotate::watch(tls_inputs, schedule) => {}
-        }
-    };
-
-    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
-        // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
-        // an error in the log, not a CrashLoopBackOff on top of it.
-        Drain::Overran => tracing::error!(
-            budget_secs = DRAIN_BUDGET.as_secs(),
-            "the drain did not finish within its budget; ending anyway with calls still in \
-             flight. A request blocked this long is the thing to look at"
-        ),
-    }
-
-    Ok(())
+    Ok(pool)
 }
 
 #[cfg(test)]

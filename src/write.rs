@@ -3,10 +3,6 @@
 //! One RPC is one transaction (D5), and the D9 claim is taken inside it, so a
 //! write and the record that it happened commit together or not at all.
 
-use prost::Message as _;
-use prost_types::FieldMask;
-use sqlx::mysql::MySqlArguments;
-use sqlx::query::Query;
 use sqlx::types::Json;
 use sqlx::{MySql, Row as _, Transaction};
 use tonic::Status;
@@ -16,6 +12,17 @@ use crate::pb::yadgar::common::v1::{Meta, Scope, Visibility};
 use crate::pb::yadgar::task::v1::*;
 use crate::service::TaskDb;
 use crate::sql::{internal, scope_of, Reach};
+
+// TWO VOCABULARIES IN FILES OF THEIR OWN, because this file crossed the shared
+// 500-line ceiling. Neither is a step of an RPC: `payload` is what D9's
+// fingerprint is taken over, `mask` is which columns an update may write, and
+// nothing in either reaches a pool or a transaction. What stays here is the
+// three RPCs and the statements they run.
+mod mask;
+mod payload;
+
+use mask::fields_of;
+use payload::Payload;
 
 /// What `UpdateTask` says when its compare-and-set matches no row.
 ///
@@ -183,44 +190,10 @@ impl TaskDb {
         }
 
         // THE PRIOR STATUS, read BEFORE the update and inside the same
-        // transaction. `UpdateTaskResponse.previous_status` promises the status
-        // the row held before this write was applied, and the update itself is
-        // what destroys that value — so it is read here or it is not readable
-        // at all. `iam`-style recomputation is not available to the caller
-        // either: the logic service reads the task first and gets what the
-        // FIRST attempt wrote, which is the defect the field exists to close.
+        // transaction. [`TaskDb::previous_status`] carries the whole of that
+        // argument; what stays here is the refusal, because it is the caller
+        // that holds the transaction to roll back.
         //
-        // ON EVERY UPDATE, NOT ONLY ON A STATUS CHANGE. An `update_mask` that
-        // does not name `status` still displaces a status, and the field
-        // carries it — equal to the status the row holds afterwards, which is
-        // the truth rather than an omission. TASK_STATUS_UNSPECIFIED must
-        // therefore have exactly one cause after this ships: an idempotency row
-        // recorded before the field existed. Making a mask that omits `status`
-        // a second cause is what this read exists to prevent.
-        //
-        // `FOR UPDATE`, and the lock is the point rather than the read. It
-        // holds the row from here until commit, so the value recorded is the
-        // one this write actually displaced and not one a concurrent writer
-        // replaced in between. It also sees the latest committed row rather
-        // than this transaction's snapshot.
-        //
-        // AUDIT: the interpolation is this module's own predicate; every caller
-        // value is a bound parameter.
-        let sql = format!(
-            "SELECT status FROM task
-              WHERE id = ? AND version = ? AND deleted_at IS NULL AND {}
-              FOR UPDATE",
-            reach.predicate()
-        );
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(&req.id)
-            .bind(req.expect_version);
-        let found = reach
-            .bind(query)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(internal)?;
-
         // The same refusal the compare-and-set below reaches, arrived at one
         // statement earlier. The two conditions are identical — same id, same
         // version, same reach, same `deleted_at` — so a caller cannot tell
@@ -228,11 +201,10 @@ impl TaskDb {
         // constant rather than two literals for exactly that reason: the
         // indistinguishability is the property, and two literals are two places
         // for it to stop being true.
-        let Some(row) = found else {
+        let Some(previous_status) = self.previous_status(&mut tx, &reach, &req).await? else {
             tx.rollback().await.map_err(internal)?;
             return Err(Status::failed_precondition(UPDATE_REFUSED));
         };
-        let previous_status = row.try_get::<i8, _>("status").map_err(internal)? as i32;
 
         // Compare-and-set (D8): the version is in the WHERE, so a concurrent
         // writer's update makes this one match zero rows rather than silently
@@ -290,6 +262,62 @@ impl TaskDb {
         Ok(response)
     }
 
+    /// The status the row held before [`TaskDb::update`] displaced it, read
+    /// inside that RPC's own transaction. `Ok(None)` is "no row this caller may
+    /// edit at this version", which the caller renders as `UPDATE_REFUSED`.
+    ///
+    /// **READ HERE OR NOT READABLE AT ALL.** `UpdateTaskResponse.previous_status`
+    /// promises the status the row held before this write was applied, and the
+    /// update itself is what destroys that value. `iam`-style recomputation is
+    /// not available to the caller either: the logic service reads the task first
+    /// and gets what the FIRST attempt wrote, which is the defect the field
+    /// exists to close.
+    ///
+    /// **ON EVERY UPDATE, NOT ONLY ON A STATUS CHANGE.** An `update_mask` that
+    /// does not name `status` still displaces a status, and the field carries it
+    /// — equal to the status the row holds afterwards, which is the truth rather
+    /// than an omission. TASK_STATUS_UNSPECIFIED must therefore have exactly one
+    /// cause after this ships: an idempotency row recorded before the field
+    /// existed. Making a mask that omits `status` a second cause is what this
+    /// read exists to prevent.
+    ///
+    /// **`FOR UPDATE`, and the lock is the point rather than the read.** It holds
+    /// the row from here until commit, so the value recorded is the one this
+    /// write actually displaced and not one a concurrent writer replaced in
+    /// between. It also sees the latest committed row rather than this
+    /// transaction's snapshot.
+    ///
+    /// It takes the transaction rather than opening one: the lock is worth
+    /// nothing outside the transaction the update commits in.
+    async fn previous_status(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        reach: &Reach,
+        req: &UpdateTaskRequest,
+    ) -> Result<Option<i32>, Status> {
+        // AUDIT: the interpolation is this module's own predicate; every caller
+        // value is a bound parameter.
+        let sql = format!(
+            "SELECT status FROM task
+              WHERE id = ? AND version = ? AND deleted_at IS NULL AND {}
+              FOR UPDATE",
+            reach.predicate()
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&req.id)
+            .bind(req.expect_version);
+        let found = reach
+            .bind(query)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?;
+
+        let Some(row) = found else { return Ok(None) };
+        Ok(Some(
+            row.try_get::<i8, _>("status").map_err(internal)? as i32
+        ))
+    }
+
     pub(crate) async fn delete(
         &self,
         req: DeleteTaskRequest,
@@ -345,59 +373,6 @@ impl TaskDb {
         idem::record(&mut tx, scope, req.idempotency.as_ref(), &response).await?;
         tx.commit().await.map_err(internal)?;
         Ok(response)
-    }
-}
-
-/// The bytes D9's fingerprint is taken over.
-///
-/// Which fields count as the payload is per-RPC, and D9 requires that written
-/// down rather than inferred. This module's answer is the same for all three of
-/// its mutating RPCs: **every field of the request except `scope` and
-/// `idempotency`** — see the header of `src/idem.rs` for why those two, and only
-/// those two, are excluded.
-///
-/// Stated as "clear the two, keep the rest" rather than as a list of the fields
-/// to hash. The list would be the same today and would silently stop being
-/// right the day the contract grows a field: a new one nobody added here would
-/// be omitted from the digest, and a request differing only in it would be
-/// replayed. The exclusions are what this module has actually decided about.
-trait Payload {
-    fn payload(&self) -> Vec<u8>;
-}
-
-impl Payload for CreateTaskRequest {
-    fn payload(&self) -> Vec<u8> {
-        let mut canonical = self.clone();
-        canonical.scope = None;
-        canonical.idempotency = None;
-        canonical.encode_to_vec()
-    }
-}
-
-impl Payload for UpdateTaskRequest {
-    fn payload(&self) -> Vec<u8> {
-        let mut canonical = self.clone();
-        canonical.scope = None;
-        canonical.idempotency = None;
-        // A mask is a SET of field names, and its encoding is a sequence. Two
-        // masks naming the same fields in another order, or one naming a field
-        // twice, ask for the identical write — so a digest taken over the bytes
-        // as they arrived would refuse a request that discards nothing. D9's
-        // test is whether a replay would silently discard the difference.
-        if let Some(mask) = canonical.update_mask.as_mut() {
-            mask.paths.sort();
-            mask.paths.dedup();
-        }
-        canonical.encode_to_vec()
-    }
-}
-
-impl Payload for DeleteTaskRequest {
-    fn payload(&self) -> Vec<u8> {
-        let mut canonical = self.clone();
-        canonical.scope = None;
-        canonical.idempotency = None;
-        canonical.encode_to_vec()
     }
 }
 
@@ -481,83 +456,4 @@ fn assigned_by_the_module(meta: Option<&Meta>) -> Result<(), Status> {
         ));
     }
     Ok(())
-}
-
-/// The columns an update may write.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Title,
-    Body,
-    Status,
-    Tags,
-    Links,
-}
-
-impl Field {
-    const ALL: [Field; 5] = [
-        Field::Title,
-        Field::Body,
-        Field::Status,
-        Field::Tags,
-        Field::Links,
-    ];
-
-    /// What an update wrote before masks were honoured and before `tags` and
-    /// `links` had columns — which is exactly the set an unmasked caller can
-    /// know about. See [`fields_of`].
-    const BEFORE_THE_MASK: [Field; 3] = [Field::Title, Field::Body, Field::Status];
-
-    fn column(self) -> &'static str {
-        match self {
-            Field::Title => "title",
-            Field::Body => "body",
-            Field::Status => "status",
-            Field::Tags => "tags",
-            Field::Links => "links",
-        }
-    }
-
-    fn named(path: &str) -> Option<Field> {
-        Field::ALL.into_iter().find(|f| f.column() == path)
-    }
-
-    fn bind<'q>(
-        self,
-        query: Query<'q, MySql, MySqlArguments>,
-        task: &'q Task,
-    ) -> Query<'q, MySql, MySqlArguments> {
-        match self {
-            Field::Title => query.bind(&task.title),
-            Field::Body => query.bind(&task.body),
-            Field::Status => query.bind(task.status as i8),
-            Field::Tags => query.bind(Json(&task.tags)),
-            Field::Links => query.bind(Json(&task.links)),
-        }
-    }
-}
-
-/// An absent or empty mask means the fields an update wrote BEFORE the mask was
-/// honoured — title, body and status — and deliberately not `tags` or `links`.
-///
-/// "Absent means everything" is the obvious reading and it loses data during a
-/// rollout. A caller built against the older contract cannot populate `tags`,
-/// so its request carries the empty vec that is the field's zero value; treating
-/// that as an instruction would erase a task's tags on every status change made
-/// by a pod that has not been upgraded yet. A caller that wants to write them
-/// names them, which an old caller cannot do and a new one always does.
-///
-/// A mask that NAMES fields is honoured, and that is what lets `EditTask` write
-/// a title without also writing the status it had to read first.
-fn fields_of(mask: Option<&FieldMask>) -> Result<Vec<Field>, Status> {
-    let Some(mask) = mask.filter(|m| !m.paths.is_empty()) else {
-        return Ok(Field::BEFORE_THE_MASK.to_vec());
-    };
-    mask.paths
-        .iter()
-        .map(|path| {
-            Field::named(path).ok_or_else(|| {
-                Status::invalid_argument(format!("update_mask names an unknown field: {path}"))
-            })
-        })
-        .collect()
 }
