@@ -8,7 +8,7 @@ is a hand-written MariaDB CR under an Argo Application, so an adopter who instal
 this chart gets the pod and no engine for it to talk to. ADR-0752 put the shared
 platform layer in `yadgarhq/platform` and kept this object OUT of it, in one
 sentence: "an object that exactly one module consumes does NOT go here. The three
-MariaDB CRs belong to `task-db`, `project-db` and `task-db` behind `database.create`."
+MariaDB CRs belong to `iam-db`, `project-db` and `task-db` behind `database.create`."
 This instance has exactly one consumer — the Deployment rendered beside it — and no
 invariant spanning its siblings, so it belongs here.
 

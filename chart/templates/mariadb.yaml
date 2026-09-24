@@ -3,7 +3,7 @@ THE ENGINE THIS MODULE IS THE ONLY WRITER OF, rendered by the chart that consume
 
 ADR-0752 put the shared platform layer in `yadgarhq/platform` and kept this object
 out of it in one sentence: "an object that exactly one module consumes does NOT go
-here. The three MariaDB CRs belong to `task-db`, `project-db` and `task-db` behind
+here. The three MariaDB CRs belong to `iam-db`, `project-db` and `task-db` behind
 `database.create`." This instance has exactly one consumer — the Deployment rendered
 beside it — and no invariant spanning its siblings, which is the test that decides
 between the two homes.
