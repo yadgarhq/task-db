@@ -181,14 +181,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// What ends the serve, and nothing else does.
-///
-/// **THE BUDGET IS PART OF THIS RATHER THAN A FOLLOW-UP TO IT.** tokio never
-/// unregisters a libc signal handler, so once the rotation arm wins this
-/// `select!` a later SIGTERM is SWALLOWED and only SIGKILL remains. A watcher
-/// added without `drain_within` would trade an expired certificate for a pod
-/// that cannot be stopped politely — which is why the caller hands the future
-/// this returns to `drain_within` and never awaits it directly.
 /// The BINARY installs the exporter, never the library — a library that
 /// installs one picks the backend for every service linking it. A failure here
 /// is logged and ignored: a service that cannot export metrics should still
@@ -204,6 +196,14 @@ fn install_metrics() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// What ends the serve, and nothing else does.
+///
+/// **THE BUDGET IS PART OF THIS RATHER THAN A FOLLOW-UP TO IT.** tokio never
+/// unregisters a libc signal handler, so once the rotation arm wins this
+/// `select!` a later SIGTERM is SWALLOWED and only SIGKILL remains. A watcher
+/// added without `drain_within` would trade an expired certificate for a pod
+/// that cannot be stopped politely — which is why the caller hands the future
+/// this returns to `drain_within` and never awaits it directly.
 async fn stop_when(
     signals: impl std::future::Future<Output = ()>,
     tls_inputs: rotate::Inputs,
