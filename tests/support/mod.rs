@@ -195,7 +195,7 @@ impl World {
     /// containing only the migration under test would exercise a path
     /// production never takes and would prove the test, not the migration.
     pub async fn migrate_to_head(&self) -> u64 {
-        yadgar_store::migrate::apply(&self.pool, &schema::migrations().expect("set"))
+        yadgar_store::migrate::apply(&self.pool, &schema::migrations().expect("set"), &lock())
             .await
             .expect("migrate")
     }
@@ -240,7 +240,7 @@ impl World {
             Some(version) => schema::migrations_upto(version).expect("set"),
             None => schema::migrations().expect("set"),
         };
-        yadgar_store::migrate::apply(&pool, &set)
+        yadgar_store::migrate::apply(&pool, &set, &lock())
             .await
             .expect("migrate");
         Self {
@@ -589,4 +589,11 @@ pub async fn two_projects_two_users(name: &str) -> Cast {
         u3_org,
         u1_elsewhere,
     }
+}
+
+/// The migration lock as `main` builds it, with the chart's shipped wait.
+/// Stated in the TEST because `yadgar-store` has no default for it any more
+/// (ADR-0569, ledger 814).
+fn lock() -> yadgar_store::migrate::LockOptions {
+    yadgar_store::migrate::LockOptions::new(60).expect("60 seconds is a wait")
 }

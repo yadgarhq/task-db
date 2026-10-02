@@ -15,6 +15,7 @@ use tonic::transport::Server;
 use yadgar_lifecycle::{drain_within, Drain, DRAIN_BUDGET};
 use yadgar_store::capability::{Capability, CapabilitySet};
 use yadgar_store::credentials::{CredentialSource, Secret};
+use yadgar_store::migrate::LockOptions;
 use yadgar_store::pool::PoolConfig;
 use yadgar_store::{migrate, probe};
 
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reads exactly as it did when these lines stood here.
     let Configured {
         config,
+        migration_lock,
         tls,
         mut server,
         secret,
@@ -80,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. PROBE and 2. MIGRATE, in that order and neither optional. The whole of
     //    D7 and of the migration refusal is in `probe_and_migrate`.
-    let pool = probe_and_migrate(&config, &secret).await?;
+    let pool = probe_and_migrate(&config, &secret, &migration_lock).await?;
 
     // 3. SERVE. Only now.
     // The BINARY installs the exporter, never the library — a library that
@@ -226,6 +228,7 @@ fn init_tracing() {
 /// would change which refusal an operator sees first for a broken environment.
 struct Configured {
     config: PoolConfig,
+    migration_lock: LockOptions,
     tls: Option<boot::ServeTls>,
     server: Server,
     secret: Secret,
@@ -250,6 +253,10 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
     // away. `task` has stringified for the same reason since its own transport
     // landed.
     let config = boot::pool_config(|key| std::env::var(key).ok()).map_err(|e| e.to_string())?;
+    // The migration lock's wait, read beside the pool's knobs (ledger 814,
+    // ADR-0837). `store` has no default for it any more.
+    let migration_lock =
+        boot::migration_lock(|key| std::env::var(key).ok()).map_err(|e| e.to_string())?;
 
     // THE LISTENER'S transport, read and CHECKED before anything else — the PEM
     // decoded, the certificate matched against its key. A deployment that asked
@@ -333,6 +340,7 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
 
     Ok(Configured {
         config,
+        migration_lock,
         tls,
         server,
         secret,
@@ -349,6 +357,7 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
 async fn probe_and_migrate(
     config: &PoolConfig,
     secret: &Secret,
+    migration_lock: &LockOptions,
 ) -> Result<MySqlPool, Box<dyn std::error::Error>> {
     // 1. PROBE, on a connection of its own and before the pool exists. Refusing
     //    here is the whole point of D7.
@@ -373,7 +382,7 @@ async fn probe_and_migrate(
 
     // 2. MIGRATE. Refuses outright if the database is ahead of this binary.
     let pool = yadgar_store::pool::connect(config, secret).await?;
-    let applied = migrate::apply(&pool, &schema::migrations()?).await?;
+    let applied = migrate::apply(&pool, &schema::migrations()?, migration_lock).await?;
     tracing::info!(applied, "schema at migration {applied}");
 
     Ok(pool)
