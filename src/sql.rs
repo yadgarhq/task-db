@@ -325,10 +325,15 @@ impl Readable {
     /// `an_owner_outside_the_team_reaches_their_own_team_record` — "with the
     /// setting ON, an owner reads their own record from outside its team:
     /// Status { code: NotFound }" — and six tests with it. Replacing
-    /// [`Reach::bind_visible`]'s `self.user` instead reddens
-    /// `a_row_with_an_unrecognised_visibility_falls_back_to_private` in
-    /// `tests/scope.rs` and `a_healed_row_reads_as_private_through_the_service`
-    /// in `tests/migration.rs`. Both state `ladder_only`; a third test states it
+    /// [`Reach::bind_visible`]'s `self.user` instead reddens 16 tests, measured
+    /// 2026-10-02 the same way — a `'static` literal in that binding's place,
+    /// `cargo test --no-fail-fast` against `mariadb:11.8`, whole suite green
+    /// beforehand: 3 in `tests/contract.rs`, 4 in `tests/idempotency.rs`, 1 in
+    /// `tests/known_answer.rs`, 1 in `tests/list.rs`, 1 in `tests/migration.rs`
+    /// — `a_healed_row_reads_as_private_through_the_service` — 4 in
+    /// `tests/previous_status.rs`, and 2 in `tests/scope.rs`, among them
+    /// `a_row_with_an_unrecognised_visibility_falls_back_to_private`. Both of
+    /// those two named tests state `ladder_only`; a third test states it
     /// too — `the_owner_of_a_team_task_reads_it_through_the_team_arm`'s second
     /// half, added by ledger 475 — and stays green here, because its row is TEAM
     /// and the TEAM arm answers it without the PRIVATE rung's owner hole.
