@@ -63,8 +63,29 @@ fn env_required(key: &str) -> Result<String, String> {
     }
 }
 
+/// The process entry point: run the service, and print a refusal as its SENTENCE.
+///
+/// **NOT `main() -> Result`.** Rust prints a `main` that returns `Err` with
+/// DEBUG, so a `BootError` arrived as its variant name (`ObsoleteRequireTls`)
+/// and even a refusal already converted to its sentence arrived as a quoted,
+/// escaped string — `Error: "… is \"0\" …"`. ADR-0569 asks a refusal to name the
+/// knob and where it is set; an operator reading a crash loop must get that as
+/// plain text. `tests/boot_message.rs` runs the binary and holds it.
+///
+/// The exit status is unchanged: an `Err` from `main` exits 1, and so does
+/// `ExitCode::FAILURE`.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     // EVERY REFUSAL THIS PROCESS CAN REACH BEFORE IT TOUCHES THE ENGINE, in one
@@ -85,14 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = probe_and_migrate(&config, &secret, &migration_lock).await?;
 
     // 3. SERVE. Only now.
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure here
-    // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
+    install_metrics()?;
 
     // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
     // recorder is a value nobody ever sees. This is the half of the rotation work
@@ -175,6 +189,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// added without `drain_within` would trade an expired certificate for a pod
 /// that cannot be stopped politely — which is why the caller hands the future
 /// this returns to `drain_within` and never awaits it directly.
+/// The BINARY installs the exporter, never the library — a library that
+/// installs one picks the backend for every service linking it. A failure here
+/// is logged and ignored: a service that cannot export metrics should still
+/// serve traffic, which is D25's rule applied to the metrics path too.
+///
+/// Its own function since `run` stopped being `#[tokio::main]`: clippy's
+/// cognitive-complexity ceiling did not see through the macro, and does now.
+fn install_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+    Ok(())
+}
+
 async fn stop_when(
     signals: impl std::future::Future<Output = ()>,
     tls_inputs: rotate::Inputs,
