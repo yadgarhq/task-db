@@ -332,8 +332,11 @@ impl Readable {
     /// `tests/known_answer.rs`, 1 in `tests/list.rs`, 1 in `tests/migration.rs`
     /// — `a_healed_row_reads_as_private_through_the_service` — 4 in
     /// `tests/previous_status.rs`, and 2 in `tests/scope.rs`, among them
-    /// `a_row_with_an_unrecognised_visibility_falls_back_to_private`. Both of
-    /// those two named tests state `ladder_only`; a third test states it
+    /// `a_row_with_an_unrecognised_visibility_falls_back_to_private`. Most of
+    /// the 16 are reached through [`Reach::predicate`], which `UpdateTask`
+    /// (`src/write.rs:222,304`) also uses — the write path, not a read-only
+    /// hole. Both of those two named tests state `ladder_only`; a third test
+    /// states it
     /// too — `the_owner_of_a_team_task_reads_it_through_the_team_arm`'s second
     /// half, added by ledger 475 — and stays green here, because its row is TEAM
     /// and the TEAM arm answers it without the PRIVATE rung's owner hole.
