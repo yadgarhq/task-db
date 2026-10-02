@@ -15,6 +15,7 @@ use tonic::transport::Server;
 use yadgar_lifecycle::{drain_within, Drain, DRAIN_BUDGET};
 use yadgar_store::capability::{Capability, CapabilitySet};
 use yadgar_store::credentials::{CredentialSource, Secret};
+use yadgar_store::migrate::LockOptions;
 use yadgar_store::pool::PoolConfig;
 use yadgar_store::{migrate, probe};
 
@@ -62,8 +63,29 @@ fn env_required(key: &str) -> Result<String, String> {
     }
 }
 
+/// The process entry point: run the service, and print a refusal as its SENTENCE.
+///
+/// **NOT `main() -> Result`.** Rust prints a `main` that returns `Err` with
+/// DEBUG, so a `BootError` arrived as its variant name (`ObsoleteRequireTls`)
+/// and even a refusal already converted to its sentence arrived as a quoted,
+/// escaped string — `Error: "… is \"0\" …"`. ADR-0569 asks a refusal to name the
+/// knob and where it is set; an operator reading a crash loop must get that as
+/// plain text. `tests/boot_message.rs` runs the binary and holds it.
+///
+/// The exit status is unchanged: an `Err` from `main` exits 1, and so does
+/// `ExitCode::FAILURE`.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     // EVERY REFUSAL THIS PROCESS CAN REACH BEFORE IT TOUCHES THE ENGINE, in one
@@ -71,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reads exactly as it did when these lines stood here.
     let Configured {
         config,
+        migration_lock,
         tls,
         mut server,
         secret,
@@ -80,17 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. PROBE and 2. MIGRATE, in that order and neither optional. The whole of
     //    D7 and of the migration refusal is in `probe_and_migrate`.
-    let pool = probe_and_migrate(&config, &secret).await?;
+    let pool = probe_and_migrate(&config, &secret, &migration_lock).await?;
 
     // 3. SERVE. Only now.
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure here
-    // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
+    install_metrics()?;
 
     // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
     // recorder is a value nobody ever sees. This is the half of the rotation work
@@ -165,6 +181,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The BINARY installs the exporter, never the library — a library that
+/// installs one picks the backend for every service linking it. A failure here
+/// is logged and ignored: a service that cannot export metrics should still
+/// serve traffic, which is D25's rule applied to the metrics path too.
+///
+/// Its own function since `run` stopped being `#[tokio::main]`: clippy's
+/// cognitive-complexity ceiling did not see through the macro, and does now.
+fn install_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+    Ok(())
+}
+
 /// What ends the serve, and nothing else does.
 ///
 /// **THE BUDGET IS PART OF THIS RATHER THAN A FOLLOW-UP TO IT.** tokio never
@@ -226,6 +257,7 @@ fn init_tracing() {
 /// would change which refusal an operator sees first for a broken environment.
 struct Configured {
     config: PoolConfig,
+    migration_lock: LockOptions,
     tls: Option<boot::ServeTls>,
     server: Server,
     secret: Secret,
@@ -250,6 +282,10 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
     // away. `task` has stringified for the same reason since its own transport
     // landed.
     let config = boot::pool_config(|key| std::env::var(key).ok()).map_err(|e| e.to_string())?;
+    // The migration lock's wait, read beside the pool's knobs (ledger 814,
+    // ADR-0837). `store` has no default for it any more.
+    let migration_lock =
+        boot::migration_lock(|key| std::env::var(key).ok()).map_err(|e| e.to_string())?;
 
     // THE LISTENER'S transport, read and CHECKED before anything else — the PEM
     // decoded, the certificate matched against its key. A deployment that asked
@@ -333,6 +369,7 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
 
     Ok(Configured {
         config,
+        migration_lock,
         tls,
         server,
         secret,
@@ -349,6 +386,7 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
 async fn probe_and_migrate(
     config: &PoolConfig,
     secret: &Secret,
+    migration_lock: &LockOptions,
 ) -> Result<MySqlPool, Box<dyn std::error::Error>> {
     // 1. PROBE, on a connection of its own and before the pool exists. Refusing
     //    here is the whole point of D7.
@@ -373,7 +411,7 @@ async fn probe_and_migrate(
 
     // 2. MIGRATE. Refuses outright if the database is ahead of this binary.
     let pool = yadgar_store::pool::connect(config, secret).await?;
-    let applied = migrate::apply(&pool, &schema::migrations()?).await?;
+    let applied = migrate::apply(&pool, &schema::migrations()?, migration_lock).await?;
     tracing::info!(applied, "schema at migration {applied}");
 
     Ok(pool)
