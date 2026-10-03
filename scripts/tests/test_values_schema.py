@@ -12,14 +12,17 @@ template. `test_migration_lock_schema.py` and `test_render_checks.py` /
 respectively; this file does not re-assert either.
 
 TESTS HERE ASSERT THE SCHEMA KEY AND ITS JSON PATH ONLY, NEVER HELM'S OWN WORDING.
-helm's JSON-Schema error sentence is the validator library's text, not this chart's,
-and it has changed shape across helm releases (3.18.4's `<path>: Additional
-property X is not allowed` versus 3.20.2's and 4.3.0's `at '<path>': additional
-properties 'X' not allowed`). This chart's CI and this builder's run both cover only
-helm 4.3.0 and 3.20.2, which happen to share the newer shape, but the assertions
-below parse out the PATH and the KEY and compare those — never the sentence around
-them — so a future helm that rewraps the sentence again does not redden this file
-for a reason that has nothing to do with the schema.
+helm's JSON-Schema error sentence is the validator library's text, not this
+chart's, and it has changed shape across helm releases — MEASURED, not assumed,
+against TWO live installs: 3.20.2 and 4.3.0 both print `at '<path>': additional
+properties 'X' not allowed` (slash-separated path, root `''`), while this
+repository's own `ci / precommit` job (`azure/setup-helm@…` pins `v3.18.4`)
+prints `- <path>: Additional property X is not allowed` (dot-separated path,
+root the literal string `(root)`). `extract_refusal` below parses EITHER shape
+into the same (path-segment-tuple, key) pair, and every assertion compares that
+pair — never the sentence around it — so neither a local run against 3.20.2/4.3.0
+nor the CI run against 3.18.4 reddens this file for a reason that has nothing to
+do with the schema.
 
 CLOSED, OPEN, AND EXTRA are the vocabulary `values.schema.json`'s own `$comment`
 uses and this file reuses verbatim: CLOSED is a block whose `additionalProperties`
@@ -67,10 +70,20 @@ EXTRA_PATHS = {
     ("networkPolicy", "scrapeFrom", "namespace"),
 }
 
-# THE MESSAGE SHAPE BOTH HELMS THIS SUITE RUNS ON SHARE (3.20.2 and 4.3.0; NOT
-# 3.18.4 — see the module docstring). Only the path and the key are read out of it;
-# the surrounding sentence is never compared.
-REFUSAL = re.compile(r"at '([^']*)': additional propert(?:y|ies) '?([A-Za-z0-9_.\-]+)'? (?:is|are|not) ")
+# THE TWO MESSAGE SHAPES MEASURED: 3.20.2 and 4.3.0 (this builder's own pair,
+# `at '/path': additional properties 'key' not allowed`, PATH SLASH-SEPARATED,
+# root `''`) and 3.18.4 (what this repository's own `ci / precommit` job pins via
+# `azure/setup-helm`, `- path: Additional property key is not allowed`, PATH
+# DOT-SEPARATED, root the literal string `(root)`). Both are parsed into the SAME
+# shape — a tuple of path segments plus the bare key name — so every assertion
+# below compares that shape and never either sentence.
+REFUSAL_SLASH_PATH = re.compile(
+    r"at '([^']*)': additional propert(?:y|ies) '([^']+)' (?:is |are )?not allowed"
+)
+REFUSAL_DOTTED_PATH = re.compile(
+    r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+Additional propert(?:y|ies)\s+(\S+)\s+(?:is|are)\s+not allowed",
+    re.MULTILINE,
+)
 
 
 def load_schema() -> dict[str, Any]:
@@ -107,12 +120,23 @@ def render_overlay(body: str, destination: Path, *extra: str) -> subprocess.Comp
     return render("--values", str(values), *extra)
 
 
-def extract_refusal(stderr: str) -> tuple[str, str] | None:
-    """The JSON path and the key name out of a schema refusal, never its sentence."""
-    match = REFUSAL.search(stderr)
-    if not match:
-        return None
-    return match.group(1), match.group(2)
+def extract_refusal(stderr: str) -> tuple[tuple[str, ...], str] | None:
+    """The JSON path (as a tuple of segments) and the key name out of a schema
+    refusal — on EITHER measured helm shape — never the sentence around them.
+    """
+    match = REFUSAL_SLASH_PATH.search(stderr)
+    if match:
+        raw_path, key = match.group(1), match.group(2)
+        segments = tuple(raw_path.strip("/").split("/")) if raw_path.strip("/") else ()
+        return segments, key
+
+    match = REFUSAL_DOTTED_PATH.search(stderr)
+    if match:
+        raw_path, key = match.group(1), match.group(2)
+        segments = () if raw_path == "(root)" else tuple(raw_path.split("."))
+        return segments, key
+
+    return None
 
 
 def object_count(stdout: str) -> int:
@@ -130,7 +154,7 @@ def test_a_root_typo_is_refused_naming_the_key_at_the_root_path(tmp_path: Path) 
     found = extract_refusal(result.stderr)
     assert found, result.stderr
     path, key = found
-    assert path == "", (path, result.stderr)
+    assert path == (), (path, result.stderr)
     assert key == "autoscalng", (key, result.stderr)
 
 
@@ -140,7 +164,7 @@ def test_a_typo_one_level_down_is_refused_naming_the_key_under_its_block(tmp_pat
     found = extract_refusal(result.stderr)
     assert found, result.stderr
     path, key = found
-    assert path == "/autoscaling", (path, result.stderr)
+    assert path == ("autoscaling",), (path, result.stderr)
     assert key == "enabeld", (key, result.stderr)
 
 
@@ -152,7 +176,7 @@ def test_a_typo_two_levels_down_in_scrapefrom_is_refused(tmp_path: Path) -> None
     found = extract_refusal(result.stderr)
     assert found, result.stderr
     path, key = found
-    assert path == "/networkPolicy/scrapeFrom", (path, result.stderr)
+    assert path == ("networkPolicy", "scrapeFrom"), (path, result.stderr)
     assert key == "namespac", (key, result.stderr)
 
 
@@ -165,7 +189,7 @@ def test_a_typo_two_levels_down_in_the_instance_storage_block_is_refused(tmp_pat
     found = extract_refusal(result.stderr)
     assert found, result.stderr
     path, key = found
-    assert path == "/database/instance/storage", (path, result.stderr)
+    assert path == ("database", "instance", "storage"), (path, result.stderr)
     assert key == "siz", (key, result.stderr)
 
 
