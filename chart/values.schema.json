@@ -1,20 +1,122 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "values",
-  "$comment": "DELIBERATELY OPEN: this schema bounds ONE knob, database.migrationLockTimeoutSeconds (ledger 814, ADR-0837), and constrains nothing else, so every other value stays exactly as unvalidated as it was. A closed schema covering the whole chart is ledger 990's job, not this one's. `required` on database makes an explicit null of the knob a RENDER-time refusal naming the key. NO root `required: [database]`: the chart's own render check already refuses a nulled `database` with its own sentence (`database` is absent from the values), and a schema refusal would pre-empt it with a less specific one, measured by scripts/tests/test_render_checks.py. leaving the key out of an override is not a null, because helm deep-merges over chart/values.yaml and inherits the shipped value. THIS FILE IS THE ONE SOURCE OF THE BOUND; the binary refuses only what can never be a wait, and chart/values.yaml beside the value carries the arithmetic.",
-  "type": "object",
+  "title": "yadgar/task-db",
+  "$comment": "CLOSURE IS PER CHART (ADR-0850): this schema closes only what task-db owns \u2014 its own root and every block below. It does not speak for the parent chart, the platform chart, or any other module.\n\nCLOSED (own): image, database (+instance, +instance.storage, +instance.tls, +mariadbOperator), tls, autoscaling (+kedaOperator), topologySpread, networkPolicy (+scrapeFrom). A typo inside any of these, or at the root, is refused at render, naming the key and its JSON path (ledger 990, ADR-0847).\n\nOPEN (bare {}, any subkey passes): `global` \u2014 read by no template in this chart, but forwarded by the parent's coalesced values to every child, so closing it here would refuse the parent's own default render; `resources` and `database.instance.resources` \u2014 Kubernetes ResourceRequirements, read with `toYaml` and never enumerated; `rollingUpdate` \u2014 read with `with .Values.rollingUpdate`, same reason.\n\nEXTRAS (declared though `values.yaml` omits them): `image.digest`, read by `templates/deployment.yaml` \u2014 ci-release rewrites the tag to a digest at package time (D65) and the key is absent from the shipped values; `networkPolicy.scrapeFrom.namespace`, read by `templates/networkpolicy.yaml` \u2014 `values.yaml` ships `scrapeFrom: {}`, and declaring this one key keeps `scrapeFrom` closed rather than leaving it a second open map.\n\nTYPES, TOGGLES AND `required` ARE RENDER CHECKS' JOB (ADR-0847), in `templates/render-checks.yaml` and `templates/scaledobject.yaml` \u2014 this file adds no `type`, `enum` or `required` to any key it did not already carry. The one exception, UNCHANGED by this change: `database` keeps `type: object` and `required: [migrationLockTimeoutSeconds]`, and the leaf itself keeps `type: integer, minimum: 1, maximum: 590` (ledger 814, ADR-0837) \u2014 the bound this file was deliberately open around before ledger 990 closed the rest of the chart. `tls.enabled` carries no `required` here; that lands in C-DB1, not this change (K-8).",
   "properties": {
-    "database": {
-      "type": "object",
+    "image": {
       "properties": {
+        "repository": {},
+        "tag": {},
+        "digest": {}
+      },
+      "additionalProperties": false
+    },
+    "replicaCount": {},
+    "resources": {},
+    "database": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "name": {},
+        "user": {},
+        "passwordSecret": {},
+        "sslMode": {},
+        "sslCaSecret": {},
+        "sslCaSecretKey": {},
+        "maxConnections": {},
+        "engineMaxConnections": {},
         "migrationLockTimeoutSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 590,
           "description": "Seconds a replica waits for another one's migration before failing its boot. Rendered as DB_MIGRATION_LOCK_TIMEOUT_SECONDS and read with no fallback. Minimum 1: GET_LOCK with 0 never waits and with a negative wait never takes the lock. Maximum 590: see chart/values.yaml."
+        },
+        "create": {},
+        "mariadbOperator": {
+          "properties": {
+            "apiVersion": {}
+          },
+          "additionalProperties": false
+        },
+        "instance": {
+          "properties": {
+            "image": {},
+            "replicas": {},
+            "tls": {
+              "properties": {
+                "enabled": {},
+                "required": {}
+              },
+              "additionalProperties": false
+            },
+            "storage": {
+              "properties": {
+                "size": {},
+                "className": {}
+              },
+              "additionalProperties": false
+            },
+            "rootPasswordSecret": {},
+            "resources": {}
+          },
+          "additionalProperties": false
         }
       },
+      "additionalProperties": false,
+      "type": "object",
       "required": ["migrationLockTimeoutSeconds"]
-    }
-  }
+    },
+    "tls": {
+      "properties": {
+        "enabled": {},
+        "certSecret": {},
+        "certSecretKey": {},
+        "keySecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "autoscaling": {
+      "properties": {
+        "enabled": {},
+        "kedaOperator": {
+          "properties": {
+            "apiVersion": {}
+          },
+          "additionalProperties": false
+        },
+        "minReplicas": {},
+        "maxReplicas": {},
+        "threshold": {},
+        "prometheusAddress": {}
+      },
+      "additionalProperties": false
+    },
+    "preStopSleepSeconds": {},
+    "terminationGracePeriodSeconds": {},
+    "rollingUpdate": {},
+    "topologySpread": {
+      "properties": {
+        "enabled": {},
+        "maxSkew": {},
+        "topologyKey": {},
+        "whenUnsatisfiable": {}
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "properties": {
+        "enabled": {},
+        "clients": {},
+        "scrapeFrom": {
+          "properties": {
+            "namespace": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "global": {}
+  },
+  "additionalProperties": false
 }
