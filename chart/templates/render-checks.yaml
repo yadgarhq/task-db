@@ -143,6 +143,62 @@ the template to count and exercise the checks; the gate that keeps the two one i
 THE TOGGLE IS OPT-IN, which is what makes this check legal at all. `autoscaling.enabled`
 defaults false, for the same reason `database.create` does.
 */}}
+{{/*
+THE SHAPE OF `autoscaling.enabled`, REFUSED BEFORE THE KEDA CHECK CAN READ IT (ledger
+1135, ADR-0850).
+
+`templates/scaledobject.yaml` gates on `{{ if .Values.autoscaling.enabled }}` — a BARE
+TRUTHINESS TEST, which is FAIL-OPEN on a string exactly like `database.create` above:
+`autoscaling.enabled: "false"` reads as OFF to any human and renders a ScaledObject.
+ADR-0850 amends ADR-0797's scope from dependency-condition keys to every boolean
+toggle a template reads, so this toggle gets the same two-part guard: `hasKey` before
+`kindIs`, because `kindOf` answers `invalid` for a deleted key and for an absent one
+alike and cannot tell them apart.
+
+`autoscaling` ITSELF IS GUARDED FIRST, AND THAT ARM IS ADR-0794's IDIOM — `hasKey`
+then `kindIs "map"` on the raw value — because `minReplicas`, `maxReplicas`,
+`threshold` and `prometheusAddress` all live under it too: a non-map `autoscaling`
+(`autoscaling: "x"`) is refused by name here rather than raising a bare Go template
+error the first place something under it is read.
+
+ADR-0850'S OTHER HALF LIVES IN `templates/scaledobject.yaml`, NOT HERE. Helm renders
+that template before this one, so a `fail` here cannot pre-empt a raise `.Values.
+autoscaling.enabled` throws there first when `autoscaling` is not a map. That template
+carries its own `kindIs "map"` guard on the same read for that reason — the refusal
+below is reached only once that guard has already kept the read safe.
+*/}}
+{{- if not (hasKey .Values "autoscaling") }}
+{{- fail (join "" (list
+      "task-db: `autoscaling` is absent from the values, so `autoscaling.enabled` cannot "
+      "be read. Helm deletes a null-valued key that a chart in the tree declares, and "
+      "restores no default, so a values file writing `autoscaling:` with no value leaves "
+      "this chart with nothing under it. Write the keys you mean, or omit `autoscaling` "
+      "entirely and this chart's own defaults apply.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.autoscaling) }}
+{{- fail (printf (join "" (list
+      "task-db: `autoscaling` must be a map and is %s (%s). `enabled`, `minReplicas`, "
+      "`maxReplicas`, `threshold` and `prometheusAddress` all live under it, so a "
+      "string, number or list here cannot be read. Write the block this chart's "
+      "`values.yaml` declares."))
+      (kindOf .Values.autoscaling) (toJson .Values.autoscaling)) }}
+{{- end }}
+{{- if not (hasKey .Values.autoscaling "enabled") }}
+{{- fail (join "" (list
+      "task-db: `autoscaling.enabled` is absent. This chart's `values.yaml` declares it "
+      "false, so it is missing only when a values file wrote `enabled:` with NO VALUE — "
+      "helm deletes a null-valued key a chart declares and restores no default. Write "
+      "`autoscaling.enabled: false` to leave autoscaling off, or `true` to turn it on.")) }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.autoscaling.enabled) }}
+{{- fail (printf (join "" (list
+      "task-db: `autoscaling.enabled` must be true or false and is %s (%s). A string, "
+      "number, map or list here is not a toggle: the template gates on bare truthiness, "
+      "so \"false\", \"no\", \"true\" and 1 all TURN AUTOSCALING ON while {}, 0 and [] do "
+      "not, and nothing tells you which one you wrote. Write the bare word `true` or "
+      "`false`."))
+      (kindOf .Values.autoscaling.enabled) (toJson .Values.autoscaling.enabled)) }}
+{{- end }}
 {{- if .Values.autoscaling.enabled }}
 {{- include "task-db.require-api" (dict
       "context" $

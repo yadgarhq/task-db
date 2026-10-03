@@ -1,4 +1,13 @@
-{{- if .Values.autoscaling.enabled }}
+{{/*
+THIS IS `autoscaling.enabled`'S FIRST READER, AND HELM RENDERS IT BEFORE
+`render-checks.yaml` (ADR-0850) — so the `kindIs "map"` guard that protects a
+non-map `autoscaling` from raising a bare Go template error has to live HERE too,
+not only in the refusal that names it. Without `and (kindIs "map" ...)`,
+`autoscaling: "x"` raises `can't evaluate field enabled in type interface {}` on
+THIS line before `render-checks.yaml` ever runs, which is the Go stack trace an
+adopter meets instead of the named refusal (ledger 1135).
+*/}}
+{{- if and (kindIs "map" .Values.autoscaling) .Values.autoscaling.enabled }}
 # KEDA, not a bare HPA (D68): it wraps a plain HPA for the concurrency cases,
 # handles queue depth natively for the write path, and gives scale-to-zero for a
 # disabled plugin (D1). One mechanism instead of prometheus-adapter plus special
