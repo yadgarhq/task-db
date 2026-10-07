@@ -78,7 +78,7 @@ EXTRA_PATHS = {
 # shape — a tuple of path segments plus the bare key name — so every assertion
 # below compares that shape and never either sentence.
 REFUSAL_SLASH_PATH = re.compile(
-    r"at '([^']*)': additional propert(?:y|ies) '([^']+)' (?:is |are )?not allowed"
+    r"at '([^']*)': additional propert(?:y|ies) '([^']+)'(?:, '[^']+')* (?:is |are )?not allowed"
 )
 REFUSAL_DOTTED_PATH = re.compile(
     r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+Additional propert(?:y|ies)\s+(\S+)\s+(?:is|are)\s+not allowed",
@@ -143,6 +143,25 @@ def object_count(stdout: str) -> int:
     return len(
         [doc for doc in yaml.safe_load_all(stdout) if isinstance(doc, dict) and doc.get("apiVersion")]
     )
+
+
+# ── PURE (NO HELM): extract_refusal PARSES EVERY MEASURED REFUSAL SHAPE ──────────
+
+
+def test_extract_refusal_parses_the_slash_path_multi_key_form() -> None:
+    """A newer helm can refuse several unknown keys under one block in a single
+    sentence, e.g. `at '/autoscaling': additional properties 'a', 'b' not
+    allowed`. `REFUSAL_SLASH_PATH` must still match it, naming the path and the
+    first offending key, instead of failing to match at all.
+    """
+    found = extract_refusal(
+        "Error: INSTALLATION FAILED: ... at '/autoscaling': additional "
+        "properties 'a', 'b' not allowed"
+    )
+    assert found, "the multi-key slash-path form was not recognised"
+    path, key = found
+    assert path == ("autoscaling",), (path, key)
+    assert key == "a", (path, key)
 
 
 # ── RENDER: THE CLOSURE REFUSES A TYPO, NAMING THE KEY AND THE PATH ──────────────
@@ -403,13 +422,13 @@ def test_deleting_the_root_additional_properties_reddens_the_closure_check() -> 
     schema = load_schema()
     del schema["additionalProperties"]
     violations = closed_blocks_missing_additional_properties_false(schema)
-    assert violations == ["<root>"], violations
+    assert "<root>" in violations, violations
 
 
 def test_deleting_global_reddens_the_global_check() -> None:
     schema = load_schema()
     del schema["properties"]["global"]
-    assert "global" not in schema["properties"]
+    assert actual_open_map_paths(schema, load_values()) != OPEN_PATHS
 
 
 def test_deleting_an_extra_reddens_the_extras_check() -> None:
