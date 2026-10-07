@@ -1612,50 +1612,77 @@ def test_removing_deployments_own_tls_guard_still_renders_safely(tmp_path):
 
 
 # ── B-U5E: `tls.clientAuth`, `tls.clientCaSecret`, `tls.clientCaSecretKey` ───
+#
+# EVERY CASE HERE USES `-f` (a values FILE), NEVER `--set` (B-U5E-convention.md
+# item 6): `--set tls.clientAuth=off` and a values file's bare `clientAuth: off`
+# are not provably the same input to helm's YAML layer, and the unquoted-off
+# refusal below exists ONLY for the file shape. A file is also what every
+# adopter actually writes.
 
 
 def test_client_auth_absent_renders_neither_variable(tmp_path):
-    result = render(CHART, "--set", "tls.enabled=true")
+    result = render_the_shape(CHART, "tls:\n  enabled: true\n", tmp_path / "absent")
     assert result.returncode == 0, result.stderr
     assert "LISTEN_TLS_CLIENT_AUTH" not in result.stdout
     assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
 
 
 def test_client_auth_off_renders_the_variable(tmp_path):
-    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=off")
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "off"\n', tmp_path / "off"
+    )
     assert result.returncode == 0, result.stderr
     assert rendered_env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
 
 
+def test_client_auth_unquoted_off_is_refused_naming_the_key(tmp_path):
+    """B-U5E-convention.md item 1: YAML 1.1 reads a bare `off` as the boolean
+    `false`, so a values file writing it unquoted must be refused BY NAME
+    rather than reaching the `eq` comparisons below it — which, against a
+    bool, raise a bare Go template "incompatible types" error instead.
+    """
+    result = render_the_shape(CHART, "tls:\n  enabled: true\n  clientAuth: off\n", tmp_path / "bare-off")
+    assert result.returncode != 0
+    assert "must be a quoted string" in result.stderr, result.stderr
+    assert 'write `clientAuth: "off"`' in result.stderr, result.stderr
+    for marker in RAISE_MARKERS:
+        assert marker not in result.stderr, (
+            f"the unquoted `off` raised rather than refused by name: {result.stderr}"
+        )
+
+
 def test_client_auth_optional_is_refused_as_not_enforced_yet(tmp_path):
-    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=optional")
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "optional"\n', tmp_path / "optional"
+    )
     assert result.returncode != 0
     assert "is not enforced yet" in result.stderr, result.stderr
     assert "optional" in result.stderr, result.stderr
 
 
 def test_client_auth_required_is_refused_as_not_enforced_yet(tmp_path):
-    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=required")
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "required"\n', tmp_path / "required"
+    )
     assert result.returncode != 0
     assert "is not enforced yet" in result.stderr, result.stderr
     assert "required" in result.stderr, result.stderr
 
 
 def test_client_auth_bad_mode_is_refused(tmp_path):
-    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=maybe")
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "maybe"\n', tmp_path / "bad-mode"
+    )
     assert result.returncode != 0
     assert "must be `off`, `optional` or `required`" in result.stderr, result.stderr
 
 
 def test_client_ca_secret_renders_the_file_and_the_mount(tmp_path):
-    result = render(
+    result = render_the_shape(
         CHART,
-        "--set",
-        "tls.enabled=true",
-        "--set",
-        "tls.clientCaSecret=peer-ca",
-        "--set",
-        "tls.clientCaSecretKey=ca.crt",
+        'tls:\n  enabled: true\n  clientAuth: "off"\n  clientCaSecret: peer-ca\n'
+        "  clientCaSecretKey: ca.crt\n",
+        tmp_path / "client-ca",
     )
     assert result.returncode == 0, result.stderr
     assert (
@@ -1666,9 +1693,50 @@ def test_client_ca_secret_renders_the_file_and_the_mount(tmp_path):
     assert 'secretName: "peer-ca"' in result.stdout
 
 
+def test_client_ca_secret_empty_renders_neither_mount_nor_file(tmp_path):
+    """B-U5E-convention.md item 4: gated on TRUTHINESS, not `hasKey` — an
+    explicit empty string names no Secret, the same rule
+    `database.sslCaSecret` already follows.
+    """
+    result = render_the_shape(
+        CHART,
+        'tls:\n  enabled: true\n  clientAuth: "off"\n  clientCaSecret: ""\n',
+        tmp_path / "empty-ca",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert "name: client-ca" not in result.stdout
+
+
+def test_client_auth_present_but_tls_disabled_renders_nothing(tmp_path):
+    """B-U5E-convention.md item 3: client auth is nested under `tls.enabled`
+    too — stating a mode while TLS itself is off renders nothing, though the
+    SHAPE is still validated (a bad mode is refused regardless, proven by
+    `test_client_auth_bad_mode_is_refused_even_with_tls_disabled` below).
+    """
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: false\n  clientAuth: "off"\n', tmp_path / "tls-off"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_AUTH" not in result.stdout
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+
+
+def test_client_auth_bad_mode_is_refused_even_with_tls_disabled(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: false\n  clientAuth: "maybe"\n', tmp_path / "tls-off-bad-mode"
+    )
+    assert result.returncode != 0
+    assert "must be `off`, `optional` or `required`" in result.stderr, result.stderr
+
+
 def test_client_auth_shape_refusals_do_not_quote_a_raise():
     text = (CHART / "templates" / "render-checks.yaml").read_text()
-    for phrase in ("is not enforced yet", "must be `off`, `optional` or `required`"):
+    for phrase in (
+        "must be a quoted string",
+        "is not enforced yet",
+        "must be `off`, `optional` or `required`",
+    ):
         assert phrase in text, f"the client-auth message is not in the template: {phrase!r}"
     for marker in RAISE_MARKERS:
         assert marker not in text, (

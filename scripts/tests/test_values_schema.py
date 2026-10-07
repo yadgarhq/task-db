@@ -306,6 +306,12 @@ def test_tls_enabled_wrong_type_is_refused_by_the_schema_naming_tls_enabled(
 ) -> None:
     result = render_overlay('tls:\n  enabled: "true"\n', tmp_path)
     assert result.returncode != 0, result.stdout
+    # THE STABLE WRAPPER (B-U5E-convention.md item 9), asserted alongside the
+    # path and key rather than instead of them: every schema violation carries
+    # it, on every measured helm version, so its presence is what tells a
+    # schema refusal apart from a render-check one even before the shape is
+    # parsed.
+    assert "values don't meet the specifications of the schema" in result.stderr, result.stderr
     found = extract_type_or_missing_refusal(result.stderr)
     assert found, result.stderr
     path, key = found
@@ -324,6 +330,7 @@ def test_tls_enabled_null_is_refused_by_the_schema_naming_tls_enabled(
     """
     result = render_overlay("tls:\n  enabled:\n", tmp_path)
     assert result.returncode != 0, result.stdout
+    assert "values don't meet the specifications of the schema" in result.stderr, result.stderr
     found = extract_type_or_missing_refusal(result.stderr)
     assert found, result.stderr
     path, key = found

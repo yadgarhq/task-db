@@ -243,8 +243,8 @@ shape is proved sound.
       "task-db: `tls` is absent from the values, so `tls.enabled` cannot be read. "
       "Helm deletes a null-valued key that a chart in the tree declares, and "
       "restores no default, so a values file writing `tls:` with no value leaves "
-      "this chart with nothing under it. Write the keys you mean, or omit `tls` "
-      "entirely and this chart's own defaults apply.")) }}
+      "this chart with nothing under it. Write the keys you mean: `tls.enabled` "
+      "has no default (ADR-0845) and must be `true` or `false`.")) }}
 {{- end }}
 {{- if not (kindIs "map" .Values.tls) }}
 {{- fail (printf (join "" (list
@@ -289,8 +289,23 @@ and `required` are refused HERE rather than rendered: shipping either today
 would have an adopter believe client certificates are checked when nothing
 checks them. Only `off` — ADR-0854's "emergency value" — is accepted before
 B-U5 lifts this gate (K-8 step 1).
+
+THE STRING GUARD COMES FIRST, BEFORE ANY `eq`, and is load-bearing rather than
+cosmetic: YAML 1.1 reads a bare, unquoted `off` as the boolean `false`
+(`clientAuth: off` parses to `false`, not the string `"off"`), and `eq false
+"optional"` is a Go template TYPE ERROR — "incompatible types for comparison" —
+raised as a bare raise rather than refused by name. `kindIs "string"` catches
+that shape before any `eq` is reached, naming the mistake an adopter who wrote
+the unquoted word actually made.
 */}}
 {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if not (kindIs "string" .Values.tls.clientAuth) }}
+{{- fail (printf (join "" (list
+      "task-db: `tls.clientAuth` must be a quoted string (\"off\", \"optional\" or "
+      "\"required\") and is %s (%s). YAML reads a bare `off` as false: write "
+      "`clientAuth: \"off\"`."))
+      (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
+{{- end }}
 {{- if eq .Values.tls.clientAuth "optional" }}
 {{- fail (join "" (list
       "task-db: `tls.clientAuth: optional` is not enforced yet. This binary does "
