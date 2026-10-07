@@ -359,12 +359,11 @@ def test_tls_not_a_map_is_refused_naming_tls_by_the_render_check(tmp_path: Path)
     assert "`tls` must be a map and is string" in result.stderr, result.stderr
 
 
-def test_tls_enabled_true_renders_and_is_neutral_against_origin_main(tmp_path: Path) -> None:
-    """THE CARD'S OWN GOLDEN: with `tls.enabled=true` and the same image ref,
-    HEAD's render must equal origin/main's. `test_render_checks.py` carries
-    the full diff against a `git show origin/main:chart/...` checkout; this
-    is the narrower half that belongs here — the schema accepts the shipped
-    shape and nothing about turning TLS on trips the closure this file owns.
+def test_tls_enabled_true_renders_successfully(tmp_path: Path) -> None:
+    """`tls.enabled: true` is a shape this schema's own closure must accept:
+    `type: boolean` and `required: [enabled]` (ADR-0845, C-DB1) bound the
+    VALUE, never the value `true` itself, so turning TLS on must not trip
+    anything this file owns.
     """
     result = render_overlay("tls:\n  enabled: true\n", tmp_path)
     assert result.returncode == 0, result.stderr

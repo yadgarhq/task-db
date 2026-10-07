@@ -316,6 +316,15 @@ fn only_exactly_one_or_zero_are_recognised() {
             ),
             "{value:?} must be refused as an invalid value, not read as off: {err}"
         );
+        let message = err.to_string();
+        assert!(
+            message.contains("LISTEN_TLS_ENABLED"),
+            "{value:?}: the refusal must name the variable: {message}"
+        );
+        assert!(
+            message.contains("tls.enabled"),
+            "{value:?}: the refusal must name the chart key too: {message}"
+        );
     }
 }
 

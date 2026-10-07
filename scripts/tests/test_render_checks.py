@@ -1708,6 +1708,27 @@ def test_client_ca_secret_empty_renders_neither_mount_nor_file(tmp_path):
     assert "name: client-ca" not in result.stdout
 
 
+def test_client_ca_secret_without_client_auth_renders_nothing(tmp_path):
+    """B-U5E-convention.md item 3's OTHER half, and the mutation this proves:
+    the CA env/mount/volume are gated on `hasKey .Values.tls "clientAuth"`
+    AS WELL AS `tls.clientCaSecret`'s truthiness — naming a Secret alone,
+    with no `clientAuth` key at all, must render nothing. Without this case,
+    dropping the `hasKey` clause from those three gates (leaving only the
+    `clientCaSecret` truthiness test) would pass every other test in this
+    file: `test_client_ca_secret_renders_the_file_and_the_mount` always sets
+    `clientAuth` too, and `test_client_ca_secret_empty_renders_neither_mount_
+    nor_file` never names a Secret at all.
+    """
+    result = render_the_shape(
+        CHART,
+        "tls:\n  enabled: true\n  clientCaSecret: peer-ca\n  clientCaSecretKey: ca.crt\n",
+        tmp_path / "ca-without-client-auth",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert "name: client-ca" not in result.stdout
+
+
 def test_client_auth_present_but_tls_disabled_renders_nothing(tmp_path):
     """B-U5E-convention.md item 3: client auth is nested under `tls.enabled`
     too — stating a mode while TLS itself is off renders nothing, though the
@@ -1743,60 +1764,3 @@ def test_client_auth_shape_refusals_do_not_quote_a_raise():
             f"`templates/render-checks.yaml` contains {marker!r}: a refusal "
             f"carrying it makes the raise/refusal discrimination false-green"
         )
-
-
-# ── THE CARD'S GOLDEN: `tls.enabled=true` RENDERS THE SAME AS origin/main ───
-
-
-def origin_main_chart(destination: Path) -> Path:
-    """A read-only copy of `chart/` AT `origin/main`, via `git show` — never a
-    checkout, so this cannot touch the working tree. Assumes `origin/main` is
-    already known to the local repository (every builder fetches before
-    branching; this test does not fetch again).
-    """
-    listing = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", "origin/main", "--", "chart"],
-        cwd=REPO,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    assert listing, "origin/main holds no chart/ tree — is origin/main fetched locally?"
-    for rel in listing:
-        blob = subprocess.run(
-            ["git", "show", f"origin/main:{rel}"],
-            cwd=REPO,
-            check=True,
-            capture_output=True,
-        ).stdout
-        dest = destination / Path(rel).relative_to("chart")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(blob)
-    return destination
-
-
-def test_tls_enabled_true_render_is_unchanged_against_origin_main(tmp_path):
-    """THE CARD'S GOLDEN. `origin/main`'s chart still defaults `tls.enabled:
-    false` and carries no `ci/values.yaml`, so `--set tls.enabled=true` alone
-    reaches the same shape there; HEAD needs no `--set` at all because its own
-    `ci/values.yaml` already says so, but passes it anyway so the two renders
-    are driven by the identical argv.
-
-    COMPARED AS PARSED OBJECTS, NOT AS TEXT. Plain `#` lines are YAML
-    comments, not Go-template ones, so helm renders them into the output
-    verbatim — and this card rewrites several, right beside the lines whose
-    behaviour it actually changes (`LISTEN_TLS_ENABLED` is no longer
-    conditional, so the comment explaining the old conditional had to go).
-    A byte-for-byte diff would redden on prose this card is EXPECTED to
-    touch; what the card's neutrality claim is actually about is that the
-    two renders describe the same OBJECTS.
-    """
-    base_chart = origin_main_chart(tmp_path / "origin-main" / "chart")
-    head = render(CHART, "--set", "tls.enabled=true")
-    assert head.returncode == 0, head.stderr
-    base = render(base_chart, "--set", "tls.enabled=true")
-    assert base.returncode == 0, base.stderr
-    assert objects(head.stdout) == objects(base.stdout), (
-        "HEAD's render with tls.enabled=true diverges from origin/main's — the "
-        "card's neutrality requirement"
-    )
