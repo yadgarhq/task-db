@@ -252,38 +252,69 @@ fn an_unrecognised_ssl_mode_refuses_the_boot_rather_than_falling_back() {
 const SENTINEL_CERT: &str = "/etc/yadgar/pangolin-7c21/serving.crt";
 const SENTINEL_KEY: &str = "/etc/yadgar/pangolin-7c21/serving.key";
 
-/// THE DEFAULT for the listener, and the property the whole change is built
-/// around: nothing configured means the cleartext listener, unchanged.
+/// THERE IS NO DEFAULT FOR THE LISTENER ANY MORE (ADR-0845, C-DB1). Nothing
+/// configured used to mean the cleartext listener; now it refuses the boot,
+/// naming the variable and the chart key, exactly like every other required
+/// knob in `pool_config`. `an_explicit_off_still_serves_cleartext` below is
+/// the test this one used to be, restated with the flag an adopter now has
+/// to write for it.
 #[test]
-fn nothing_configured_means_the_listener_serves_cleartext() {
-    assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&[])).unwrap(), None);
+fn an_unset_listen_tls_enabled_refuses_the_boot() {
+    let err = ServeTls::from_lookup(LISTEN, env_of(&[])).unwrap_err();
+    assert!(
+        matches!(err, BootError::MissingKnob(_)),
+        "an absent LISTEN_TLS_ENABLED must refuse as a missing knob: {err}"
+    );
+    let message = err.to_string();
+    assert!(message.contains("LISTEN_TLS_ENABLED"), "{message}");
+    assert!(message.contains("NOT SET"), "{message}");
+    assert!(
+        message.contains("tls.enabled"),
+        "the refusal must name the chart key too: {message}"
+    );
 }
 
-/// A certificate without the flag is the REVERTED state, not an error. The
-/// flag is the lever; leaving the paths in place is how it gets pulled back.
+/// THE EMPTY CASE, told apart from absent (ADR-0569's own discriminating
+/// property): Helm renders a nulled value as `""`.
 #[test]
-fn a_certificate_alone_does_not_enable_the_listeners_tls() {
+fn an_empty_listen_tls_enabled_refuses_with_its_own_message() {
+    let err = ServeTls::from_lookup(LISTEN, env_of(&[("LISTEN_TLS_ENABLED", "")])).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("LISTEN_TLS_ENABLED"), "{message}");
+    assert!(message.contains("set but EMPTY"), "{message}");
+    assert!(message.contains("tls.enabled"), "{message}");
+}
+
+/// An EXPLICIT `"0"` is the revert lever: TLS stated off, as against unstated.
+/// A certificate left configured beside it does not enable anything — that is
+/// how the cut-over gets reverted without deleting the Secret reference.
+#[test]
+fn an_explicit_off_still_serves_cleartext() {
     let vars = [
+        ("LISTEN_TLS_ENABLED", "0"),
         ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
     ];
     assert_eq!(ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(), None);
 }
 
-/// Anything but "1" is off — the same parse `DB_SSL_MODE`'s predecessor got
-/// wrong, and the reason it is spelled out rather than inferred.
+/// Anything but "1" or "0" is refused rather than silently read as off — the
+/// same parse `DB_SSL_MODE`'s predecessor got wrong, and the reason it is
+/// spelled out rather than inferred.
 #[test]
-fn only_exactly_one_enables_the_listeners_tls() {
-    for value in ["0", "false", "no", "true", "yes", "", " "] {
-        let vars = [
-            ("LISTEN_TLS_ENABLED", value),
-            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-            ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
-        ];
-        assert_eq!(
-            ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap(),
-            None,
-            "{value:?} must not enable TLS"
+fn only_exactly_one_or_zero_are_recognised() {
+    for value in ["false", "no", "true", "yes", "2"] {
+        let vars = [("LISTEN_TLS_ENABLED", value)];
+        let err = ServeTls::from_lookup(LISTEN, env_of(&vars)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BootError::TlsEnabledInvalid {
+                    prefix: "LISTEN",
+                    ..
+                }
+            ),
+            "{value:?} must be refused as an invalid value, not read as off: {err}"
         );
     }
 }
@@ -341,6 +372,10 @@ fn the_certificate_and_the_key_both_arrive() {
 fn the_engines_transport_does_not_configure_the_listener() {
     let vars = [
         ("DB_SSL_MODE", "verify-identity"),
+        // THE LISTENER'S OWN FLAG, EXPLICITLY OFF — required since ADR-0845,
+        // and set here so the case below tests only what it claims to: that
+        // the BARE, unprefixed keys next to it are not read as LISTEN's.
+        ("LISTEN_TLS_ENABLED", "0"),
         ("TLS_ENABLED", "1"),
         ("TLS_CERT_FILE", SENTINEL_CERT),
     ];
@@ -424,6 +459,52 @@ fn an_empty_knob_refuses_with_a_message_of_its_own() {
         assert_ne!(
             empty, absent,
             "{key}: empty and absent must not share one message"
+        );
+    }
+}
+
+/// AN UNPARSABLE VALUE IS A THIRD SHAPE, neither absent nor empty — a value
+/// that is THERE and is simply not a whole number. `Int(#[from]
+/// ParseIntError)` used to carry this with no key and no chart key at all,
+/// so an operator reading a crash loop learned only that SOME number was
+/// unreadable. Every one of the four parsed knobs gets its own case, because
+/// each has its own chart key and a shared assertion over all four would not
+/// prove any one of them is named correctly.
+///
+/// MUTATION: reverting `env_parsed`'s `raw.parse().map_err(..)` to a bare
+/// `.parse()?` (which needs `Int(#[from] ParseIntError)` restored on
+/// [`BootError`] to compile at all) turns every case here red, because the
+/// message would then name neither the key nor the chart key.
+#[test]
+fn an_unparsable_numeric_knob_names_the_variable_and_the_chart_key() {
+    let cases = [
+        ("DB_PORT", PORT_CHART_KEY),
+        ("DB_MAX_CONNECTIONS", MAX_CONNECTIONS_CHART_KEY),
+        ("REPLICAS", REPLICAS_CHART_KEY),
+        (
+            "DB_ENGINE_MAX_CONNECTIONS",
+            ENGINE_MAX_CONNECTIONS_CHART_KEY,
+        ),
+    ];
+    for (key, chart_key) in cases {
+        let err = pool_config(env_with(&[(key, "abc")]))
+            .expect_err("a non-numeric value must refuse the boot");
+        assert!(
+            matches!(err, BootError::Unparsable { .. }),
+            "{key} refused, but not as Unparsable: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(key),
+            "{key}: must name the variable: {message}"
+        );
+        assert!(
+            message.contains(chart_key),
+            "{key}: must name the chart key: {message}"
+        );
+        assert!(
+            message.contains("abc"),
+            "{key}: must show the value that could not be read: {message}"
         );
     }
 }

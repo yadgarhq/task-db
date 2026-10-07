@@ -206,3 +206,112 @@ below is reached only once that guard has already kept the read safe.
       "operator" "KEDA"
       "toggle" "autoscaling.enabled") }}
 {{- end }}
+
+{{/*
+THE SHAPE OF `tls.enabled`, REFUSED BEFORE `templates/deployment.yaml` CAN RENDER
+IT (ADR-0845, C-DB1).
+
+`templates/deployment.yaml` now renders `LISTEN_TLS_ENABLED` UNCONDITIONALLY —
+ADR-0845 deleted the binary's compiled-in default, so the chart can no longer skip
+the variable when TLS is "off"; it must always say which one it means, as
+`ternary "1" "0" .Values.tls.enabled`. A BARE `.Values.tls.enabled` read is
+FAIL-OPEN on a string exactly as `autoscaling.enabled` and `database.create`
+above: `tls.enabled: "false"` reads as off to any human, and under Go template
+truthiness a non-empty string is truthy, so `ternary` would hand the pod
+LISTEN_TLS_ENABLED="1" for a value every reader believes turned TLS off. ADR-0850
+is the same two-part guard every other toggle here carries: `hasKey` before
+`kindIs`, because `kindOf` answers `invalid` for a deleted key and for an absent
+one alike and cannot tell them apart.
+
+`tls` ITSELF IS GUARDED FIRST, the same `hasKey` then `kindIs "map"` idiom as
+`autoscaling`: `certSecret`, `certSecretKey`, `keySecretKey` and the B-U5E
+expand's `clientAuth`, `clientCaSecret`, `clientCaSecretKey` all live under it
+too.
+
+`templates/deployment.yaml` CARRIES ITS OWN `kindIs "map"` GUARD on the same
+read, the same defence `templates/scaledobject.yaml` carries for
+`autoscaling.enabled` — the refusal below is reached only once that guard has
+already kept the read safe, whichever of the two templates helm reaches first.
+
+UNLIKE `database.create` AND `autoscaling.enabled`, THIS GUARD HAS NO TRAILING
+`include "task-db.require-api"`: TLS needs no CRD-backed operator at render
+time, only a Secret, so there is no API-availability check to chain after the
+shape is proved sound.
+*/}}
+{{- if not (hasKey .Values "tls") }}
+{{- fail (join "" (list
+      "task-db: `tls` is absent from the values, so `tls.enabled` cannot be read. "
+      "Helm deletes a null-valued key that a chart in the tree declares, and "
+      "restores no default, so a values file writing `tls:` with no value leaves "
+      "this chart with nothing under it. Write the keys you mean, or omit `tls` "
+      "entirely and this chart's own defaults apply.")) }}
+{{- end }}
+{{- if not (kindIs "map" .Values.tls) }}
+{{- fail (printf (join "" (list
+      "task-db: `tls` must be a map and is %s (%s). `enabled`, `certSecret`, "
+      "`certSecretKey` and `keySecretKey` all live under it, so a string, number "
+      "or list here cannot be read. Write the block this chart's `values.yaml` "
+      "declares."))
+      (kindOf .Values.tls) (toJson .Values.tls)) }}
+{{- end }}
+{{- if not (hasKey .Values.tls "enabled") }}
+{{- fail (join "" (list
+      "task-db: `tls.enabled` is absent. ADR-0845 gives this knob no compiled-in "
+      "default: an absent or nulled value is a choice this chart cannot make for "
+      "an adopter. Write `tls.enabled: true` to serve this listener over TLS, or "
+      "`false` to leave it in cleartext.")) }}
+{{- end }}
+{{- if not (kindIs "bool" .Values.tls.enabled) }}
+{{- fail (printf (join "" (list
+      "task-db: `tls.enabled` must be true or false and is %s (%s). A string, "
+      "number, map or list here is not a toggle: the chart renders "
+      "LISTEN_TLS_ENABLED from it unconditionally, so a quoted or typed value is "
+      "misread rather than refused until the pod either fails to boot or serves "
+      "the wrong transport. Write the bare word `true` or `false`."))
+      (kindOf .Values.tls.enabled) (toJson .Values.tls.enabled)) }}
+{{- end }}
+
+{{/*
+B-U5E EXPAND: `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey`
+(ADR-0854, folded into this card per the plan's B-U5E card).
+
+NONE OF THIS CHANGES THE BINARY. `src/boot/serve_tls.rs` does not read
+LISTEN_TLS_CLIENT_AUTH at all yet — B-U5 is the unit that adopts it. This block
+only lets an adopter STATE the mode ahead of that cut-over, and refuses the two
+modes the binary cannot yet enforce, so nothing shipped here can promise a
+protection this pod does not give.
+
+`tls.clientAuth` IS OPTIONAL. An absent key renders `templates/deployment.yaml`
+exactly as it did before this change, which is the whole of what "expand" means
+— no LISTEN_TLS_CLIENT_AUTH, no LISTEN_TLS_CLIENT_CA_FILE, no `ca.crt` item.
+When the key IS present, ADR-0854 allows exactly three values, and `optional`
+and `required` are refused HERE rather than rendered: shipping either today
+would have an adopter believe client certificates are checked when nothing
+checks them. Only `off` — ADR-0854's "emergency value" — is accepted before
+B-U5 lifts this gate (K-8 step 1).
+*/}}
+{{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if eq .Values.tls.clientAuth "optional" }}
+{{- fail (join "" (list
+      "task-db: `tls.clientAuth: optional` is not enforced yet. This binary does "
+      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
+      "`optional` here would have an adopter believe client certificates are "
+      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
+      "entirely, until B-U5 ships.")) }}
+{{- end }}
+{{- if eq .Values.tls.clientAuth "required" }}
+{{- fail (join "" (list
+      "task-db: `tls.clientAuth: required` is not enforced yet. This binary does "
+      "not read LISTEN_TLS_CLIENT_AUTH until B-U5 adopts it, so shipping "
+      "`required` here would have an adopter believe client certificates are "
+      "checked when nothing checks them. Write `off`, or omit `tls.clientAuth` "
+      "entirely, until B-U5 ships.")) }}
+{{- end }}
+{{- if ne .Values.tls.clientAuth "off" }}
+{{- fail (printf (join "" (list
+      "task-db: `tls.clientAuth` must be `off`, `optional` or `required` "
+      "(ADR-0854) and is %s. `optional` and `required` are refused for a "
+      "separate reason, above. Write `off`, or omit `tls.clientAuth` entirely."))
+      (toJson .Values.tls.clientAuth)) }}
+{{- end }}
+{{- end }}

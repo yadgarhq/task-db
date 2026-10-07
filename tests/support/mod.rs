@@ -119,7 +119,7 @@ pub fn ladder_only() -> InheritedSetting {
 /// A test that is ABOUT the ratio names its own size through
 /// [`World::with_pool_size`] rather than leaning on this one — an assertion
 /// derived from a default silently stops testing the day the default moves.
-const DEFAULT_POOL_SIZE: u32 = 4;
+const FIXTURE_POOL_SIZE: u32 = 4;
 
 pub fn dsn() -> String {
     std::env::var("YADGAR_TEST_DSN")
@@ -155,13 +155,13 @@ pub struct World {
 
 impl World {
     pub async fn fresh(name: &str) -> Self {
-        Self::build(name, DEFAULT_POOL_SIZE, None, None).await
+        Self::build(name, FIXTURE_POOL_SIZE, None, None).await
     }
 
     /// The same service against a pool of exactly `max_connections`.
     ///
     /// For the tests whose subject IS the pool ceiling. They must name their own
-    /// number: an assertion that reads [`DEFAULT_POOL_SIZE`] and spawns that many
+    /// number: an assertion that reads [`FIXTURE_POOL_SIZE`] and spawns that many
     /// racers keeps passing when the default changes, while no longer testing the
     /// ratio it was written for.
     pub async fn with_pool_size(name: &str, max_connections: u32) -> Self {
@@ -176,7 +176,7 @@ impl World {
     /// cannot exist in a database the current set created. This stops short, so
     /// a test can write the BEFORE state itself and then migrate over it.
     pub async fn fresh_at(name: &str, version: u64) -> Self {
-        Self::build(name, DEFAULT_POOL_SIZE, None, Some(version)).await
+        Self::build(name, FIXTURE_POOL_SIZE, None, Some(version)).await
     }
 
     /// The same service against a pool that waits one second for a row lock
@@ -184,7 +184,7 @@ impl World {
     /// uses this, and a test that takes fifty seconds to observe it is a test
     /// nobody runs.
     pub async fn impatient(name: &str) -> Self {
-        Self::build(name, DEFAULT_POOL_SIZE, Some(1), None).await
+        Self::build(name, FIXTURE_POOL_SIZE, Some(1), None).await
     }
 
     /// Apply whatever is still pending, and answer with the version now
@@ -220,7 +220,7 @@ impl World {
                 .expect("ddl");
         }
         let pool = sqlx::mysql::MySqlPoolOptions::new()
-            // STATED, never inherited. See [`DEFAULT_POOL_SIZE`].
+            // STATED, never inherited. See [`FIXTURE_POOL_SIZE`].
             .max_connections(max_connections)
             .after_connect(move |conn, _| {
                 Box::pin(async move {
@@ -596,4 +596,405 @@ pub async fn two_projects_two_users(name: &str) -> Cast {
 /// (ADR-0569, ledger 814).
 fn lock() -> yadgar_store::migrate::LockOptions {
     yadgar_store::migrate::LockOptions::new(60).expect("60 seconds is a wait")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// RUNNING THE REAL BINARY (ledger 748, `tests/exit_chain.rs`), copied from
+// `yadgarhq/task`'s own `tests/support/mod.rs` at origin/main (task#70,
+// adopted here per the C-DB1 card) and adapted to what THIS binary needs:
+//
+//   - `BIN` names `yadgar-task-db`, not `yadgar-task`.
+//   - `cleartext_env` renders the EIGHT pool knobs `boot::pool_config` reads
+//     plus the migration lock's wait, none of which `task` carries at all —
+//     and writes the database credential to a FILE under the per-test root,
+//     because `DB_PASSWORD_FILE` is a path, never an inline value (D58).
+//     `DsnParts` is what turns `YADGAR_TEST_DSN` (one URL, for sqlx) into
+//     the four discrete pieces the chart renders as four separate keys.
+//   - task's own rotation-triggered case (a rewritten `shared.yaml` draining
+//     the server) is NOT ported: this binary's watch set carries three
+//     material kinds beside the shared document — the database credential
+//     and `database.sslCaSecret`'s authority — and reproducing that case
+//     safely is filed as follow-up work rather than guessed at here. The
+//     SIGNAL case below does not depend on any of that, and is ported whole.
+//
+// THE MOUNT NAMESPACE IS STILL NEEDED, for the identical reason: this
+// binary's own `rotate::Configuration::mounted()` is `yadgar_lifecycle::
+// rotate::Configuration::mounted`, the SAME function task calls, and it
+// reads `/etc/yadgar/config/shared/shared.yaml` unconditionally with no
+// environment override. A test cannot write under the host's `/etc`, so
+// every run goes through `unshare -rm`, exactly as documented in the
+// upstream file this section is copied from.
+// ══════════════════════════════════════════════════════════════════════════
+
+use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+/// The binary under test.
+pub const BIN: &str = env!("CARGO_BIN_EXE_yadgar-task-db");
+
+/// The rotation schedule every run is given: poll each second, no splay. Read
+/// even though this harness does not yet exercise a rotation case — the
+/// schedule is parsed at boot regardless (`main.rs`'s `configure`), and an
+/// absent or unusable one refuses before the server ever listens.
+pub const FIXTURE: &str = "tlsRotation:\n  pollSeconds: 1\n  splayMaxSeconds: 0\n";
+
+/// What every deadline adds on top of the time the binary is allowed.
+/// Generous, because a shared CI runner is slow; the waits it bounds are
+/// seconds long.
+pub const MARGIN: Duration = Duration::from_secs(10);
+
+/// How long a boot may take to reach its "listening" line. Longer than
+/// `task`'s own, because this boot also probes and migrates a real engine.
+pub const BOOT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The script `unshare` runs. Paths arrive as positional arguments — `$1` the
+/// per-test root, `$2` the binary — rather than interpolated into the text.
+const SCRIPT: &str = r#"set -e
+mount -t overlay overlay -o "lowerdir=/etc,upperdir=$1/upper,workdir=$1/work" /etc
+mkdir -p /etc/yadgar/config/shared
+mount --bind "$1/shared" /etc/yadgar/config/shared
+exec "$2""#;
+
+/// `YADGAR_TEST_DSN`, taken apart into the pieces `boot::pool_config` reads as
+/// four discrete environment variables.
+///
+/// A HAND-ROLLED PARSE rather than a URL crate: this is the one caller in the
+/// tree that needs the DSN in pieces, and the shape it parses is the one
+/// `dsn()` is ever handed — `mysql://user:password@host:port[/database]` —
+/// so a general-purpose parser would be a dependency for a single call site.
+struct DsnParts {
+    host: String,
+    port: String,
+    user: String,
+    password: String,
+}
+
+fn dsn_parts() -> DsnParts {
+    let raw = dsn();
+    let rest = raw
+        .strip_prefix("mysql://")
+        .unwrap_or_else(|| panic!("YADGAR_TEST_DSN must start with mysql://: {raw}"));
+    let (creds, host_port) = rest
+        .split_once('@')
+        .unwrap_or_else(|| panic!("YADGAR_TEST_DSN must carry user:password@host:port: {raw}"));
+    let (user, password) = creds
+        .split_once(':')
+        .unwrap_or_else(|| panic!("YADGAR_TEST_DSN must carry user:password: {raw}"));
+    let host_port = host_port.split('/').next().unwrap_or(host_port);
+    let (host, port) = host_port
+        .split_once(':')
+        .unwrap_or_else(|| panic!("YADGAR_TEST_DSN must carry host:port: {raw}"));
+    DsnParts {
+        host: host.to_string(),
+        port: port.to_string(),
+        user: user.to_string(),
+        password: password.to_string(),
+    }
+}
+
+/// The environment a cleartext deployment of THIS chart renders, with
+/// loopback addresses and port 0 on both listeners — the cases in a target
+/// run in parallel, same as `task`'s own `cleartext_env`.
+///
+/// `DB_PASSWORD_FILE` is written under `root`, OUTSIDE `/etc`: the script
+/// above only remounts `/etc`, so a path under the system temp directory is
+/// visible unchanged inside the namespace.
+fn cleartext_env(root: &std::path::Path) -> Vec<(String, String)> {
+    let dsn = dsn_parts();
+    let password_file = root.join("db-password");
+    std::fs::write(&password_file, &dsn.password).expect("the password file must be written");
+
+    vec![
+        ("DB_HOST".to_string(), dsn.host),
+        ("DB_PORT".to_string(), dsn.port),
+        ("DB_NAME".to_string(), unique_database_name()),
+        ("DB_USER".to_string(), dsn.user),
+        (
+            "DB_PASSWORD_FILE".to_string(),
+            password_file.display().to_string(),
+        ),
+        ("DB_MAX_CONNECTIONS".to_string(), "4".to_string()),
+        ("REPLICAS".to_string(), "1".to_string()),
+        ("DB_ENGINE_MAX_CONNECTIONS".to_string(), "200".to_string()),
+        ("DB_SSL_MODE".to_string(), "disabled".to_string()),
+        (
+            "DB_MIGRATION_LOCK_TIMEOUT_SECONDS".to_string(),
+            "60".to_string(),
+        ),
+        ("LISTEN".to_string(), "127.0.0.1:0".to_string()),
+        ("METRICS_LISTEN".to_string(), "127.0.0.1:0".to_string()),
+        ("LISTEN_TLS_ENABLED".to_string(), "0".to_string()),
+    ]
+}
+
+/// A database name this run owns alone, created on the engine named by
+/// `YADGAR_TEST_DSN` before the binary starts — `main` only MIGRATES, it
+/// never creates the database itself (D7 is a capability probe, not DDL).
+fn unique_database_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "task_db_exit_chain_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+    )
+}
+
+/// Create `name` on the engine `YADGAR_TEST_DSN` names, dropping it first if a
+/// previous run left it behind. Blocking, deliberately: `Booted::start` is a
+/// synchronous constructor and every caller here is a `#[test]`, not
+/// `#[tokio::test]` — `exit_chain.rs` needs no async runtime of its own, the
+/// same shape `task`'s copy of this harness takes.
+fn create_database_blocking(name: &str) {
+    let dsn = dsn();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(async move {
+                let mut root = sqlx::MySqlConnection::connect(&dsn).await.expect("connect");
+                for stmt in [
+                    format!("DROP DATABASE IF EXISTS {name}"),
+                    format!("CREATE DATABASE {name}"),
+                ] {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
+                        .execute(&mut root)
+                        .await
+                        .expect("ddl");
+                }
+            });
+    })
+    .join()
+    .expect("the database-creation thread must not panic");
+}
+
+/// One line the binary wrote, and which stream it came from.
+enum Line {
+    Out(String),
+    Err(String),
+}
+
+/// The binary, running in its own mount namespace, with its output pumped.
+pub struct Booted {
+    child: Child,
+    lines: Receiver<Line>,
+    seen: Vec<String>,
+    root: PathBuf,
+}
+
+impl Booted {
+    /// Start the binary against a FRESH database it owns alone, with the
+    /// rest of a cleartext deployment's environment, plus `extra` layered
+    /// over it (later entries win).
+    pub fn start(extra: &[(&str, &str)]) -> Self {
+        let root = fresh_root();
+        let name = unique_database_name();
+        create_database_blocking(&name);
+
+        let mut vars = cleartext_env(&root);
+        if let Some(entry) = vars.iter_mut().find(|(k, _)| k == "DB_NAME") {
+            entry.1 = name;
+        }
+        for (key, value) in extra {
+            match vars.iter_mut().find(|(k, _)| k == key) {
+                Some(entry) => entry.1 = value.to_string(),
+                None => vars.push((key.to_string(), value.to_string())),
+            }
+        }
+
+        let path = std::env::var_os("PATH").expect("the test runner must have a PATH");
+        let mut child = Command::new("unshare")
+            .args(["-rm", "sh", "-c", SCRIPT, "sh"])
+            .arg(&root)
+            .arg(BIN)
+            .env_clear()
+            .env("PATH", path)
+            .envs(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("`unshare` could not be started: {e}"));
+
+        // ONE THREAD PER STREAM, pumping for the life of the child. Reading
+        // only until the "listening" line would leave the pipe to fill and
+        // the binary to block on its next log line.
+        let (tx, lines) = mpsc::channel();
+        let out = child.stdout.take().expect("stdout was piped");
+        let err = child.stderr.take().expect("stderr was piped");
+        let tx_err = tx.clone();
+        std::thread::spawn(move || pump(out, move |l| tx.send(Line::Out(l)).is_ok()));
+        std::thread::spawn(move || pump(err, move |l| tx_err.send(Line::Err(l)).is_ok()));
+
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+            root,
+        }
+    }
+
+    /// The binary's pid. `exec` all the way down makes it the direct child.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Wait for a line satisfying `matches`, or fail on `deadline`.
+    pub fn wait_for_line(
+        &mut self,
+        what: &str,
+        deadline: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
+        let until = Instant::now() + deadline;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(Line::Out(l) | Line::Err(l)) => {
+                    self.seen.push(l.clone());
+                    if matches(&l) {
+                        return l;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.fail(&format!("waited {deadline:?} for {what}; it never came"))
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let status = self.reap(Duration::from_secs(5));
+                    self.fail(&format!(
+                        "the binary's output ended before {what} ({})",
+                        describe(status)
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Wait for the boot to reach the line `main` logs once the signal
+    /// handlers are armed and the server is spawned.
+    pub fn wait_until_listening(&mut self) {
+        self.wait_for_line("the \"task-db listening\" line", BOOT_DEADLINE, |l| {
+            l.contains("\"task-db listening\"")
+        });
+    }
+
+    /// Send SIGTERM, the way kubelet ends a pod.
+    pub fn terminate(&mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.pid().to_string()])
+            .status()
+            .unwrap_or_else(|e| panic!("`kill` could not be started: {e}"));
+        if !status.success() {
+            self.fail(&format!("`kill -TERM` failed: {status}"));
+        }
+    }
+
+    /// Wait for the process to exit, or fail on `deadline`.
+    pub fn wait_for_exit(&mut self, what: &str, deadline: Duration) -> ExitStatus {
+        match self.reap(deadline) {
+            Some(status) => {
+                self.drain_lines();
+                status
+            }
+            None => self.fail(&format!(
+                "waited {deadline:?} for the process to exit {what}; it was still running"
+            )),
+        }
+    }
+
+    /// Every line the binary has written so far.
+    pub fn seen(&self) -> &[String] {
+        &self.seen
+    }
+
+    /// Fail the test: kill the child, then panic with everything it printed.
+    pub fn fail(&mut self, why: &str) -> ! {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.drain_lines();
+        panic!(
+            "{why}\n--- everything the binary wrote ---\n{}",
+            self.seen.join("\n")
+        );
+    }
+
+    fn reap(&mut self, deadline: Duration) -> Option<ExitStatus> {
+        let until = Instant::now() + deadline;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() >= until => return None,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("the child could not be waited on: {e}"),
+            }
+        }
+    }
+
+    fn drain_lines(&mut self) {
+        while let Ok(Line::Out(l) | Line::Err(l)) =
+            self.lines.recv_timeout(Duration::from_millis(500))
+        {
+            self.seen.push(l);
+        }
+    }
+}
+
+impl Drop for Booted {
+    fn drop(&mut self) {
+        // A panicking test must not leave a server running.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        remove_root(&self.root);
+    }
+}
+
+/// The exit status as a sentence that says whether a signal ended it.
+pub fn describe(status: Option<ExitStatus>) -> String {
+    match status {
+        None => "still running".to_string(),
+        Some(s) => format!("code {:?}, signal {:?}", s.code(), s.signal()),
+    }
+}
+
+/// A per-test directory: the overlay's upper and work dirs, and the directory
+/// bind-mounted as `/etc/yadgar/config/shared`.
+fn fresh_root() -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "yadgar-task-db-exit-chain-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    for dir in ["upper", "work", "shared"] {
+        std::fs::create_dir_all(root.join(dir)).expect("the test root must be created");
+    }
+    std::fs::write(root.join("shared").join("shared.yaml"), FIXTURE)
+        .expect("the fixture document must be written");
+    root
+}
+
+/// Best effort. Overlayfs leaves `work/work` with mode 0, so it is opened up
+/// before the tree is removed.
+fn remove_root(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(
+        root.join("work").join("work"),
+        std::fs::Permissions::from_mode(0o700),
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn pump(stream: impl std::io::Read, mut send: impl FnMut(String) -> bool) {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(stream).lines() {
+        let Ok(line) = line else { return };
+        if !send(line) {
+            return;
+        }
+    }
 }

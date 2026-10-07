@@ -22,15 +22,17 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    # THE REV MOVES FROM v1.20.1 TO v1.22.0 FOR THE TWO IDS BELOW, and the whole
-    # block comes with it because pre-commit resolves one rev per repository
-    # entry. `git diff --stat v1.20.1 v1.22.0 -- hooks/ .pre-commit-hooks.yaml`
-    # is 1901 insertions and 0 deletions, touching only the new
-    # `hooks/chart_baseline.py` and the two manifest entries that publish it — so
-    # no hook already in this block changes behaviour. A second `repo:` entry
-    # pinning the same repository at a second rev was the alternative, and it is
-    # the drift the shared manifest exists to prevent.
-    rev: v1.22.0
+    # THE REV MOVES FROM v1.22.0 TO v1.31.0 FOR C-DB1 (ledger 965, ADR-0845).
+    # C-A1 widens `no-compiled-in-defaults` to the four extra shapes the
+    # census found (a bare `const DEFAULT_*`, a presence test against
+    # `Some("...")`, an `EnvFilter::new(...)` fallback, a `None` arm beside an
+    # env read answering a bare constant); C-A2 gives `helm-lint` a chart's
+    # own `chart/ci/values.yaml` override, which this chart now carries
+    # because `tls.enabled` lost its default. Measured: `boot_reads_watched`,
+    # `no_test_skips` and `observe_coverage` also moved between the two tags;
+    # none of the three changes this tree's own verdict (this PR's own CI run
+    # is the proof — see the PR body).
+    rev: v1.31.0
     hooks:
       - id: gitleaks
       - id: prettier

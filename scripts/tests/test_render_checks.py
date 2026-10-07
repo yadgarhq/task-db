@@ -114,6 +114,15 @@ list rather than reconstructing it:
     Service, a ServiceAccount and a PodDisruptionBudget. It asserts instead that
     they render no object of the checked group, and `test_mariadb.py` carries the
     count those four objects are asserted against.
+  - `render()` now passes `-f <chart>/ci/values.yaml` ahead of every other
+    argument, when that file exists under the chart being rendered (ADR-0845,
+    C-DB1). `tls.enabled` carries no default in the shipped chart any more,
+    so a bare render of the real chart — or of a `shutil.copytree(CHART, ...)`
+    copy of it, which carries the same `ci/` directory — needs this to reach
+    anything past the schema's own refusal. `two_check_fixture` builds a
+    schema-less throwaway chart with no `ci/` directory, so it sees no
+    difference; `probe_capability`'s own one-template chart calls `helm()`
+    directly rather than `render()` and is untouched either way.
 
 Run: python3 -m pytest scripts/tests/ -q
 """
@@ -457,7 +466,16 @@ def red_api_versions(declared: Iterable[str], under_test: str) -> tuple[str, ...
 
 
 def render(chart: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return helm("template", CHART_NAME, str(chart), *arguments)
+    # `-f <chart>/ci/values.yaml` FIRST, WHEN IT EXISTS (ADR-0845, C-DB1):
+    # `tls.enabled` carries no default any more, so a bare render of the real
+    # chart needs this override to reach anything past the schema refusal.
+    # `chart` may be a `shutil.copytree(CHART, ...)` copy — which carries the
+    # same `ci/` directory — or one of this file's own minimal, schema-less
+    # fixtures, which has no `ci/` directory and so gets no flag: deviation
+    # from the `yadgarhq/platform` reference this file is copied from.
+    ci_values = chart / "ci" / "values.yaml"
+    override = ("-f", str(ci_values)) if ci_values.is_file() else ()
+    return helm("template", CHART_NAME, str(chart), *override, *arguments)
 
 
 def objects(stdout: str) -> list[dict]:
@@ -1454,3 +1472,263 @@ def test_the_autoscaling_shape_refusal_does_not_quote_a_raise():
             f"refusal is told apart from a raise — a refusal carrying it makes that "
             f"discrimination false-green"
         )
+
+
+# ══ C-DB1 (ADR-0845, ADR-0854): `tls.enabled` RENDERS UNCONDITIONALLY, AND THE ══
+# ══ B-U5E CLIENT-AUTH EXPAND ════════════════════════════════════════════════
+
+# THE TWO ARMS THAT GUARD `tls` ITSELF, mirroring `AUTOSCALING_SHAPE_ARMS`. The
+# `enabled` key's own absence/type is the SCHEMA's job now (ADR-0845 gave it
+# `type: boolean` and `required: [enabled]`, unlike `autoscaling.enabled`, which
+# carries neither) — `scripts/tests/test_values_schema.py` holds those cases.
+# These two are what the schema CANNOT catch, because the root `tls` property
+# carries no `type: object` (ADR-0850's own `database` has one; `tls` does not,
+# matching `autoscaling`): a non-map `tls` passes schema validation and would
+# crash `templates/deployment.yaml` without this guard.
+TLS_MAP_SHAPE_ARMS = {
+    "tls-absent": (
+        "`tls` is absent from the values",
+        '{{- if not (hasKey .Values "tls") }}',
+    ),
+    "tls-not-map": (
+        "`tls` must be a map",
+        '{{- if not (kindIs "map" .Values.tls) }}',
+    ),
+}
+
+
+def test_tls_block_deleted_is_refused_naming_tls(tmp_path):
+    """`tls:` with no value deletes the whole block THIS chart's `values.yaml`
+    declares (it still carries `certSecret` etc.), which is the one shape
+    `hasKey` sees as truly absent rather than merely unset.
+    """
+    result = render(CHART, "--set", "tls=null")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-absent"][0] in result.stderr, result.stderr
+
+
+def test_tls_not_a_map_is_refused_naming_tls(tmp_path):
+    result = render_the_shape(CHART, 'tls: "x"\n', tmp_path / "tls-not-map")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-not-map"][0] in result.stderr, result.stderr
+
+
+def test_stripping_each_tls_map_arm_reddens_its_own_shape(tmp_path):
+    """Mirrors `test_stripping_each_autoscaling_arm_...`: each arm removed in
+    turn, and the shape it alone owns must stop being refused for its reason.
+    """
+    owners = {
+        "tls-absent": ("tls=null",),
+        "tls-not-map": ('tls: "x"\n',),
+    }
+    for arm, (phrase, opening) in sorted(TLS_MAP_SHAPE_ARMS.items()):
+        copy = tmp_path / arm / "chart"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(CHART, copy)
+        template = copy / "templates" / "render-checks.yaml"
+        template.write_text(strip_arm(template.read_text(), opening))
+
+        if arm == "tls-absent":
+            result = render(copy, "--set", "tls=null")
+        else:
+            result = render_the_shape(copy, owners[arm][0], tmp_path / arm / "renders")
+        assert phrase not in result.stderr, (
+            f"the {arm} arm was stripped and the shape it owns still named it: "
+            f"{result.stderr}"
+        )
+
+
+def test_tls_map_shape_refusals_do_not_quote_a_raise():
+    text = (CHART / "templates" / "render-checks.yaml").read_text()
+    for arm, (phrase, _opening) in sorted(TLS_MAP_SHAPE_ARMS.items()):
+        assert phrase in text, f"the {arm} arm's message is not in the template: {phrase!r}"
+    for marker in RAISE_MARKERS:
+        assert marker not in text, (
+            f"`templates/render-checks.yaml` contains {marker!r}: a refusal "
+            f"carrying it makes the raise/refusal discrimination false-green"
+        )
+
+
+def rendered_env_value(stdout: str, variable: str) -> str | None:
+    """The rendered VALUE line right after `- name: <variable>` in a
+    Deployment's env list, whitespace trimmed, or `None` if it is not
+    rendered at all. Whitespace-tolerant (unlike a literal substring match)
+    because the env list is indented to match its container block.
+    """
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == f"- name: {variable}":
+            return lines[i + 1].strip()
+    return None
+
+
+def test_listen_tls_enabled_renders_unconditionally_as_1_when_true(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true")
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "1"'
+
+
+def test_listen_tls_enabled_renders_unconditionally_as_0_when_false(tmp_path):
+    """THE DEFECT THIS CARD REMOVES: before it, `tls.enabled=false` rendered NO
+    `LISTEN_TLS_ENABLED` at all, and the binary's own compiled-in default
+    silently supplied cleartext. After it, the chart states "0" rather than
+    omitting the variable, so the binary's refusal (absent/empty) can never
+    fire for a deployment that correctly asked for cleartext.
+    """
+    result = render(CHART, "--set", "tls.enabled=false")
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
+
+
+def test_removing_deployments_own_tls_guard_still_renders_safely(tmp_path):
+    """THE GUARD `templates/deployment.yaml` carries on its OWN read of
+    `tls.enabled` is BELT AND BRACES, not the only line of defence this card
+    relies on, and this is the measured reason: unlike `scaledobject.yaml`
+    (`test_removing_the_scaledobject_guard_raises_instead_of_refusing`),
+    stripping it does NOT put a raw Go template crash back for this chart —
+    `templates/render-checks.yaml`'s own `tls`-not-map arm reaches `tls: "x"`
+    first regardless, measured on this tree's helm. This records that
+    measurement rather than asserting the opposite result the autoscaling
+    case happens to show; the guard is kept in `deployment.yaml` anyway, both
+    because a future helm release's rendering order is not a thing this
+    chart controls and because `kindIs "map"` is one `and` clause, not a
+    maintenance burden.
+    """
+    copy = tmp_path / "chart"
+    shutil.copytree(CHART, copy)
+    template = copy / "templates" / "deployment.yaml"
+    text = template.read_text()
+    guarded = (
+        'value: {{ ternary "1" "0" (and (kindIs "map" .Values.tls) '
+        '.Values.tls.enabled) | quote }}'
+    )
+    assert guarded in text, "the guard this case strips is no longer in deployment.yaml"
+    text = text.replace(guarded, 'value: {{ ternary "1" "0" .Values.tls.enabled | quote }}')
+    template.write_text(text)
+
+    result = render_the_shape(copy, 'tls: "x"\n', tmp_path / "renders")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-not-map"][0] in result.stderr, result.stderr
+
+
+# ── B-U5E: `tls.clientAuth`, `tls.clientCaSecret`, `tls.clientCaSecretKey` ───
+
+
+def test_client_auth_absent_renders_neither_variable(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true")
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_AUTH" not in result.stdout
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+
+
+def test_client_auth_off_renders_the_variable(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=off")
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+
+
+def test_client_auth_optional_is_refused_as_not_enforced_yet(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=optional")
+    assert result.returncode != 0
+    assert "is not enforced yet" in result.stderr, result.stderr
+    assert "optional" in result.stderr, result.stderr
+
+
+def test_client_auth_required_is_refused_as_not_enforced_yet(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=required")
+    assert result.returncode != 0
+    assert "is not enforced yet" in result.stderr, result.stderr
+    assert "required" in result.stderr, result.stderr
+
+
+def test_client_auth_bad_mode_is_refused(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true", "--set", "tls.clientAuth=maybe")
+    assert result.returncode != 0
+    assert "must be `off`, `optional` or `required`" in result.stderr, result.stderr
+
+
+def test_client_ca_secret_renders_the_file_and_the_mount(tmp_path):
+    result = render(
+        CHART,
+        "--set",
+        "tls.enabled=true",
+        "--set",
+        "tls.clientCaSecret=peer-ca",
+        "--set",
+        "tls.clientCaSecretKey=ca.crt",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        rendered_env_value(result.stdout, "LISTEN_TLS_CLIENT_CA_FILE")
+        == "value: /var/run/config/client-ca/ca.crt"
+    )
+    assert "name: client-ca" in result.stdout
+    assert 'secretName: "peer-ca"' in result.stdout
+
+
+def test_client_auth_shape_refusals_do_not_quote_a_raise():
+    text = (CHART / "templates" / "render-checks.yaml").read_text()
+    for phrase in ("is not enforced yet", "must be `off`, `optional` or `required`"):
+        assert phrase in text, f"the client-auth message is not in the template: {phrase!r}"
+    for marker in RAISE_MARKERS:
+        assert marker not in text, (
+            f"`templates/render-checks.yaml` contains {marker!r}: a refusal "
+            f"carrying it makes the raise/refusal discrimination false-green"
+        )
+
+
+# ── THE CARD'S GOLDEN: `tls.enabled=true` RENDERS THE SAME AS origin/main ───
+
+
+def origin_main_chart(destination: Path) -> Path:
+    """A read-only copy of `chart/` AT `origin/main`, via `git show` — never a
+    checkout, so this cannot touch the working tree. Assumes `origin/main` is
+    already known to the local repository (every builder fetches before
+    branching; this test does not fetch again).
+    """
+    listing = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "origin/main", "--", "chart"],
+        cwd=REPO,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert listing, "origin/main holds no chart/ tree — is origin/main fetched locally?"
+    for rel in listing:
+        blob = subprocess.run(
+            ["git", "show", f"origin/main:{rel}"],
+            cwd=REPO,
+            check=True,
+            capture_output=True,
+        ).stdout
+        dest = destination / Path(rel).relative_to("chart")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob)
+    return destination
+
+
+def test_tls_enabled_true_render_is_unchanged_against_origin_main(tmp_path):
+    """THE CARD'S GOLDEN. `origin/main`'s chart still defaults `tls.enabled:
+    false` and carries no `ci/values.yaml`, so `--set tls.enabled=true` alone
+    reaches the same shape there; HEAD needs no `--set` at all because its own
+    `ci/values.yaml` already says so, but passes it anyway so the two renders
+    are driven by the identical argv.
+
+    COMPARED AS PARSED OBJECTS, NOT AS TEXT. Plain `#` lines are YAML
+    comments, not Go-template ones, so helm renders them into the output
+    verbatim — and this card rewrites several, right beside the lines whose
+    behaviour it actually changes (`LISTEN_TLS_ENABLED` is no longer
+    conditional, so the comment explaining the old conditional had to go).
+    A byte-for-byte diff would redden on prose this card is EXPECTED to
+    touch; what the card's neutrality claim is actually about is that the
+    two renders describe the same OBJECTS.
+    """
+    base_chart = origin_main_chart(tmp_path / "origin-main" / "chart")
+    head = render(CHART, "--set", "tls.enabled=true")
+    assert head.returncode == 0, head.stderr
+    base = render(base_chart, "--set", "tls.enabled=true")
+    assert base.returncode == 0, base.stderr
+    assert objects(head.stdout) == objects(base.stdout), (
+        "HEAD's render with tls.enabled=true diverges from origin/main's — the "
+        "card's neutrality requirement"
+    )

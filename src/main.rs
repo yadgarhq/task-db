@@ -63,6 +63,16 @@ fn env_required(key: &str) -> Result<String, String> {
     }
 }
 
+/// `value.parse::<SocketAddr>()`, naming `key` in the refusal — a bare
+/// `.parse()?` converts via `Box<dyn Error>`'s blanket `From<AddrParseError>`
+/// and prints only "invalid socket address syntax" for both `LISTEN` and
+/// `METRICS_LISTEN` alike (ledgers 1257, 748; card C-DB1).
+fn parse_listen_addr(key: &str, value: &str) -> Result<SocketAddr, String> {
+    value.parse().map_err(|source: std::net::AddrParseError| {
+        format!("{key} is {value:?}, which is not a usable address: {source}")
+    })
+}
+
 /// The process entry point: run the service, and print a refusal as its SENTENCE.
 ///
 /// **NOT `main() -> Result`.** Rust prints a `main` that returns `Err` with
@@ -114,7 +124,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // shows the loaded leaf ageing out.
     tls_inputs.export_not_after();
 
-    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
+    let addr: SocketAddr = parse_listen_addr("LISTEN", &env_required("LISTEN")?)?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `boot::shutdown` is a `fn`
@@ -189,7 +199,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Its own function since `run` stopped being `#[tokio::main]`: clippy's
 /// cognitive-complexity ceiling did not see through the macro, and does now.
 fn install_metrics() -> Result<(), Box<dyn std::error::Error>> {
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    let metrics_addr: SocketAddr =
+        parse_listen_addr("METRICS_LISTEN", &env_required("METRICS_LISTEN")?)?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -236,8 +247,9 @@ fn init_tracing() {
         //
         // A service nobody can observe is one D67 cannot measure either.
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info") // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour.
+            }),
         )
         .init();
 }
@@ -419,7 +431,23 @@ async fn probe_and_migrate(
 
 #[cfg(test)]
 mod tests {
-    use super::env_required;
+    use super::{env_required, parse_listen_addr};
+
+    /// MUTATION: reverting to a bare `.parse()?` turns this red — the
+    /// message becomes the standard library's "invalid socket address
+    /// syntax", naming neither `LISTEN` nor the value.
+    #[test]
+    fn an_unusable_address_names_the_key_and_the_value() {
+        let err = parse_listen_addr("LISTEN", "notanaddr").unwrap_err();
+        assert!(err.contains("LISTEN"), "must name the variable: {err}");
+        assert!(err.contains("notanaddr"), "must show the value: {err}");
+    }
+
+    #[test]
+    fn a_usable_address_is_returned_verbatim() {
+        let addr = parse_listen_addr("LISTEN", "0.0.0.0:50051").unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:50051");
+    }
 
     // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
     // runs these on threads of one process, so tests sharing a variable name

@@ -8,8 +8,14 @@ use crate::service::TaskDb;
 use crate::sql::{internal, scope_of, Reach};
 
 /// D56 bounds reads: an unbounded page is how one caller takes the whole table.
+///
+/// `DEFAULT_PAGE` is marked CB (ledger 965 census M8): gateway and every other
+/// caller must get the same answer when `page_size` is omitted or zero, so
+/// this is read off ONE source rather than each caller guessing. iam-db's own
+/// `DEFAULT_PAGE_SIZE` caps at 200 where this caps at 500 — a recorded drift,
+/// not a defect either page cap is asked to fix here.
 const MAX_PAGE: i32 = 500;
-const DEFAULT_PAGE: i32 = 50;
+const DEFAULT_PAGE: i32 = 50; // ADR-0569-EXCEPTION(CB): contract bound, not a knob — see the doc comment above.
 
 impl TaskDb {
     pub(crate) async fn get(&self, req: GetTaskRequest) -> Result<GetTaskResponse, Status> {
