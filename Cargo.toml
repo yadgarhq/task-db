@@ -19,7 +19,14 @@ description = "The task module's -db twin: the only writer of its store, serving
 # perform: it accepted any publicly-trusted certificate for any name. Nothing in
 # this estate runs it, so the refusal changes no deployment; `verify_identity`
 # is the mode that binds the connection to the engine it names.
-yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.3.0" }
+#
+# `v0.4.0` DELETES THE LAST FOUR COMPILED-IN `PoolConfig` DEFAULTS (ADR-0837,
+# ADR-0849, card C-S1): `acquire_timeout`, `idle_timeout` and `max_lifetime`
+# replace sqlx's own 30s/600s/1800s, and `operator_reserve` replaces the `5`
+# this crate's headroom check used to hard-code. `boot::pool_config` below
+# now reads all four from the environment with no fallback, the same shape
+# every other knob here already takes.
+yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.4.0" }
 # In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
 # feature on tonic itself.
 tonic = { version = "0.14", default-features = false, features = [
@@ -110,6 +117,14 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # watching. Same crate and same features yadgar-dial uses for the client half of
 # this seam.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `tests/chart_request_deadline.rs` pins `database.acquireTimeoutSeconds`'s
+# schema bound below the caller's own request deadline (card C-DB2,
+# M-audit-C): this binary never dials out, so the only reason this crate
+# names `yadgar-dial` at all is to read `default_request_timeout()` back. A
+# dev-dependency only — the shipped binary gains no new crate. No
+# `[features]` table exists on this crate to pick one of, unlike
+# `yadgar-telemetry`'s `grpc` above.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.14" }
 
 [lints.rust]
 unsafe_code = "forbid"

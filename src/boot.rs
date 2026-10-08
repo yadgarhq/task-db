@@ -43,6 +43,7 @@
 //! configuration.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use sqlx::mysql::MySqlConnectOptions;
 use yadgar_store::credentials::Secret;
@@ -141,6 +142,25 @@ const REPLICAS_CHART_KEY: &str =
 const ENGINE_MAX_CONNECTIONS_CHART_KEY: &str = "database.engineMaxConnections";
 const SSL_MODE_CHART_KEY: &str = "database.sslMode";
 
+/// `yadgar-store` v0.4.0 deleted the four `PoolConfig` fields below from its
+/// own compiled-in defaults (ADR-0837, ADR-0849, card C-DB2): sqlx's own
+/// 30s/600s/1800s acquire/idle/lifetime, and the `5` this crate's headroom
+/// check used to hard-code as `operator_reserve`. Read and named here the
+/// same way the eight knobs above already are.
+const OPERATOR_RESERVE_KEY: &str = "DB_ENGINE_OPERATOR_RESERVE";
+const OPERATOR_RESERVE_CHART_KEY: &str = "database.engineOperatorReserve";
+
+/// Bounded above by `chart/values.schema.json`'s `maximum: 29` — below the
+/// dial client's own `REQUEST_TIMEOUT` (30s), so this pool's own acquire
+/// wait can never be the deadline a caller's whole request runs against.
+/// `tests/chart_request_deadline.rs` pins the two together.
+const ACQUIRE_TIMEOUT_KEY: &str = "DB_ACQUIRE_TIMEOUT_SECONDS";
+const ACQUIRE_TIMEOUT_CHART_KEY: &str = "database.acquireTimeoutSeconds";
+const IDLE_TIMEOUT_KEY: &str = "DB_IDLE_TIMEOUT_SECONDS";
+const IDLE_TIMEOUT_CHART_KEY: &str = "database.idleTimeoutSeconds";
+const MAX_LIFETIME_KEY: &str = "DB_MAX_LIFETIME_SECONDS";
+const MAX_LIFETIME_CHART_KEY: &str = "database.maxLifetimeSeconds";
+
 /// [`env_required`], with the chart key appended to either of its two
 /// sentences (ADR-0569). `env_required` itself says only "The chart renders
 /// it" — true of every knob here, and so no help telling one apart from
@@ -191,7 +211,7 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
         return Err(BootError::ObsoleteRequireTls);
     }
 
-    // EVERY ONE OF THE EIGHT IS REQUIRED, and every one is rendered by this
+    // EVERY ONE OF THE TWELVE IS REQUIRED, and every one is rendered by this
     // repository's chart — which is the half that makes the requirement safe
     // rather than a pod that will not boot. `env_required_named`/`env_parsed`
     // at each site rather than a signature change: this function's error type
@@ -209,6 +229,30 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
             "DB_ENGINE_MAX_CONNECTIONS",
             ENGINE_MAX_CONNECTIONS_CHART_KEY,
         )?,
+        // THE OTHER HALF OF D4's ARITHMETIC (ADR-0849). It used to be `5`,
+        // compiled into `store`, and the right number depends on the engine
+        // an adopter runs and on what else connects to it — a deployment
+        // fact, same as `engine_max_connections` beside it.
+        operator_reserve: env_parsed(&env, OPERATOR_RESERVE_KEY, OPERATOR_RESERVE_CHART_KEY)?,
+        // THE THREE POOL DURATIONS `store` used to inherit from sqlx's own
+        // defaults (30s/600s/1800s) rather than state. Read as whole seconds,
+        // like every other duration this module renders, and converted once
+        // here rather than asking `store` to parse a unit it does not own.
+        acquire_timeout: Duration::from_secs(env_parsed(
+            &env,
+            ACQUIRE_TIMEOUT_KEY,
+            ACQUIRE_TIMEOUT_CHART_KEY,
+        )?),
+        idle_timeout: Duration::from_secs(env_parsed(
+            &env,
+            IDLE_TIMEOUT_KEY,
+            IDLE_TIMEOUT_CHART_KEY,
+        )?),
+        max_lifetime: Duration::from_secs(env_parsed(
+            &env,
+            MAX_LIFETIME_KEY,
+            MAX_LIFETIME_CHART_KEY,
+        )?),
         ssl_mode: parse_ssl_mode(&env_required_named(&env, SSL_MODE_KEY, SSL_MODE_CHART_KEY)?)?,
         // STILL AN OPTIONAL READ, and deliberately NOT converted to
         // `env_required` with the rest (ADR-0569). The chart renders

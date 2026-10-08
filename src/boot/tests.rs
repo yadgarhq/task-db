@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Path;
+use std::time::Duration;
 use yadgar_store::pool::MySqlSslMode;
 
 /// An environment stating only what a test cares about.
@@ -24,8 +25,10 @@ fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String
 /// from the lookup rather than from a fallback somebody left behind. The
 /// former defaults (`127.0.0.1`, `3306`, `task`, `8`, `2`, `151`,
 /// `required`) are deliberately absent from this list: a fixture repeating
-/// them could not tell a read from a leftover default.
-const RENDERED: [(&str, &str); 8] = [
+/// them could not tell a read from a leftover default. The four C-DB2
+/// entries follow the same rule against `chart/values.yaml`'s shipped `5`,
+/// `25`, `600` and `1800`.
+const RENDERED: [(&str, &str); 12] = [
     ("DB_HOST", "engine.example.invalid"),
     ("DB_PORT", "13306"),
     ("DB_NAME", "task_fixture"),
@@ -33,6 +36,10 @@ const RENDERED: [(&str, &str); 8] = [
     ("DB_MAX_CONNECTIONS", "4"),
     ("REPLICAS", "3"),
     ("DB_ENGINE_MAX_CONNECTIONS", "137"),
+    ("DB_ENGINE_OPERATOR_RESERVE", "9"),
+    ("DB_ACQUIRE_TIMEOUT_SECONDS", "11"),
+    ("DB_IDLE_TIMEOUT_SECONDS", "733"),
+    ("DB_MAX_LIFETIME_SECONDS", "2100"),
     ("DB_SSL_MODE", "verify-identity"),
 ];
 
@@ -75,6 +82,10 @@ fn config_with(mode: MySqlSslMode) -> PoolConfig {
         max_connections: 4,
         replicas: 2,
         engine_max_connections: 151,
+        operator_reserve: 5,
+        acquire_timeout: Duration::from_secs(25),
+        idle_timeout: Duration::from_secs(600),
+        max_lifetime: Duration::from_secs(1800),
         ssl_mode: mode,
         ssl_ca: None,
     }
@@ -472,13 +483,45 @@ fn an_empty_knob_refuses_with_a_message_of_its_own() {
     }
 }
 
+/// THE EMPTY PATH MUST NAME THE CHART KEY TOO, not only the variable
+/// (ADR-0569, card C-DB2) — the loop above has no chart key to check
+/// against, so it only proves the variable is named. These four do both.
+///
+/// MUTATION: `env_required_named`'s `map_err` appends the chart-key
+/// sentence to WHATEVER `env_required` returns, empty or absent alike.
+/// Special-casing it to skip the append when the sentence contains "set but
+/// EMPTY" (i.e. only appending on the absent path) turns every case here
+/// red, while leaving `every_rendered_knob_is_required_and_the_refusal_
+/// names_it` — which only exercises the absent path — green. That is
+/// exactly the gap this test exists to close: a refusal that names the
+/// chart key when a value is MISSING but not when it is EMPTY would still
+/// pass every other test in this module.
+#[test]
+fn an_empty_new_pool_knob_names_the_chart_key_too() {
+    let cases = [
+        ("DB_ENGINE_OPERATOR_RESERVE", OPERATOR_RESERVE_CHART_KEY),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", ACQUIRE_TIMEOUT_CHART_KEY),
+        ("DB_IDLE_TIMEOUT_SECONDS", IDLE_TIMEOUT_CHART_KEY),
+        ("DB_MAX_LIFETIME_SECONDS", MAX_LIFETIME_CHART_KEY),
+    ];
+    for (key, chart_key) in cases {
+        let empty = pool_config(env_with(&[(key, "")]))
+            .expect_err("an empty knob must refuse the boot")
+            .to_string();
+        assert!(
+            empty.contains(chart_key),
+            "{key}: the empty refusal must name the chart key too, not only the variable: {empty}"
+        );
+    }
+}
+
 /// AN UNPARSABLE VALUE IS A THIRD SHAPE, neither absent nor empty — a value
 /// that is THERE and is simply not a whole number. `Int(#[from]
 /// ParseIntError)` used to carry this with no key and no chart key at all,
 /// so an operator reading a crash loop learned only that SOME number was
-/// unreadable. Every one of the four parsed knobs gets its own case, because
-/// each has its own chart key and a shared assertion over all four would not
-/// prove any one of them is named correctly.
+/// unreadable. Every one of the eight parsed knobs gets its own case,
+/// because each has its own chart key and a shared assertion over all eight
+/// would not prove any one of them is named correctly.
 ///
 /// MUTATION: reverting `env_parsed`'s `raw.parse().map_err(..)` to a bare
 /// `.parse()?` (which needs `Int(#[from] ParseIntError)` restored on
@@ -494,6 +537,10 @@ fn an_unparsable_numeric_knob_names_the_variable_and_the_chart_key() {
             "DB_ENGINE_MAX_CONNECTIONS",
             ENGINE_MAX_CONNECTIONS_CHART_KEY,
         ),
+        ("DB_ENGINE_OPERATOR_RESERVE", OPERATOR_RESERVE_CHART_KEY),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", ACQUIRE_TIMEOUT_CHART_KEY),
+        ("DB_IDLE_TIMEOUT_SECONDS", IDLE_TIMEOUT_CHART_KEY),
+        ("DB_MAX_LIFETIME_SECONDS", MAX_LIFETIME_CHART_KEY),
     ];
     for (key, chart_key) in cases {
         let err = pool_config(env_with(&[(key, "abc")]))
@@ -523,7 +570,10 @@ fn an_unparsable_numeric_knob_names_the_variable_and_the_chart_key() {
 /// with a compiled-in default still sitting behind every read.
 ///
 /// The fixture holds none of the seven values this function used to default
-/// to, so each assertion below fails if any one of them came back.
+/// to, so each assertion below fails if any one of them came back. The four
+/// C-DB2 fields get the same proof against `store`'s own former defaults
+/// (30s, 600s, 1800s, `5`), which `pool_config` never read from in the first
+/// place — they lived in `yadgar-store`, not here.
 #[test]
 fn every_rendered_value_reaches_the_pool_configuration_verbatim() {
     let config = pool_config(env_with(&[])).expect("config");
@@ -535,6 +585,10 @@ fn every_rendered_value_reaches_the_pool_configuration_verbatim() {
     assert_eq!(config.max_connections, 4);
     assert_eq!(config.replicas, 3);
     assert_eq!(config.engine_max_connections, 137);
+    assert_eq!(config.operator_reserve, 9);
+    assert_eq!(config.acquire_timeout, Duration::from_secs(11));
+    assert_eq!(config.idle_timeout, Duration::from_secs(733));
+    assert_eq!(config.max_lifetime, Duration::from_secs(2100));
     assert!(matches!(config.ssl_mode, MySqlSslMode::VerifyIdentity));
 }
 

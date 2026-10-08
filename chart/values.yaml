@@ -108,13 +108,54 @@ database:
   # THE OTHER HALF OF D4's ARITHMETIC, and the reason this one is not optional.
   #
   # `store`'s `check_engine_headroom` refuses boot when
-  # maxConnections x replicas exceeds engineMaxConnections minus five, the five
-  # being what the engine keeps back so an operator can still log in. 151 is
-  # stock MariaDB's number; RDS derives max_connections from instance size, and
-  # a small instance is well under it. On an engine with a smaller ceiling the
-  # pod could not start and the operator had no value to change.
+  # maxConnections x replicas exceeds engineMaxConnections minus
+  # engineOperatorReserve below, the reserve being what the engine keeps back
+  # so an operator can still log in. 151 is stock MariaDB's number; RDS
+  # derives max_connections from instance size, and a small instance is well
+  # under it. On an engine with a smaller ceiling the pod could not start and
+  # the operator had no value to change.
   maxConnections: 8
   engineMaxConnections: 151
+
+  # THE RESERVE ITSELF (ADR-0849). `yadgar-store` compiled this in as `5`
+  # until v0.4.0 deleted it — the right number depends on the engine an
+  # adopter runs and on what else connects to it, the same reasoning as
+  # `engineMaxConnections` above.
+  #
+  # MEASURED AGAINST MariaDB 11.8.9 (`max_connections=10`, `extra_port=0`,
+  # the image default): ten non-admin sessions fill it and the eleventh is
+  # refused with 1040; one session holding `CONNECTION ADMIN` (`SUPER`)
+  # still gets in, as the eleventh, and a second admin session is refused.
+  # So the engine's OWN reserve is one admin connection above
+  # `maxConnections`, and nothing for a non-admin operator — which is what 0
+  # here would leave. `store` refuses a zero value at boot (operator ruling
+  # 2026-10-03); chart/values.schema.json's own minimum is 1 to match.
+  engineOperatorReserve: 5
+
+  # THE POOL'S OWN DURATIONS (ADR-0837). `yadgar-store` v0.4.0 deleted the
+  # three sqlx defaults these replace — 30s, 600s and 1800s — the same shape
+  # `migrationLockTimeoutSeconds` below already took for its own wait.
+  #
+  # `acquireTimeoutSeconds` IS BOUNDED 1..29 (chart/values.schema.json),
+  # below `yadgar-dial`'s `REQUEST_TIMEOUT` of 30s: `task` reaches this
+  # module over that client, and an acquire wait equal to or longer than the
+  # caller's own deadline could never surface as THIS pool's error — the
+  # caller's timeout would always land first, one hop further from the
+  # cause. 25 leaves five seconds of margin.
+  #
+  # gateway's own `AUTH_DEADLINE` (10s) and `RESOLVE_DEADLINE` (5s) bound
+  # only gateway's calls to `iam` — they are not on the `task` -> `task-db`
+  # path this bound protects. gateway -> `task` carries no deadline of its
+  # own either; it dials through `yadgar-dial` too, at that client's same
+  # default 30s.
+  # `tests/chart_request_deadline.rs` pins both numbers against each other.
+  acquireTimeoutSeconds: 25
+  # How long an idle connection is kept before the pool closes it. Replaces
+  # sqlx's own 600s default.
+  idleTimeoutSeconds: 600
+  # The age at which a connection is retired however busy it is. Replaces
+  # sqlx's own 1800s default.
+  maxLifetimeSeconds: 1800
 
   # HOW LONG A REPLICA WAITS FOR ANOTHER ONE'S MIGRATION, in seconds, before it
   # fails its boot. Rendered as DB_MIGRATION_LOCK_TIMEOUT_SECONDS and read with
