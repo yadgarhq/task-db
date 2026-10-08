@@ -77,10 +77,71 @@ fn a_malformed_db_port_names_the_variable_and_the_chart_key() {
     );
 }
 
+/// `DB_ENGINE_OPERATOR_RESERVE` is one of the four knobs card C-DB2 adds
+/// (ADR-0837, ADR-0849): `yadgar-store` v0.4.0 deleted the `5` it used to
+/// compile in, so an absent value here must refuse the boot naming both the
+/// variable and the chart key, the same shape every other required knob
+/// already takes — not silently reach for the old constant, which no longer
+/// exists to reach for.
+#[test]
+fn an_unset_db_engine_operator_reserve_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+    ]);
+    assert!(
+        stderr.contains("DB_ENGINE_OPERATOR_RESERVE"),
+        "the refusal must name the variable: {stderr}"
+    );
+    assert!(
+        stderr.contains("database.engineOperatorReserve"),
+        "the refusal must name the chart key: {stderr}"
+    );
+}
+
+/// `DB_ACQUIRE_TIMEOUT_SECONDS` is read before `DB_SSL_MODE` now, so a value
+/// that is there but unparsable reaches its own refusal with only the seven
+/// knobs ahead of it set (card C-DB2).
+#[test]
+fn a_malformed_db_acquire_timeout_seconds_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_ENGINE_OPERATOR_RESERVE", "5"),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", "abc"),
+    ]);
+    assert!(
+        stderr.contains("DB_ACQUIRE_TIMEOUT_SECONDS"),
+        "the refusal must name the variable: {stderr}"
+    );
+    assert!(
+        stderr.contains("database.acquireTimeoutSeconds"),
+        "the refusal must name the chart key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Unparsable"),
+        "the operator got the Debug variant, not the sentence: {stderr}"
+    );
+}
+
 /// `LISTEN_TLS_ENABLED` is read right after the migration lock's wait, so a
 /// full pool environment plus a usable wait reaches its own refusal and
 /// nothing later (ADR-0845; card C-DB1). Before this card, an absent value
 /// here produced a cleartext listener with no refusal at all.
+///
+/// The four C-DB2 knobs are part of that "full pool environment" now
+/// (`pool_config` reads them before `DB_SSL_MODE`), so this fixture carries
+/// them too — otherwise the refusal this test wants would never be reached.
 #[test]
 fn an_unset_listen_tls_enabled_names_the_variable_and_the_chart_key() {
     let stderr = refusal(&[
@@ -91,6 +152,10 @@ fn an_unset_listen_tls_enabled_names_the_variable_and_the_chart_key() {
         ("DB_MAX_CONNECTIONS", "4"),
         ("REPLICAS", "3"),
         ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_ENGINE_OPERATOR_RESERVE", "5"),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", "25"),
+        ("DB_IDLE_TIMEOUT_SECONDS", "600"),
+        ("DB_MAX_LIFETIME_SECONDS", "1800"),
         ("DB_SSL_MODE", "verify-identity"),
         ("DB_MIGRATION_LOCK_TIMEOUT_SECONDS", "60"),
     ]);
@@ -108,6 +173,9 @@ fn an_unset_listen_tls_enabled_names_the_variable_and_the_chart_key() {
 /// pool environment plus an unusable wait reaches that refusal and nothing
 /// later. Its variant carries fields: Debug would print `MigrationLockWait {
 /// value: "0", .. }` and name neither the variable nor the chart key.
+///
+/// The four C-DB2 knobs are part of the pool's own knobs now, so this
+/// fixture states them too (card C-DB2).
 #[test]
 fn an_unusable_migration_lock_wait_is_refused_naming_the_variable_and_the_chart_key() {
     let stderr = refusal(&[
@@ -118,6 +186,10 @@ fn an_unusable_migration_lock_wait_is_refused_naming_the_variable_and_the_chart_
         ("DB_MAX_CONNECTIONS", "4"),
         ("REPLICAS", "3"),
         ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_ENGINE_OPERATOR_RESERVE", "5"),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", "25"),
+        ("DB_IDLE_TIMEOUT_SECONDS", "600"),
+        ("DB_MAX_LIFETIME_SECONDS", "1800"),
         ("DB_SSL_MODE", "verify-identity"),
         ("DB_MIGRATION_LOCK_TIMEOUT_SECONDS", "0"),
     ]);
