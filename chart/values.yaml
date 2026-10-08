@@ -142,6 +142,12 @@ database:
   # caller's own deadline could never surface as THIS pool's error — the
   # caller's timeout would always land first, one hop further from the
   # cause. 25 leaves five seconds of margin.
+  #
+  # gateway's own `AUTH_DEADLINE` (10s) and `RESOLVE_DEADLINE` (5s) bound
+  # only gateway's calls to `iam` — they are not on the `task` -> `task-db`
+  # path this bound protects. gateway -> `task` carries no deadline of its
+  # own either; it dials through `yadgar-dial` too, at that client's same
+  # default 30s.
   # `tests/chart_request_deadline.rs` pins both numbers against each other.
   acquireTimeoutSeconds: 25
   # How long an idle connection is kept before the pool closes it. Replaces

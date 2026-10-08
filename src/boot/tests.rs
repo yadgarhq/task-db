@@ -483,6 +483,38 @@ fn an_empty_knob_refuses_with_a_message_of_its_own() {
     }
 }
 
+/// THE EMPTY PATH MUST NAME THE CHART KEY TOO, not only the variable
+/// (ADR-0569, card C-DB2) — the loop above has no chart key to check
+/// against, so it only proves the variable is named. These four do both.
+///
+/// MUTATION: `env_required_named`'s `map_err` appends the chart-key
+/// sentence to WHATEVER `env_required` returns, empty or absent alike.
+/// Special-casing it to skip the append when the sentence contains "set but
+/// EMPTY" (i.e. only appending on the absent path) turns every case here
+/// red, while leaving `every_rendered_knob_is_required_and_the_refusal_
+/// names_it` — which only exercises the absent path — green. That is
+/// exactly the gap this test exists to close: a refusal that names the
+/// chart key when a value is MISSING but not when it is EMPTY would still
+/// pass every other test in this module.
+#[test]
+fn an_empty_new_pool_knob_names_the_chart_key_too() {
+    let cases = [
+        ("DB_ENGINE_OPERATOR_RESERVE", OPERATOR_RESERVE_CHART_KEY),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", ACQUIRE_TIMEOUT_CHART_KEY),
+        ("DB_IDLE_TIMEOUT_SECONDS", IDLE_TIMEOUT_CHART_KEY),
+        ("DB_MAX_LIFETIME_SECONDS", MAX_LIFETIME_CHART_KEY),
+    ];
+    for (key, chart_key) in cases {
+        let empty = pool_config(env_with(&[(key, "")]))
+            .expect_err("an empty knob must refuse the boot")
+            .to_string();
+        assert!(
+            empty.contains(chart_key),
+            "{key}: the empty refusal must name the chart key too, not only the variable: {empty}"
+        );
+    }
+}
+
 /// AN UNPARSABLE VALUE IS A THIRD SHAPE, neither absent nor empty — a value
 /// that is THERE and is simply not a whole number. `Int(#[from]
 /// ParseIntError)` used to carry this with no key and no chart key at all,
