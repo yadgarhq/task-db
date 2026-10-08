@@ -45,7 +45,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 
-use yadgar_task_db::boot::{self, ServeTls};
+use yadgar_task_db::boot::{self, ServerTls};
 use yadgar_task_db::rotate::{self, Configuration, Presented};
 
 /// The leaf's expiry, and the issuing authority's — DELIBERATELY DIFFERENT and
@@ -176,6 +176,8 @@ fn mount() -> Mount {
         ("tls.pem", format!("{}{}", leaf.pem(), ca.pem())),
         ("tls-key.pem", key.serialize_pem()),
         ("db-ca.pem", ca.pem()),
+        // The authority a verifying listener checks CALLERS against (B-U5).
+        ("client-ca.pem", ca.pem()),
         // NOT A CERTIFICATE, and in the set for exactly the reason ADR-0523
         // gives: the process read it at boot, the chart mounts it as a DIRECTORY
         // so it can rotate, and it is baked into a pool that outlives every
@@ -201,9 +203,17 @@ fn configuration() -> Configuration {
 }
 
 /// The listener's transport built the way a DEPLOYMENT builds it — out of the
-/// three variables — rather than by assembling the struct. A test that bypassed
-/// `from_lookup` would leave the reading of those names unproven.
-fn listener(mount: &Mount) -> ServeTls {
+/// environment, through [`boot::listener`] — rather than by assembling the
+/// struct. A test that bypassed the lookup would leave the reading of those
+/// names unproven. Client auth `off`: no client CA is read, so none is watched.
+fn listener(mount: &Mount) -> ServerTls {
+    listener_with(mount, "off")
+}
+
+/// The same with a client-auth MODE. A verifying mode names `client-ca.pem`
+/// in the mount as LISTEN_TLS_CLIENT_CA_FILE; `off` names it too, which is the
+/// shape `off` beside a configured CA takes, and lifecycle drops it.
+fn listener_with(mount: &Mount, mode: &str) -> ServerTls {
     let vars = [
         ("LISTEN_TLS_ENABLED", "1".to_string()),
         (
@@ -214,8 +224,13 @@ fn listener(mount: &Mount) -> ServeTls {
             "LISTEN_TLS_KEY_FILE",
             mount.at("tls-key.pem").display().to_string(),
         ),
+        ("LISTEN_TLS_CLIENT_AUTH", mode.to_string()),
+        (
+            "LISTEN_TLS_CLIENT_CA_FILE",
+            mount.at("client-ca.pem").display().to_string(),
+        ),
     ];
-    ServeTls::from_lookup(boot::LISTEN, |key| {
+    boot::listener(|key| {
         vars.iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.to_string())
@@ -293,6 +308,33 @@ fn the_private_key_is_watched_beside_its_certificate() {
 
     assert!(watched(&inputs).contains(&"tls-key.pem".to_string()));
     assert!(watched(&inputs).contains(&"tls.pem".to_string()));
+}
+
+/// THE CLIENT CA IS WATCHED EXACTLY WHEN IT IS READ (ADR-0523, card B-U5). A
+/// verifying listener bakes the authority into its acceptor at boot, so a
+/// rotated CA bundle that nothing watched would keep verifying callers
+/// against the old authority until some unrelated restart. Under `off` the
+/// file is neither read nor watched, so the two sets differ by that one file.
+#[test]
+fn the_client_ca_is_watched_exactly_when_a_mode_verifies() {
+    let mount = mount();
+    let config = configuration();
+
+    for mode in ["required", "optional"] {
+        let verifying = listener_with(&mount, mode);
+        let inputs = rotate::watch_set(Some(&verifying), &mount.at("password"), None, &config);
+        assert!(
+            watched(&inputs).contains(&"client-ca.pem".to_string()),
+            "a verifying mode must watch the client CA it read"
+        );
+    }
+
+    let off = listener(&mount);
+    let inputs = rotate::watch_set(Some(&off), &mount.at("password"), None, &config);
+    assert!(
+        !watched(&inputs).contains(&"client-ca.pem".to_string()),
+        "`off` reads no client CA, so it must watch none"
+    );
 }
 
 #[test]

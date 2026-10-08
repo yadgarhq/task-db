@@ -20,5 +20,12 @@
 # turning TLS on costs nothing else to coalesce, and it is the shape every
 # offline render in the estate is measured against (the card's own golden
 # render, against origin/main).
+#
+# tls.clientAuth: B-U5 (ADR-0854, X-ADR-1) gives LISTEN_TLS_CLIENT_AUTH no
+# default either, and the schema requires the key. "off" is the value the
+# parent states on every server until a hop is cut over (B-P1), so it keeps
+# every offline render in the estate measuring the same pod. QUOTED: YAML
+# reads a bare off as false, which the render check refuses by name.
 tls:
   enabled: true
+  clientAuth: "off"

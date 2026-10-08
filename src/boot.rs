@@ -34,10 +34,10 @@
 //! [`probe_connect_options`] is the seam that keeps it one.
 //!
 //! **The listener is the same argument, one hop further out.** `DB_SSL_MODE`
-//! decides how this module reaches its engine; [`ServeTls`] decides what `task`
+//! decides how this module reaches its engine; [`ServerTls`] decides what `task`
 //! gets when it reaches this module. NEITHER DEFAULTS ANY MORE: `DB_SSL_MODE` is
 //! required and refuses the boot when unset (ADR-0569), and the listener's
-//! transport is a flag that is either set or absent. Both refuse rather than
+//! switch and client-auth mode are both required (ADR-0845, ADR-0854). Both refuse rather than
 //! downgrade when asked for something they cannot deliver, and neither names an
 //! issuer, a CRD or a mesh (D80) — a flag and file paths is the whole of the
 //! configuration.
@@ -56,11 +56,15 @@ use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError};
 // THE LISTENER'S TRANSPORT, in a file of its own. `boot.rs` crossed the shared
 // 500-line ceiling, and this is the seam `tests/serve_tls.rs` already names: what
 // this module SERVES on, as against the connection OUT to the engine configured
-// below. Re-exported so `boot::ServeTls`, `boot::LISTEN` and `boot::server` are
-// the same paths every caller and test already writes.
+// below. Since B-U5 the file holds only the WIRING of
+// `yadgar_lifecycle::serve_tls`; the types are lifecycle's, re-exported so
+// `boot::listener`, `boot::server` and `boot::refusal` are the paths `main` and
+// every test write.
 mod serve_tls;
 
-pub use serve_tls::{server, ServeTls, LISTEN};
+pub use serve_tls::{
+    listener, refusal, server, ClientAuth, ServeTlsError, ServerTls, LISTEN, LISTEN_CHART_KEY,
+};
 
 /// The key this module used to read, and no longer does.
 ///
@@ -268,7 +272,7 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
         // opens and cannot, so a deployment that never asked for certificate
         // verification fails to boot. Absent and empty must mean the same thing:
         // no authority named, which is what `None` is. Same shape as
-        // `ServeTls::from_lookup` below, for the same reason.
+        // the listener's own optional paths in `yadgar_lifecycle::serve_tls`.
         ssl_ca: env(SSL_CA_KEY)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -323,8 +327,8 @@ pub fn probe_connect_options(
 ///
 /// **A `map_err` RATHER THAN A `From` IMPL, deliberately.** [`BootError`] would
 /// need `From<std::io::Error>` for a bare `?` to work, and
-/// [`BootError::TlsUnreadable`] already carries an `io::Error` for an entirely
-/// different reason — so the blanket impl would let any unreadable file become a
+/// an unreadable mounted file is an `io::Error` too, for an entirely different
+/// reason — so the blanket impl would let any unreadable file become a
 /// signal-handler refusal at whatever call site next wrote `?`. One explicit
 /// conversion at the one place it is correct is the smaller claim.
 ///
@@ -354,59 +358,10 @@ pub enum BootError {
     )]
     ObsoleteRequireTls,
 
-    /// `{prefix}_TLS_ENABLED` is set, non-empty, and neither `"1"` nor `"0"`
-    /// (ADR-0845). [`BootError::MissingKnob`] already covers absent and
-    /// empty; this is the third shape — a value that is there and is simply
-    /// not one of the two this flag accepts.
-    #[error(
-        "{prefix}_TLS_ENABLED is {value:?}, which is neither \"1\" nor \"0\". Set it to \
-         \"1\" to serve TLS, or \"0\" to serve cleartext explicitly — the chart renders \
-         it as tls.enabled."
-    )]
-    TlsEnabledInvalid { prefix: &'static str, value: String },
-
-    #[error(
-        "{0}_TLS_ENABLED is set but {0}_TLS_CERT_FILE names no certificate. TLS was \
-         asked for, so this is a deployment mistake rather than a reason to open a \
-         plaintext listener — and it is NOT the same as leaving TLS off, which is the \
-         supported way to serve without one. Point {0}_TLS_CERT_FILE at the PEM \
-         certificate this module should present."
-    )]
-    NoTlsCertFile(&'static str),
-
-    #[error(
-        "{0}_TLS_ENABLED is set but {0}_TLS_KEY_FILE names no private key. A \
-         certificate without its key cannot complete a handshake, so this refuses \
-         rather than opening a plaintext listener. Point {0}_TLS_KEY_FILE at the PEM \
-         private key belonging to {0}_TLS_CERT_FILE."
-    )]
-    NoTlsKeyFile(&'static str),
-
-    #[error(
-        "the TLS {what} at {path} could not be read: {source}. TLS was asked for, so \
-         this module refuses to start rather than serving in cleartext. The usual \
-         cause is a Secret that was never mounted, or a key inside it under a \
-         different name than the chart selected."
-    )]
-    TlsUnreadable {
-        what: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(
-        "the TLS certificate at {cert} and the private key at {key} were read but \
-         refused: {detail}. Both files exist, so this is their CONTENT: a PEM that \
-         decodes to no certificate at all, or a certificate that does not belong to \
-         the key beside it — what a half-finished rotation leaves behind. This module \
-         refuses to start rather than serving in cleartext."
-    )]
-    TlsUnusable {
-        cert: PathBuf,
-        key: PathBuf,
-        detail: String,
-    },
+    // THE LISTENER'S REFUSALS ARE NOT HERE ANY MORE (card B-U5). They are
+    // `yadgar_lifecycle::serve_tls::ServeTlsError`'s, each naming the
+    // variable AND the chart key; `boot::refusal` is the sentence `main`
+    // prints for one.
 
     // NO `name` FIELD, and its loss is the one thing this module gave up to stop
     // spelling `shutdown` for itself. `yadgar_lifecycle::shutdown` installs both

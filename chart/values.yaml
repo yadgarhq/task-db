@@ -301,6 +301,11 @@ tls:
   # `chart/ci/values.yaml` sets it `true` so every shared gate that lints or
   # renders this chart offline still has a value to coalesce.
   #
+  # `tls.clientAuth` HAS NO DEFAULT EITHER (B-U5, ADR-0854): "off", "optional"
+  # or "required", quoted, rendered as LISTEN_TLS_CLIENT_AUTH whether or not
+  # TLS is on. `optional` and `required` verify a caller's certificate against
+  # `tls.clientCaSecret` / `tls.clientCaSecretKey` and need `tls.enabled: true`.
+  #
   # THE CUT-OVER ITSELF IS STILL A SEPARATE, REVERTIBLE CHOICE. `task` can
   # already dial this pod over TLS and does not by default, so turning this on
   # alone breaks the hop rather than securing it: the two flags move together,

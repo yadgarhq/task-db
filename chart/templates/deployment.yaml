@@ -311,18 +311,21 @@ spec:
             - name: LISTEN_TLS_KEY_FILE
               value: /var/run/config/serving-cert/tls.key
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") }}
-            # B-U5E EXPAND (ADR-0854), STATED AHEAD OF THE BINARY READING IT,
-            # AND ONLY WHEN TLS ITSELF IS ON: client auth is meaningless on a
-            # cleartext listener. `templates/render-checks.yaml` refuses every
-            # value but `off` until B-U5 lifts that, so this is reached only
-            # with `off`.
+            {{- if kindIs "map" .Values.tls }}
+            # HOW THIS LISTENER VERIFIES ITS CALLERS (ADR-0854, card B-U5),
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND `tls.enabled`, for the
+            # reason LISTEN_TLS_ENABLED is: the binary refuses to boot without
+            # it whether or not TLS is on, so a cleartext pod needs `off`
+            # stated rather than omitted. `templates/render-checks.yaml`
+            # refuses an absent, non-string or unknown `tls.clientAuth`, and a
+            # verifying mode with no TLS or no client CA, before this renders.
             - name: LISTEN_TLS_CLIENT_AUTH
               value: {{ .Values.tls.clientAuth | quote }}
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
-            # THE AUTHORITY this listener would check a CLIENT certificate
-            # against, once B-U5 adopts it. A PATH, never a PEM (D80), mounted
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
+            # THE AUTHORITY this listener checks a CLIENT certificate against
+            # when `tls.clientAuth` is `optional` or `required`; beside `off`
+            # the binary drops it with a warning. A PATH, never a PEM (D80), mounted
             # from its own Secret rather than `tls.certSecret`'s: the CA that
             # signs the callers' certificates is not necessarily the one that
             # signs this pod's own. TRUTHINESS, not `hasKey`: an empty
@@ -376,7 +379,7 @@ spec:
               mountPath: /var/run/config/serving-cert
               readOnly: true
             {{- end }}
-            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
             # A DIRECTORY MOUNT, never subPath, for the same reason as
             # `serving-cert` above: kubelet never refreshes a subPath mount, and
             # a rotated authority would never reach this pod.
@@ -537,8 +540,8 @@ spec:
             secretName: {{ .Values.database.sslCaSecret }}
             # REQUIRED, and this is the one place this chart does NOT copy the
             # serving certificate's `optional: true`. That argument rests on the
-            # BINARY opening the file and naming it: `ServeTls` reads its own
-            # certificate, so an empty mount produces `BootError::TlsUnreadable`
+            # BINARY opening the file and naming it: `ServerTls` reads its own
+            # certificate, so an empty mount produces a refusal
             # quoting the path. Nothing in this module opens the CA — sqlx does,
             # at connect time, and its `CertificateInput::data` returns a bare
             # `std::io::Error` from `std::fs::read` with NO path in it. The
@@ -572,8 +575,10 @@ spec:
             # unencrypted connection it was told to encrypt.
             optional: true
             # NAMED KEYS rather than the whole Secret. An issuer's Secret also
-            # carries `ca.crt`, which this pod has no use for — the CALLER is
-            # what mounts that — and selecting the two keys it does need is also
+            # carries `ca.crt`, which this mount does not take — the CALLER
+            # mounts that to verify this pod, and the authority this pod
+            # verifies CALLERS against arrives separately, through
+            # `tls.clientCaSecret` (B-U5) — and selecting the two keys it does need is also
             # what renames whatever the issuer called them to the `tls.crt` and
             # `tls.key` that LISTEN_TLS_CERT_FILE and LISTEN_TLS_KEY_FILE name.
             items:
@@ -582,9 +587,9 @@ spec:
               - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
                 path: tls.key
         {{- end }}
-        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
-        # B-U5E EXPAND (ADR-0854): the authority a CLIENT certificate would be
-        # checked against, once B-U5 adopts LISTEN_TLS_CLIENT_CA_FILE. A PATH,
+        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled .Values.tls.clientCaSecret }}
+        # THE AUTHORITY a CLIENT certificate is checked against
+        # (LISTEN_TLS_CLIENT_CA_FILE, ADR-0854, card B-U5). A PATH,
         # never a PEM (D80). NOT `optional: true`: this block renders only
         # when `tls.clientCaSecret` NAMES a Secret (truthiness, not `hasKey`
         # — see the env block above), so a mount that cannot be satisfied is

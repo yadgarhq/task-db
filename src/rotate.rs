@@ -3,9 +3,10 @@
 //!
 //! **THE WATCHER ITSELF IS NOT HERE.** `Schedule`, `Inputs`, `File`, `Presented`
 //! and `watch` are [`yadgar_lifecycle::rotate`]'s, pinned by tag like every
-//! in-org crate. What lives in this file is the only half that is this
-//! repository's own: the [`Material`] implementation naming this service's
-//! listener, and [`watch_set`], the one expression that lists everything.
+//! in-org crate, and so — since B-U5 — is the [`Material`] implementation for
+//! the listener's `ServerTls`. What lives in this file is the only half that is
+//! this repository's own: [`watch_set`], the one expression that lists
+//! everything.
 //!
 //! # Why this service needed it, and why it did not have it
 //!
@@ -29,7 +30,9 @@
 //! whatever the bytes mean. Four materials:
 //!
 //! - the listener's certificate AND its private key — both halves, or the pair
-//!   rotates half-watched;
+//!   rotates half-watched — and, when `LISTEN_TLS_CLIENT_AUTH` verifies, the
+//!   client CA it verifies callers against. lifecycle's impl watches the CA
+//!   exactly when it reads it;
 //! - **the database password**, which is not a certificate and is the member
 //!   with no other signal at all. It is read once by
 //!   `CredentialSource::SecretFile` and baked into a pool that lives as long as
@@ -59,22 +62,13 @@ pub use yadgar_lifecycle::rotate::{
     CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
-use crate::boot::ServeTls;
+// NO LOCAL `impl Material` FOR THE LISTENER ANY MORE (card B-U5). The type is
+// `yadgar_lifecycle::serve_tls::ServerTls`, and lifecycle implements the trait
+// for it: the certificate, its key, and the client CA exactly when a mode
+// verifies. A second impl here would not compile (orphan rule), and a copy
+// that forgot the CA is the defect the lift removes.
 use crate::service::SERVICE;
-
-/// The listener's certificate and the private key belonging to it.
-///
-/// **Both halves, or the pair rotates half-watched.** kubelet swaps a mount
-/// atomically, so a set holding only the certificate still fires on an ordinary
-/// rotation — but a deployment that rewrites the key alone would pass unnoticed.
-impl Material for ServeTls {
-    fn files(&self) -> Vec<File<'_>> {
-        vec![
-            File::certificate(Presented::Serving, self.cert_file()),
-            File::read(self.key_file()),
-        ]
-    }
-}
+use yadgar_lifecycle::serve_tls::ServerTls;
 
 /// Everything this deployment read at boot, hashed as it was read.
 ///
@@ -106,8 +100,9 @@ impl Material for ServeTls {
 /// Collecting paths and reading them when the watcher first polls would put the
 /// rest of boot inside a window where a kubelet swap quietly becomes the
 /// baseline, and the real rotation would never be noticed.
+// ADR-0523-LIBRARY-WATCHED: yadgar_lifecycle::serve_tls::ServerTls
 pub fn watch_set(
-    listener: Option<&ServeTls>,
+    listener: Option<&ServerTls>,
     db_password: &Path,
     db_ssl_ca: Option<&Path>,
     config: &Configuration,

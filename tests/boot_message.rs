@@ -169,6 +169,43 @@ fn an_unset_listen_tls_enabled_names_the_variable_and_the_chart_key() {
     );
 }
 
+/// `LISTEN_TLS_CLIENT_AUTH` is read beside the switch, and an explicit
+/// cleartext switch does NOT excuse it (ADR-0854, card B-U5): deleting the
+/// variable is a boot refusal, never a way to turn verification off. The
+/// refusal reaches the operator as lifecycle's sentence, naming the variable
+/// and the chart key, and not as the `ClientAuthMissing` variant name.
+#[test]
+fn an_unset_listen_tls_client_auth_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_ENGINE_OPERATOR_RESERVE", "5"),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", "25"),
+        ("DB_IDLE_TIMEOUT_SECONDS", "600"),
+        ("DB_MAX_LIFETIME_SECONDS", "1800"),
+        ("DB_SSL_MODE", "verify-identity"),
+        ("DB_MIGRATION_LOCK_TIMEOUT_SECONDS", "60"),
+        ("LISTEN_TLS_ENABLED", "0"),
+    ]);
+    assert!(
+        stderr.contains("LISTEN_TLS_CLIENT_AUTH is not set"),
+        "the refusal must name the variable"
+    );
+    assert!(
+        stderr.contains("`tls.clientAuth`"),
+        "the refusal must name the chart key"
+    );
+    assert!(
+        !stderr.contains("ClientAuthMissing"),
+        "the operator got the Debug variant, not the sentence"
+    );
+}
+
 /// The migration lock's wait is read right after the pool's knobs, so a full
 /// pool environment plus an unusable wait reaches that refusal and nothing
 /// later. Its variant carries fields: Debug would print `MigrationLockWait {
