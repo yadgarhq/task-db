@@ -121,6 +121,63 @@ fn env_required(env: &impl Fn(&str) -> Option<String>, key: &str) -> Result<Stri
     }
 }
 
+/// The chart key behind each of [`pool_config`]'s required knobs, in the
+/// order `pool_config` reads them.
+///
+/// Named here rather than inlined at each call site, so a reader can find
+/// the whole mapping in one place rather than assembling it from eight
+/// scattered string literals. `REPLICAS` has no single key: the chart picks
+/// `autoscaling.maxReplicas` or `replicaCount` depending on
+/// `autoscaling.enabled` (see `chart/templates/deployment.yaml`), and the
+/// sentence says so rather than naming only one of the two and being wrong
+/// half the time.
+const HOST_CHART_KEY: &str = "database.host";
+const PORT_CHART_KEY: &str = "database.port";
+const NAME_CHART_KEY: &str = "database.name";
+const USER_CHART_KEY: &str = "database.user";
+const MAX_CONNECTIONS_CHART_KEY: &str = "database.maxConnections";
+const REPLICAS_CHART_KEY: &str =
+    "autoscaling.maxReplicas (when autoscaling.enabled is true) or replicaCount";
+const ENGINE_MAX_CONNECTIONS_CHART_KEY: &str = "database.engineMaxConnections";
+const SSL_MODE_CHART_KEY: &str = "database.sslMode";
+
+/// [`env_required`], with the chart key appended to either of its two
+/// sentences (ADR-0569). `env_required` itself says only "The chart renders
+/// it" — true of every knob here, and so no help telling one apart from
+/// another in a crash loop. `lock::migration_lock` already appends its own
+/// chart key by hand at its one call site; `pool_config` has eight, so the
+/// append is a function instead of eight repeated `format!`s.
+fn env_required_named(
+    env: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    chart_key: &str,
+) -> Result<String, BootError> {
+    env_required(env, key).map_err(|sentence| {
+        BootError::MissingKnob(format!("{sentence} Set the chart value {chart_key}."))
+    })
+}
+
+/// The same knob, parsed as a whole number, naming both the variable and the
+/// chart key in the PARSE refusal too — which bare `.parse()?` never did.
+/// [`BootError::Unparsable`] is the whole of what this adds over
+/// [`env_required_named`].
+fn env_parsed<T>(
+    env: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    chart_key: &'static str,
+) -> Result<T, BootError>
+where
+    T: std::str::FromStr<Err = std::num::ParseIntError>,
+{
+    let raw = env_required_named(env, key, chart_key)?;
+    raw.parse().map_err(|source| BootError::Unparsable {
+        key,
+        chart_key,
+        value: raw.clone(),
+        source,
+    })
+}
+
 /// Read the pool configuration, refusing rather than guessing.
 ///
 /// Takes the environment as a lookup rather than reading it directly, so a test
@@ -136,29 +193,23 @@ pub fn pool_config(env: impl Fn(&str) -> Option<String>) -> Result<PoolConfig, B
 
     // EVERY ONE OF THE EIGHT IS REQUIRED, and every one is rendered by this
     // repository's chart — which is the half that makes the requirement safe
-    // rather than a pod that will not boot. `map_err` at each site rather than a
-    // signature change: this function's error type is `BootError` and its callers
-    // read it, so the refusal joins the enum as one more sentence instead of
-    // becoming a second error type beside it.
+    // rather than a pod that will not boot. `env_required_named`/`env_parsed`
+    // at each site rather than a signature change: this function's error type
+    // is `BootError` and its callers read it, so the refusal joins the enum
+    // as one more sentence instead of becoming a second error type beside it.
     Ok(PoolConfig {
-        host: env_required(&env, "DB_HOST").map_err(BootError::MissingKnob)?,
-        port: env_required(&env, "DB_PORT")
-            .map_err(BootError::MissingKnob)?
-            .parse()?,
-        database: env_required(&env, "DB_NAME").map_err(BootError::MissingKnob)?,
-        username: env_required(&env, "DB_USER").map_err(BootError::MissingKnob)?,
-        max_connections: env_required(&env, "DB_MAX_CONNECTIONS")
-            .map_err(BootError::MissingKnob)?
-            .parse()?,
-        replicas: env_required(&env, "REPLICAS")
-            .map_err(BootError::MissingKnob)?
-            .parse()?,
-        engine_max_connections: env_required(&env, "DB_ENGINE_MAX_CONNECTIONS")
-            .map_err(BootError::MissingKnob)?
-            .parse()?,
-        ssl_mode: parse_ssl_mode(
-            &env_required(&env, SSL_MODE_KEY).map_err(BootError::MissingKnob)?,
+        host: env_required_named(&env, "DB_HOST", HOST_CHART_KEY)?,
+        port: env_parsed(&env, "DB_PORT", PORT_CHART_KEY)?,
+        database: env_required_named(&env, "DB_NAME", NAME_CHART_KEY)?,
+        username: env_required_named(&env, "DB_USER", USER_CHART_KEY)?,
+        max_connections: env_parsed(&env, "DB_MAX_CONNECTIONS", MAX_CONNECTIONS_CHART_KEY)?,
+        replicas: env_parsed(&env, "REPLICAS", REPLICAS_CHART_KEY)?,
+        engine_max_connections: env_parsed(
+            &env,
+            "DB_ENGINE_MAX_CONNECTIONS",
+            ENGINE_MAX_CONNECTIONS_CHART_KEY,
         )?,
+        ssl_mode: parse_ssl_mode(&env_required_named(&env, SSL_MODE_KEY, SSL_MODE_CHART_KEY)?)?,
         // STILL AN OPTIONAL READ, and deliberately NOT converted to
         // `env_required` with the rest (ADR-0569). The chart renders
         // DB_SSL_CA_FILE only under `database.sslCaSecret`, so requiring it would
@@ -246,8 +297,8 @@ pub fn shutdown() -> Result<impl std::future::Future<Output = ()>, BootError> {
 pub enum BootError {
     #[error(
         "DB_REQUIRE_TLS is set and this binary no longer reads it. Set DB_SSL_MODE \
-         instead — one of: disabled, preferred, required, verify_ca, verify_identity \
-         (default: required). Refusing at boot rather than ignoring the key, because \
+         instead — one of: disabled, preferred, required, verify_ca, verify_identity. \
+         Refusing at boot rather than ignoring the key, because \
          an operator who set it is asking for a transport guarantee, and silently \
          substituting a default is the one outcome worse than stopping. \
          DB_REQUIRE_TLS was a boolean and could not ask for certificate \
@@ -258,6 +309,17 @@ pub enum BootError {
          or neither."
     )]
     ObsoleteRequireTls,
+
+    /// `{prefix}_TLS_ENABLED` is set, non-empty, and neither `"1"` nor `"0"`
+    /// (ADR-0845). [`BootError::MissingKnob`] already covers absent and
+    /// empty; this is the third shape — a value that is there and is simply
+    /// not one of the two this flag accepts.
+    #[error(
+        "{prefix}_TLS_ENABLED is {value:?}, which is neither \"1\" nor \"0\". Set it to \
+         \"1\" to serve TLS, or \"0\" to serve cleartext explicitly — the chart renders \
+         it as tls.enabled."
+    )]
+    TlsEnabledInvalid { prefix: &'static str, value: String },
 
     #[error(
         "{0}_TLS_ENABLED is set but {0}_TLS_CERT_FILE names no certificate. TLS was \
@@ -359,8 +421,23 @@ pub enum BootError {
     #[error(transparent)]
     Pool(#[from] PoolError),
 
-    #[error(transparent)]
-    Int(#[from] std::num::ParseIntError),
+    /// A required knob is set, non-empty, and not a whole number
+    /// (ADR-0569). [`BootError::MissingKnob`] already covers absent and
+    /// empty; this is the shape neither of those two is — a value that is
+    /// THERE and cannot be parsed, which `Int(#[from] ParseIntError)` used
+    /// to carry with no key and no chart key, so the operator learned only
+    /// that SOME number was unreadable and never which one.
+    #[error(
+        "{key} is {value:?}, which is not a whole number. Set the chart value \
+         {chart_key} to a plain integer. Why: {source}"
+    )]
+    Unparsable {
+        key: &'static str,
+        chart_key: &'static str,
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
 }
 
 mod lock;

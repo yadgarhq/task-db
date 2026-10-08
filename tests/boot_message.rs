@@ -55,6 +55,55 @@ fn the_obsolete_tls_key_is_refused_with_its_sentence_not_its_variant_name() {
     );
 }
 
+/// `DB_PORT` is the first PARSED knob `pool_config` reads, so a malformed
+/// value there needs only `DB_HOST` set beside it to reach its own refusal
+/// (ledgers 1257, 748; card C-DB1). Today's `Int(#[from] ParseIntError)`
+/// would have printed the bare parse error with neither the key nor the
+/// chart key in it.
+#[test]
+fn a_malformed_db_port_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[("DB_HOST", "engine.example.invalid"), ("DB_PORT", "abc")]);
+    assert!(
+        stderr.contains("DB_PORT"),
+        "the refusal must name the variable: {stderr}"
+    );
+    assert!(
+        stderr.contains("database.port"),
+        "the refusal must name the chart key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Unparsable"),
+        "the operator got the Debug variant, not the sentence: {stderr}"
+    );
+}
+
+/// `LISTEN_TLS_ENABLED` is read right after the migration lock's wait, so a
+/// full pool environment plus a usable wait reaches its own refusal and
+/// nothing later (ADR-0845; card C-DB1). Before this card, an absent value
+/// here produced a cleartext listener with no refusal at all.
+#[test]
+fn an_unset_listen_tls_enabled_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_SSL_MODE", "verify-identity"),
+        ("DB_MIGRATION_LOCK_TIMEOUT_SECONDS", "60"),
+    ]);
+    assert!(
+        stderr.contains("LISTEN_TLS_ENABLED"),
+        "the refusal must name the variable: {stderr}"
+    );
+    assert!(
+        stderr.contains("tls.enabled"),
+        "the refusal must name the chart key: {stderr}"
+    );
+}
+
 /// The migration lock's wait is read right after the pool's knobs, so a full
 /// pool environment plus an unusable wait reaches that refusal and nothing
 /// later. Its variant carries fields: Debug would print `MigrationLockWait {

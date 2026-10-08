@@ -1,0 +1,24 @@
+# THIS CHART'S CI OVERRIDE (C-A2). Read by `chart_values_override.py`, which
+# every shared gate that lints or renders this chart OFFLINE passes as `-f`:
+# `helm-lint`, `d80_portability.py` and `service_immutable.py` in
+# yadgarhq/actions, and this repository's own `scripts/tests/`. helm itself
+# never looks for this path — it is this chart's own declaration, the same
+# shape `chart/ci/api-versions.txt` already is for the operator API groups a
+# chart's defaults need.
+#
+# A CHART WITH NO SUCH FILE SEES NO DIFFERENCE, which is why this file exists
+# at all rather than widening `chart/values.yaml`'s own defaults: the key
+# below carries NO default in the shipped chart (ADR-0845, C-DB1), so a gate
+# that renders or lints offline with no override would refuse every such
+# render for a contract it was never told about.
+#
+# tls.enabled: ADR-0845 deleted the binary's compiled-in default for
+# LISTEN_TLS_ENABLED, and `chart/values.schema.json` marks `tls.enabled`
+# `required` to match. `true` is chosen over `false` because it is the
+# NEUTRAL choice for every other gate in this file: `tls.certSecret` already
+# ships a real Secret name in `chart/values.yaml` regardless of this flag, so
+# turning TLS on costs nothing else to coalesce, and it is the shape every
+# offline render in the estate is measured against (the card's own golden
+# render, against origin/main).
+tls:
+  enabled: true

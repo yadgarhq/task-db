@@ -114,6 +114,15 @@ list rather than reconstructing it:
     Service, a ServiceAccount and a PodDisruptionBudget. It asserts instead that
     they render no object of the checked group, and `test_mariadb.py` carries the
     count those four objects are asserted against.
+  - `render()` now passes `-f <chart>/ci/values.yaml` ahead of every other
+    argument, when that file exists under the chart being rendered (ADR-0845,
+    C-DB1). `tls.enabled` carries no default in the shipped chart any more,
+    so a bare render of the real chart — or of a `shutil.copytree(CHART, ...)`
+    copy of it, which carries the same `ci/` directory — needs this to reach
+    anything past the schema's own refusal. `two_check_fixture` builds a
+    schema-less throwaway chart with no `ci/` directory, so it sees no
+    difference; `probe_capability`'s own one-template chart calls `helm()`
+    directly rather than `render()` and is untouched either way.
 
 Run: python3 -m pytest scripts/tests/ -q
 """
@@ -457,7 +466,16 @@ def red_api_versions(declared: Iterable[str], under_test: str) -> tuple[str, ...
 
 
 def render(chart: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return helm("template", CHART_NAME, str(chart), *arguments)
+    # `-f <chart>/ci/values.yaml` FIRST, WHEN IT EXISTS (ADR-0845, C-DB1):
+    # `tls.enabled` carries no default any more, so a bare render of the real
+    # chart needs this override to reach anything past the schema refusal.
+    # `chart` may be a `shutil.copytree(CHART, ...)` copy — which carries the
+    # same `ci/` directory — or one of this file's own minimal, schema-less
+    # fixtures, which has no `ci/` directory and so gets no flag: deviation
+    # from the `yadgarhq/platform` reference this file is copied from.
+    ci_values = chart / "ci" / "values.yaml"
+    override = ("-f", str(ci_values)) if ci_values.is_file() else ()
+    return helm("template", CHART_NAME, str(chart), *override, *arguments)
 
 
 def objects(stdout: str) -> list[dict]:
@@ -1453,4 +1471,296 @@ def test_the_autoscaling_shape_refusal_does_not_quote_a_raise():
             f"`templates/render-checks.yaml` contains {marker!r}, which is how a "
             f"refusal is told apart from a raise — a refusal carrying it makes that "
             f"discrimination false-green"
+        )
+
+
+# ══ C-DB1 (ADR-0845, ADR-0854): `tls.enabled` RENDERS UNCONDITIONALLY, AND THE ══
+# ══ B-U5E CLIENT-AUTH EXPAND ════════════════════════════════════════════════
+
+# THE TWO ARMS THAT GUARD `tls` ITSELF, mirroring `AUTOSCALING_SHAPE_ARMS`. The
+# `enabled` key's own absence/type is the SCHEMA's job now (ADR-0845 gave it
+# `type: boolean` and `required: [enabled]`, unlike `autoscaling.enabled`, which
+# carries neither) — `scripts/tests/test_values_schema.py` holds those cases.
+# These two are what the schema CANNOT catch, because the root `tls` property
+# carries no `type: object` (ADR-0850's own `database` has one; `tls` does not,
+# matching `autoscaling`): a non-map `tls` passes schema validation and would
+# crash `templates/deployment.yaml` without this guard.
+TLS_MAP_SHAPE_ARMS = {
+    "tls-absent": (
+        "`tls` is absent from the values",
+        '{{- if not (hasKey .Values "tls") }}',
+    ),
+    "tls-not-map": (
+        "`tls` must be a map",
+        '{{- if not (kindIs "map" .Values.tls) }}',
+    ),
+}
+
+
+def test_tls_block_deleted_is_refused_naming_tls(tmp_path):
+    """`tls:` with no value deletes the whole block THIS chart's `values.yaml`
+    declares (it still carries `certSecret` etc.), which is the one shape
+    `hasKey` sees as truly absent rather than merely unset.
+    """
+    result = render(CHART, "--set", "tls=null")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-absent"][0] in result.stderr, result.stderr
+
+
+def test_tls_not_a_map_is_refused_naming_tls(tmp_path):
+    result = render_the_shape(CHART, 'tls: "x"\n', tmp_path / "tls-not-map")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-not-map"][0] in result.stderr, result.stderr
+
+
+def test_stripping_each_tls_map_arm_reddens_its_own_shape(tmp_path):
+    """Mirrors `test_stripping_each_autoscaling_arm_...`: each arm removed in
+    turn, and the shape it alone owns must stop being refused for its reason.
+    """
+    owners = {
+        "tls-absent": ("tls=null",),
+        "tls-not-map": ('tls: "x"\n',),
+    }
+    for arm, (phrase, opening) in sorted(TLS_MAP_SHAPE_ARMS.items()):
+        copy = tmp_path / arm / "chart"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(CHART, copy)
+        template = copy / "templates" / "render-checks.yaml"
+        template.write_text(strip_arm(template.read_text(), opening))
+
+        if arm == "tls-absent":
+            result = render(copy, "--set", "tls=null")
+        else:
+            result = render_the_shape(copy, owners[arm][0], tmp_path / arm / "renders")
+        assert phrase not in result.stderr, (
+            f"the {arm} arm was stripped and the shape it owns still named it: "
+            f"{result.stderr}"
+        )
+
+
+def test_tls_map_shape_refusals_do_not_quote_a_raise():
+    text = (CHART / "templates" / "render-checks.yaml").read_text()
+    for arm, (phrase, _opening) in sorted(TLS_MAP_SHAPE_ARMS.items()):
+        assert phrase in text, f"the {arm} arm's message is not in the template: {phrase!r}"
+    for marker in RAISE_MARKERS:
+        assert marker not in text, (
+            f"`templates/render-checks.yaml` contains {marker!r}: a refusal "
+            f"carrying it makes the raise/refusal discrimination false-green"
+        )
+
+
+def rendered_env_value(stdout: str, variable: str) -> str | None:
+    """The rendered VALUE line right after `- name: <variable>` in a
+    Deployment's env list, whitespace trimmed, or `None` if it is not
+    rendered at all. Whitespace-tolerant (unlike a literal substring match)
+    because the env list is indented to match its container block.
+    """
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == f"- name: {variable}":
+            return lines[i + 1].strip()
+    return None
+
+
+def test_listen_tls_enabled_renders_unconditionally_as_1_when_true(tmp_path):
+    result = render(CHART, "--set", "tls.enabled=true")
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "1"'
+
+
+def test_listen_tls_enabled_renders_unconditionally_as_0_when_false(tmp_path):
+    """THE DEFECT THIS CARD REMOVES: before it, `tls.enabled=false` rendered NO
+    `LISTEN_TLS_ENABLED` at all, and the binary's own compiled-in default
+    silently supplied cleartext. After it, the chart states "0" rather than
+    omitting the variable, so the binary's refusal (absent/empty) can never
+    fire for a deployment that correctly asked for cleartext.
+    """
+    result = render(CHART, "--set", "tls.enabled=false")
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
+
+
+def test_removing_deployments_own_tls_guard_still_renders_safely(tmp_path):
+    """THE GUARD `templates/deployment.yaml` carries on its OWN read of
+    `tls.enabled` is BELT AND BRACES, not the only line of defence this card
+    relies on, and this is the measured reason: unlike `scaledobject.yaml`
+    (`test_removing_the_scaledobject_guard_raises_instead_of_refusing`),
+    stripping it does NOT put a raw Go template crash back for this chart —
+    `templates/render-checks.yaml`'s own `tls`-not-map arm reaches `tls: "x"`
+    first regardless, measured on this tree's helm. This records that
+    measurement rather than asserting the opposite result the autoscaling
+    case happens to show; the guard is kept in `deployment.yaml` anyway, both
+    because a future helm release's rendering order is not a thing this
+    chart controls and because `kindIs "map"` is one `and` clause, not a
+    maintenance burden.
+    """
+    copy = tmp_path / "chart"
+    shutil.copytree(CHART, copy)
+    template = copy / "templates" / "deployment.yaml"
+    text = template.read_text()
+    guarded = (
+        'value: {{ ternary "1" "0" (and (kindIs "map" .Values.tls) '
+        '.Values.tls.enabled) | quote }}'
+    )
+    assert guarded in text, "the guard this case strips is no longer in deployment.yaml"
+    text = text.replace(guarded, 'value: {{ ternary "1" "0" .Values.tls.enabled | quote }}')
+    template.write_text(text)
+
+    result = render_the_shape(copy, 'tls: "x"\n', tmp_path / "renders")
+    assert result.returncode != 0
+    assert TLS_MAP_SHAPE_ARMS["tls-not-map"][0] in result.stderr, result.stderr
+
+
+# ── B-U5E: `tls.clientAuth`, `tls.clientCaSecret`, `tls.clientCaSecretKey` ───
+#
+# EVERY CASE HERE USES `-f` (a values FILE), NEVER `--set` (B-U5E-convention.md
+# item 6): `--set tls.clientAuth=off` and a values file's bare `clientAuth: off`
+# are not provably the same input to helm's YAML layer, and the unquoted-off
+# refusal below exists ONLY for the file shape. A file is also what every
+# adopter actually writes.
+
+
+def test_client_auth_absent_renders_neither_variable(tmp_path):
+    result = render_the_shape(CHART, "tls:\n  enabled: true\n", tmp_path / "absent")
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_AUTH" not in result.stdout
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+
+
+def test_client_auth_off_renders_the_variable(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "off"\n', tmp_path / "off"
+    )
+    assert result.returncode == 0, result.stderr
+    assert rendered_env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+
+
+def test_client_auth_unquoted_off_is_refused_naming_the_key(tmp_path):
+    """B-U5E-convention.md item 1: YAML 1.1 reads a bare `off` as the boolean
+    `false`, so a values file writing it unquoted must be refused BY NAME
+    rather than reaching the `eq` comparisons below it — which, against a
+    bool, raise a bare Go template "incompatible types" error instead.
+    """
+    result = render_the_shape(CHART, "tls:\n  enabled: true\n  clientAuth: off\n", tmp_path / "bare-off")
+    assert result.returncode != 0
+    assert "must be a quoted string" in result.stderr, result.stderr
+    assert 'write `clientAuth: "off"`' in result.stderr, result.stderr
+    for marker in RAISE_MARKERS:
+        assert marker not in result.stderr, (
+            f"the unquoted `off` raised rather than refused by name: {result.stderr}"
+        )
+
+
+def test_client_auth_optional_is_refused_as_not_enforced_yet(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "optional"\n', tmp_path / "optional"
+    )
+    assert result.returncode != 0
+    assert "is not enforced yet" in result.stderr, result.stderr
+    assert "optional" in result.stderr, result.stderr
+
+
+def test_client_auth_required_is_refused_as_not_enforced_yet(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "required"\n', tmp_path / "required"
+    )
+    assert result.returncode != 0
+    assert "is not enforced yet" in result.stderr, result.stderr
+    assert "required" in result.stderr, result.stderr
+
+
+def test_client_auth_bad_mode_is_refused(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: true\n  clientAuth: "maybe"\n', tmp_path / "bad-mode"
+    )
+    assert result.returncode != 0
+    assert "must be `off`, `optional` or `required`" in result.stderr, result.stderr
+
+
+def test_client_ca_secret_renders_the_file_and_the_mount(tmp_path):
+    result = render_the_shape(
+        CHART,
+        'tls:\n  enabled: true\n  clientAuth: "off"\n  clientCaSecret: peer-ca\n'
+        "  clientCaSecretKey: ca.crt\n",
+        tmp_path / "client-ca",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        rendered_env_value(result.stdout, "LISTEN_TLS_CLIENT_CA_FILE")
+        == "value: /var/run/config/client-ca/ca.crt"
+    )
+    assert "name: client-ca" in result.stdout
+    assert 'secretName: "peer-ca"' in result.stdout
+
+
+def test_client_ca_secret_empty_renders_neither_mount_nor_file(tmp_path):
+    """B-U5E-convention.md item 4: gated on TRUTHINESS, not `hasKey` — an
+    explicit empty string names no Secret, the same rule
+    `database.sslCaSecret` already follows.
+    """
+    result = render_the_shape(
+        CHART,
+        'tls:\n  enabled: true\n  clientAuth: "off"\n  clientCaSecret: ""\n',
+        tmp_path / "empty-ca",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert "name: client-ca" not in result.stdout
+
+
+def test_client_ca_secret_without_client_auth_renders_nothing(tmp_path):
+    """B-U5E-convention.md item 3's OTHER half, and the mutation this proves:
+    the CA env/mount/volume are gated on `hasKey .Values.tls "clientAuth"`
+    AS WELL AS `tls.clientCaSecret`'s truthiness — naming a Secret alone,
+    with no `clientAuth` key at all, must render nothing. Without this case,
+    dropping the `hasKey` clause from those three gates (leaving only the
+    `clientCaSecret` truthiness test) would pass every other test in this
+    file: `test_client_ca_secret_renders_the_file_and_the_mount` always sets
+    `clientAuth` too, and `test_client_ca_secret_empty_renders_neither_mount_
+    nor_file` never names a Secret at all.
+    """
+    result = render_the_shape(
+        CHART,
+        "tls:\n  enabled: true\n  clientCaSecret: peer-ca\n  clientCaSecretKey: ca.crt\n",
+        tmp_path / "ca-without-client-auth",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert "name: client-ca" not in result.stdout
+
+
+def test_client_auth_present_but_tls_disabled_renders_nothing(tmp_path):
+    """B-U5E-convention.md item 3: client auth is nested under `tls.enabled`
+    too — stating a mode while TLS itself is off renders nothing, though the
+    SHAPE is still validated (a bad mode is refused regardless, proven by
+    `test_client_auth_bad_mode_is_refused_even_with_tls_disabled` below).
+    """
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: false\n  clientAuth: "off"\n', tmp_path / "tls-off"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "LISTEN_TLS_CLIENT_AUTH" not in result.stdout
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+
+
+def test_client_auth_bad_mode_is_refused_even_with_tls_disabled(tmp_path):
+    result = render_the_shape(
+        CHART, 'tls:\n  enabled: false\n  clientAuth: "maybe"\n', tmp_path / "tls-off-bad-mode"
+    )
+    assert result.returncode != 0
+    assert "must be `off`, `optional` or `required`" in result.stderr, result.stderr
+
+
+def test_client_auth_shape_refusals_do_not_quote_a_raise():
+    text = (CHART / "templates" / "render-checks.yaml").read_text()
+    for phrase in (
+        "must be a quoted string",
+        "is not enforced yet",
+        "must be `off`, `optional` or `required`",
+    ):
+        assert phrase in text, f"the client-auth message is not in the template: {phrase!r}"
+    for marker in RAISE_MARKERS:
+        assert marker not in text, (
+            f"`templates/render-checks.yaml` contains {marker!r}: a refusal "
+            f"carrying it makes the raise/refusal discrimination false-green"
         )

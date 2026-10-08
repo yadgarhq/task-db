@@ -49,6 +49,7 @@ REPO = Path(__file__).resolve().parents[2]
 CHART = REPO / "chart"
 SCHEMA_PATH = CHART / "values.schema.json"
 VALUES_PATH = CHART / "values.yaml"
+CI_VALUES_PATH = CHART / "ci" / "values.yaml"
 
 # THE EXACT SET OF PATHS THIS SCHEMA LEAVES OPEN (a bare `{}` where `values.yaml`
 # itself holds a MAPPING) — the per-chart table's "Open" column for the -db twins.
@@ -68,6 +69,25 @@ OPEN_PATHS = {
 EXTRA_PATHS = {
     ("image", "digest"),
     ("networkPolicy", "scrapeFrom", "namespace"),
+    # B-U5E (ADR-0854), folded into C-DB1: declared so an adopter's override is
+    # validated by the closure, but `values.yaml` ships none of the three —
+    # the binary does not read them until B-U5 adopts LISTEN_TLS_CLIENT_AUTH.
+    ("tls", "clientAuth"),
+    ("tls", "clientCaSecret"),
+    ("tls", "clientCaSecretKey"),
+}
+
+# THE EXACT SET OF SCHEMA LEAVES THIS CHART REQUIRES AND SHIPS NO DEFAULT FOR
+# (ADR-0845, C-DB1). `tls.enabled` is neither OPEN nor an EXTRA: it is a typed,
+# `required` leaf that `values.yaml` deliberately does not declare, so the
+# extras check below must not demand it appear in `EXTRA_PATHS` — doing that
+# would blur "deliberately undeclared, no constraint" with "deliberately
+# undeclared, and an adopter MUST choose". `test_values_yaml_ships_no_tls_
+# enabled_default` and `test_every_required_no_default_key_is_required_in_
+# the_schema` are this set's own two-sided proof: absent from `values.yaml`,
+# present and `required` in the schema.
+REQUIRED_NO_DEFAULT = {
+    ("tls", "enabled"),
 }
 
 # THE TWO MESSAGE SHAPES MEASURED: 3.20.2 and 4.3.0 (this builder's own pair,
@@ -84,6 +104,64 @@ REFUSAL_DOTTED_PATH = re.compile(
     r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+Additional propert(?:y|ies)\s+(\S+)\s+(?:is|are)\s+not allowed",
     re.MULTILINE,
 )
+
+# THE TWO SHAPES OF A SCHEMA `required`/`type` REFUSAL (ADR-0845, C-DB1),
+# MEASURED THE SAME WAY as the pair above, on the same three helm versions,
+# against `tls.enabled` specifically (`type: boolean`, `required: [enabled]`
+# — the one leaf this card adds either keyword to):
+#
+#   type mismatch   (4.3.0, 3.20.2) "- at '/tls/enabled': got string, want boolean"
+#                    (3.18.4)       "- tls.enabled: Invalid type. Expected: boolean, given: string"
+#   missing property (4.3.0, 3.20.2) "- at '/tls': missing property 'enabled'"
+#                    (3.18.4)       "- tls: enabled is required"
+#
+# Both are parsed into the SAME (path-segment-tuple, key) shape `extract_refusal`
+# already uses, so `test_tls_enabled_*` below compares that shape and never the
+# sentence (correction 3: a schema refusal is asserted on key and path only).
+REFUSAL_SLASH_TYPE = re.compile(r"at '([^']*)': got \S+, want \S+")
+REFUSAL_DOTTED_TYPE = re.compile(
+    r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+Invalid type\.", re.MULTILINE
+)
+REFUSAL_SLASH_MISSING = re.compile(r"at '([^']*)': missing property '([^']+)'")
+REFUSAL_DOTTED_MISSING = re.compile(
+    r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+(\S+) is required", re.MULTILINE
+)
+
+
+def extract_type_or_missing_refusal(stderr: str) -> tuple[tuple[str, ...], str] | None:
+    """The JSON path and the leaf key out of a schema `type` or `required`
+    refusal, on EITHER measured helm shape. Mirrors `extract_refusal`, for the
+    two shapes that one does not parse (see the regexes' own comment).
+    """
+    match = REFUSAL_SLASH_TYPE.search(stderr)
+    if match:
+        raw_path = match.group(1).strip("/")
+        segments = tuple(raw_path.split("/")) if raw_path else ()
+        if not segments:
+            return None
+        return segments[:-1], segments[-1]
+
+    match = REFUSAL_DOTTED_TYPE.search(stderr)
+    if match:
+        raw_path = match.group(1)
+        if raw_path == "(root)":
+            return None
+        segments = tuple(raw_path.split("."))
+        return segments[:-1], segments[-1]
+
+    match = REFUSAL_SLASH_MISSING.search(stderr)
+    if match:
+        raw_path, key = match.group(1), match.group(2)
+        segments = tuple(raw_path.strip("/").split("/")) if raw_path.strip("/") else ()
+        return segments, key
+
+    match = REFUSAL_DOTTED_MISSING.search(stderr)
+    if match:
+        raw_path, key = match.group(1), match.group(2)
+        segments = () if raw_path == "(root)" else tuple(raw_path.split("."))
+        return segments, key
+
+    return None
 
 
 def load_schema() -> dict[str, Any]:
@@ -104,7 +182,15 @@ def helm(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def render(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return helm("template", "task-db", str(CHART), *arguments)
+    # `-f CI_VALUES_PATH` FIRST, ALWAYS, WHEN THE FILE EXISTS (ADR-0845,
+    # C-DB1): `tls.enabled` carries no default any more, and this chart's own
+    # `ci/values.yaml` is the one place that states the baseline every other
+    # render in this file renders against — the same contract
+    # `chart_values_override.py` documents for the shared `helm-lint` hook.
+    # First, not last, so a case-specific `--values`/`--set` in `*arguments`
+    # still wins on any key the two happen to share.
+    override = ("-f", str(CI_VALUES_PATH)) if CI_VALUES_PATH.is_file() else ()
+    return helm("template", "task-db", str(CHART), *override, *arguments)
 
 
 def overlay(body: str, destination: Path) -> Path:
@@ -212,6 +298,160 @@ def test_a_typo_two_levels_down_in_the_instance_storage_block_is_refused(tmp_pat
     assert key == "siz", (key, result.stderr)
 
 
+# ── RENDER: `tls.enabled` CARRIES NO DEFAULT (ADR-0845, C-DB1) ───────────────────
+
+
+def test_tls_enabled_wrong_type_is_refused_by_the_schema_naming_tls_enabled(
+    tmp_path: Path,
+) -> None:
+    result = render_overlay('tls:\n  enabled: "true"\n', tmp_path)
+    assert result.returncode != 0, result.stdout
+    # THE STABLE WRAPPER (B-U5E-convention.md item 9), asserted alongside the
+    # path and key rather than instead of them: every schema violation carries
+    # it, on every measured helm version, so its presence is what tells a
+    # schema refusal apart from a render-check one even before the shape is
+    # parsed.
+    assert "values don't meet the specifications of the schema" in result.stderr, result.stderr
+    found = extract_type_or_missing_refusal(result.stderr)
+    assert found, result.stderr
+    path, key = found
+    assert path == ("tls",), (path, result.stderr)
+    assert key == "enabled", (key, result.stderr)
+
+
+def test_tls_enabled_null_is_refused_by_the_schema_naming_tls_enabled(
+    tmp_path: Path,
+) -> None:
+    """`enabled: null` is NOT the same shape as `tls: null` below: `values.yaml`
+    carries no default for `enabled` any more, so helm's null-key-deletion
+    (which only drops a key the chart's OWN defaults also set) does not apply
+    to it — the null survives into the merged values as a value, and the
+    schema refuses it as the wrong type rather than as a missing key.
+    """
+    result = render_overlay("tls:\n  enabled:\n", tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert "values don't meet the specifications of the schema" in result.stderr, result.stderr
+    found = extract_type_or_missing_refusal(result.stderr)
+    assert found, result.stderr
+    path, key = found
+    assert path == ("tls",), (path, result.stderr)
+    assert key == "enabled", (key, result.stderr)
+
+
+def test_tls_block_null_is_refused_naming_tls_by_the_render_check(tmp_path: Path) -> None:
+    """THE OTHER NULL SHAPE: `tls:` with no value deletes the WHOLE block this
+    chart's `values.yaml` declares (it, unlike `enabled`, still carries
+    defaults — `certSecret` etc.) — so this reaches `templates/render-
+    checks.yaml`'s `tls`-absent arm, not the schema. A render-check refusal is
+    asserted on its exact sentence (correction 3), unlike the schema shapes
+    above.
+    """
+    result = render_overlay("tls:\n", tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert (
+        "`tls` is absent from the values, so `tls.enabled` cannot be read" in result.stderr
+    ), result.stderr
+
+
+def test_tls_not_a_map_is_refused_naming_tls_by_the_render_check(tmp_path: Path) -> None:
+    result = render_overlay('tls: "x"\n', tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert "`tls` must be a map and is string" in result.stderr, result.stderr
+
+
+def test_tls_enabled_true_renders_successfully(tmp_path: Path) -> None:
+    """`tls.enabled: true` is a shape this schema's own closure must accept:
+    `type: boolean` and `required: [enabled]` (ADR-0845, C-DB1) bound the
+    VALUE, never the value `true` itself, so turning TLS on must not trip
+    anything this file owns.
+    """
+    result = render_overlay("tls:\n  enabled: true\n", tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def lint(chart: Path) -> subprocess.CompletedProcess[str]:
+    binary = shutil.which("helm")
+    assert binary
+    return subprocess.run(
+        [binary, "lint", "--strict", str(chart)], capture_output=True, text=True
+    )
+
+
+def test_a_bare_lint_refuses_the_missing_tls_enabled() -> None:
+    """A bare `helm lint --strict .`, no `-f` at all — what an adopter who has
+    not yet read `chart/ci/values.yaml` runs. `values.yaml` ships no default
+    for `tls.enabled`, so this is the SHAPE OF THE SCHEMA'S OWN CONTRIBUTION:
+    `templates/render-checks.yaml`'s `fail` logs as INFO under `lint` (helm
+    grades a template `fail` as INFO, never ERROR — correction 1), so this
+    case is red ONLY because the schema's `required` makes it an ERROR.
+    `test_dropping_tls_required_degrades_the_bare_lint_message` is this
+    test's own mutation check — the case stays red either way (see there for
+    why), so what it proves is the MESSAGE this schema keyword buys.
+    """
+    result = lint(CHART)
+    assert result.returncode != 0, result.stdout
+    combined = result.stdout + result.stderr
+    # THE STABLE WRAPPER, never the per-leaf phrase: measured identically on
+    # 3.18.4, 3.20.2 and 4.3.0 (CI's `ci / precommit` pins 3.18.4 via
+    # `azure/setup-helm@…`), while the phrase naming `enabled` itself takes
+    # two different shapes across that range (`missing property 'enabled'`
+    # vs `enabled is required`) — exactly the drift `extract_type_or_missing_
+    # refusal` exists to absorb. Key and path are asserted through it rather
+    # than through either literal sentence.
+    assert "values don't meet the specifications of the schema" in combined, combined
+    found = extract_type_or_missing_refusal(combined)
+    assert found, combined
+    path, key = found
+    assert path == ("tls",), (path, combined)
+    assert key == "enabled", (key, combined)
+
+
+def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path: Path) -> None:
+    """PROOF (card): drop the schema `required` and this stops being the
+    SCHEMA's finding.
+
+    MEASURED, not the simpler claim an earlier version of this test made:
+    `helm lint --strict` does NOT go green. `templates/deployment.yaml`'s
+    unconditional `ternary "1" "0" (and (kindIs "map" .Values.tls)
+    .Values.tls.enabled)` still runs under `lint` (a template `fail` logs as
+    INFO there and does not stop execution — correction 1's own point), and
+    `ternary` itself refuses a `nil` condition with a raw sprig error —
+    `invalid value; expected bool` — which is a genuine [ERROR], not an INFO
+    line. So the case stays red either way; what `required` actually buys is
+    the MESSAGE an adopter reads: a named sentence pointing at `tls.enabled`
+    and `chart/values.yaml`, instead of a Go template path pointing at a
+    line number in `deployment.yaml`. This is the finding C-DB1's sibling
+    units (iam-db, project-db) measured identically on their own copy of
+    this card; asserting red-stays-red here keeps the three repos making the
+    same claim.
+
+    A fresh copy of the WHOLE chart, because `-f` cannot replace
+    `values.schema.json` itself — only editing the file on disk can.
+    """
+    copy = tmp_path / "chart"
+    shutil.copytree(CHART, copy)
+    schema = json.loads((copy / "values.schema.json").read_text())
+    schema["properties"]["tls"]["required"] = []
+    (copy / "values.schema.json").write_text(json.dumps(schema))
+
+    result = lint(copy)
+    assert result.returncode != 0, (
+        "removing `required: [enabled]` from `tls` was expected to STAY red, for "
+        f"a worse reason: {result.stdout}{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    # THE STABLE WRAPPER IS GONE, not a per-leaf phrase: once `required` is
+    # dropped, the schema raises no finding about `tls` at all — proven by
+    # the absence of the wrapper every schema violation carries, rather than
+    # by the absence of either version's own wording for this one leaf.
+    assert "values don't meet the specifications of the schema" not in combined, (
+        f"the schema's own finding should be gone once `required` is dropped: {combined}"
+    )
+    assert "invalid value; expected bool" in combined, (
+        f"expected the degraded sprig type error in its place: {combined}"
+    )
+
+
 # ── RENDER: WHAT STAYS OPEN OR EXTRA RENDERS CLEANLY ─────────────────────────────
 
 
@@ -259,7 +499,7 @@ def test_lint_refuses_the_root_typo_naming_the_key(tmp_path: Path) -> None:
     binary = shutil.which("helm")
     assert binary
     result = subprocess.run(
-        [binary, "lint", "--strict", str(CHART), "-f", str(values)],
+        [binary, "lint", "--strict", str(CHART), "-f", str(CI_VALUES_PATH), "-f", str(values)],
         capture_output=True,
         text=True,
     )
@@ -395,10 +635,43 @@ def test_every_schema_leaf_absent_from_values_yaml_is_a_documented_extra() -> No
     values = load_values()
     undeclared_in_values = []
     for path in schema_leaves(schema):
+        if path in REQUIRED_NO_DEFAULT:
+            continue  # a third category: see REQUIRED_NO_DEFAULT's own comment.
         present, _ = value_at(values, path)
         if not present:
             undeclared_in_values.append(path)
     assert set(undeclared_in_values) == EXTRA_PATHS, undeclared_in_values
+
+
+def test_every_required_no_default_key_has_no_default_in_values_yaml() -> None:
+    """The other half of what REQUIRED_NO_DEFAULT claims: `values.yaml` really
+    does not set it. A key that crept back into `values.yaml` would still pass
+    the extras check above (it is skipped there, not merely tolerated), so
+    this is the test that would catch it.
+    """
+    values = load_values()
+    for path in REQUIRED_NO_DEFAULT:
+        present, _ = value_at(values, path)
+        assert not present, (
+            f"{'.'.join(path)} is in REQUIRED_NO_DEFAULT but values.yaml sets it — "
+            f"ADR-0845 asks for no default, not merely an unenforced one"
+        )
+
+
+def test_every_required_no_default_key_is_required_in_the_schema() -> None:
+    """The schema half: a key with no default must be `required` by its
+    parent block, or an adopter who omits it gets `nil`/zero rather than a
+    refusal naming the key.
+    """
+    schema = load_schema()
+    for path in REQUIRED_NO_DEFAULT:
+        cursor = schema
+        for step in path[:-1]:
+            cursor = cursor["properties"][step]
+        assert path[-1] in cursor.get("required", []), (
+            f"{'.'.join(path)} is in REQUIRED_NO_DEFAULT but its parent block does "
+            f"not list it under `required`"
+        )
 
 
 def test_global_is_declared_open() -> None:

@@ -62,8 +62,12 @@ pub struct ServeTls {
 impl ServeTls {
     /// Read the listener's transport configuration from the environment.
     ///
-    /// `Ok(None)` is the ordinary answer today: TLS is opt-in, so an
-    /// unconfigured deployment serves in cleartext exactly as before.
+    /// **NEITHER `Ok(None)` NOR `Ok(Some(_))` IS A DEFAULT ANY MORE
+    /// (ADR-0845).** `{prefix}_TLS_ENABLED` has no compiled-in fallback: an
+    /// absent or empty value refuses the boot rather than assuming
+    /// cleartext, the same discipline every other required knob in this
+    /// crate already carries. `Ok(None)` is still the answer for an
+    /// EXPLICIT `"0"` — TLS stated off, not TLS unstated.
     pub fn from_env(prefix: &'static str) -> Result<Option<Self>, BootError> {
         Self::from_lookup(prefix, |key| std::env::var(key).ok())
     }
@@ -82,11 +86,43 @@ impl ServeTls {
                 .filter(|v| !v.is_empty())
         };
 
-        // Exactly "1". A permissive parse here — "0", "false" and "no" all
-        // enabling it — is how a setting meant to be off ends up on, and the
-        // reverse mistake is worse: this flag is the revert lever for the
-        // cut-over, and a lever that does not move is not one.
-        if get("TLS_ENABLED").as_deref() != Some("1") {
+        // READ DIRECTLY, NOT THROUGH `get` — `get` already collapses an empty
+        // string to `None`, and ADR-0569 asks the empty and absent cases to be
+        // told apart, each with its own sentence. `tls.enabled` is the chart
+        // key named in both: the only caller of this function is this binary,
+        // and `chart/values.schema.json` requires exactly that key (C-DB1).
+        let key = format!("{prefix}_TLS_ENABLED");
+        let raw = match lookup(&key).map(|v| v.trim().to_string()) {
+            Some(v) if !v.is_empty() => v,
+            Some(_) => {
+                return Err(BootError::MissingKnob(format!(
+                    "{key} is set but EMPTY. It has no compiled-in default (ADR-0845), so \
+                     there is nothing to fall back to. Set it to \"1\" to serve TLS, or \
+                     \"0\" to serve cleartext explicitly. The chart renders it as \
+                     tls.enabled; a values override that nulls it produces exactly this."
+                )))
+            }
+            None => {
+                return Err(BootError::MissingKnob(format!(
+                    "{key} is NOT SET. It has no compiled-in default (ADR-0845): this \
+                     module reads it from the environment alone and refuses to start \
+                     rather than assume cleartext. Set it to \"1\" to serve TLS, or \"0\" \
+                     to serve cleartext explicitly. The chart renders it as tls.enabled."
+                )))
+            }
+        };
+
+        // EXACTLY "1" OR "0", AND NOTHING ELSE. A permissive parse — "true",
+        // "false", "yes", "no" all meaning something — is how a setting meant
+        // to be off ends up on; this flag is the revert lever for the
+        // cut-over, and a lever that does not move predictably is not one.
+        let enabled = match raw.as_str() {
+            "1" => true,
+            "0" => false,
+            _ => return Err(BootError::TlsEnabledInvalid { prefix, value: raw }),
+        };
+
+        if !enabled {
             if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
                 // NOT an error. Leaving the certificate in place while the flag
                 // is off is exactly how the cut-over gets reverted, so refusing
@@ -95,8 +131,8 @@ impl ServeTls {
                 // able to see that from the boot log.
                 tracing::warn!(
                     prefix,
-                    "a serving certificate is configured but {prefix}_TLS_ENABLED is not \
-                     \"1\", so this module listens in CLEARTEXT"
+                    "a serving certificate is configured but {prefix}_TLS_ENABLED is \
+                     \"0\", so this module listens in CLEARTEXT"
                 );
             }
             return Ok(None);

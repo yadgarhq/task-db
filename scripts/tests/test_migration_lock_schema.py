@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 CHART = Path(__file__).resolve().parents[2] / "chart"
+CI_VALUES = CHART / "ci" / "values.yaml"
 KNOB = "database.migrationLockTimeoutSeconds"
 VARIABLE = "DB_MIGRATION_LOCK_TIMEOUT_SECONDS"
 
@@ -29,8 +30,13 @@ def render(*arguments: str) -> subprocess.CompletedProcess[str]:
         "helm is not on PATH. This suite renders the chart, and so does the "
         "`helm lint and render` pre-commit hook — install helm rather than skip."
     )
+    # `-f CI_VALUES` FIRST: `tls.enabled` carries no default any more (ADR-0845,
+    # C-DB1), and this chart's own `ci/values.yaml` is what every bare render in
+    # this repository renders against now. First, so `*arguments` still wins on
+    # any key the two happen to share.
+    override = ("-f", str(CI_VALUES)) if CI_VALUES.is_file() else ()
     return subprocess.run(
-        [binary, "template", "lock", str(CHART), *arguments],
+        [binary, "template", "lock", str(CHART), *override, *arguments],
         capture_output=True,
         text=True,
     )

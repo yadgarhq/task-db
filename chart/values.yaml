@@ -250,10 +250,20 @@ database:
 # by hand produces something neither the chart nor the binary can tell apart.
 # Nothing here requires a CRD, an issuer or a mesh.
 tls:
-  # OFF, and the cut-over is a separate, revertible change. `task` can already
-  # dial this pod over TLS and does not by default, so turning this on alone
-  # breaks the hop rather than securing it: the two flags move together, once
-  # certificates exist. The same discipline the attestation cut-over used.
+  # NO DEFAULT HERE ANY MORE (ADR-0845, C-DB1). `tls.enabled` used to ship
+  # `false`, and the binary's own compiled-in default agreed with it; ADR-0845
+  # deleted that default from the binary, so a chart default would be the one
+  # compiled-in default this knob has left — invisible at the point of use and
+  # wrong the day somebody relies on it. `chart/values.schema.json` marks the
+  # key `required`, so an adopter who omits it meets a render-time refusal
+  # naming `tls.enabled` rather than a pod that silently serves cleartext.
+  # `chart/ci/values.yaml` sets it `true` so every shared gate that lints or
+  # renders this chart offline still has a value to coalesce.
+  #
+  # THE CUT-OVER ITSELF IS STILL A SEPARATE, REVERTIBLE CHOICE. `task` can
+  # already dial this pod over TLS and does not by default, so turning this on
+  # alone breaks the hop rather than securing it: the two flags move together,
+  # once certificates exist. The same discipline the attestation cut-over used.
   #
   # THERE IS NO SILENT MIDDLE STATE. `true` with a certificate that is missing,
   # undecodable, or not the partner of its key fails at boot naming the file.
@@ -261,7 +271,7 @@ tls:
   # failed. `false` with a certificate still configured is the reverted state,
   # and task-db logs a warning saying it is listening in cleartext, so nobody
   # has to infer it.
-  enabled: false
+  #
   # The Secret holding this module's OWN certificate and its private key.
   #
   # A `kubernetes.io/tls` Secret is what an issuer writes, and it carries
@@ -271,12 +281,12 @@ tls:
   # key. One object, read differently by each side of the hop.
   #
   # AN EMPTY VALUE IS A LEGITIMATE DEPLOYMENT RATHER THAN A MISSING ONE. It is
-  # what every deployment looks like until the cut-over, and `enabled: false` is
-  # what makes it legitimate. The requirement is CONDITIONAL — the template asks
-  # for this only when the flag is set — because a chart that demanded a Secret
-  # nobody has issued yet would fail to install on a cluster running perfectly
-  # well without one. The same D80 argument that turned the KEDA ScaledObject
-  # off by default.
+  # what every deployment looks like until the cut-over, and an adopter writing
+  # `tls.enabled: false` is what makes it legitimate. The requirement is
+  # CONDITIONAL — the template asks for this only when the flag is set —
+  # because a chart that demanded a Secret nobody has issued yet would fail to
+  # install on a cluster running perfectly well without one. The same D80
+  # argument that turned the KEDA ScaledObject off by default.
   #
   # NOT A PEM PASTED INTO THIS FILE, and the reason is stronger than it is for a
   # CA bundle: this Secret holds a PRIVATE KEY. It also rotates, and a copy in
