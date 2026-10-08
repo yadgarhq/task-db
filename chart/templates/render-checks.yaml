@@ -278,9 +278,11 @@ THE BINARY READS LISTEN_TLS_CLIENT_AUTH NOW, through
 IS ON — deleting the variable is a boot refusal, never a way to turn
 verification off. So the chart has no default for the value that renders it:
 an absent key is refused here, by name, rather than rendering a pod that
-crashloops. `chart/values.schema.json` also lists the key under `required` and
-an `enum`, which refuse the absent, bare-`off` and unknown shapes first on this
-chart (K-3); these arms hold for a values source that schema does not see first.
+crashloops. `chart/values.schema.json` also lists the key under `required`,
+which refuses an ABSENT key first on this chart (K-3); the `hasKey` arm below
+holds for a values source that schema does not see first. The key carries no
+`enum` and no `type` (ruling R1, ADR-0847), so a bare `off`, a non-string and
+an unknown mode reach the sentences below.
 
 THE B-U5E EXPAND'S "not enforced" REFUSAL OF `optional` AND `required`
 IS LIFTED (K-8 step 3): the binary verifies a caller's certificate against
