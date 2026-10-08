@@ -72,7 +72,16 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # signal handler, so once the rotation arm wins the `select!` a later SIGTERM is
 # swallowed and only SIGKILL remains — the watcher WITHOUT `drain_within` is the
 # bug, not half the fix.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.17" }
+#
+# `serve-tls` IS THE LISTENER'S TRANSPORT, LIFTED (ADR-0846, card B-U5). The
+# local `ServeTls` copy is gone: `yadgar_lifecycle::serve_tls::ServerTls` reads
+# LISTEN_TLS_ENABLED and LISTEN_TLS_CLIENT_AUTH with no default (ADR-0845,
+# ADR-0854) and verifies a client certificate against
+# LISTEN_TLS_CLIENT_CA_FILE when the mode is `optional` or `required`. Default
+# features stay on: `rotate` is the watcher above.
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+  "serve-tls",
+] }
 sqlx = { version = "0.9", default-features = false, features = [
   "json",
   "runtime-tokio",

@@ -70,9 +70,8 @@ EXTRA_PATHS = {
     ("image", "digest"),
     ("networkPolicy", "scrapeFrom", "namespace"),
     # B-U5E (ADR-0854), folded into C-DB1: declared so an adopter's override is
-    # validated by the closure, but `values.yaml` ships none of the three —
-    # the binary does not read them until B-U5 adopts LISTEN_TLS_CLIENT_AUTH.
-    ("tls", "clientAuth"),
+    # validated by the closure, but `values.yaml` ships neither. `clientAuth`
+    # moved to REQUIRED_NO_DEFAULT below in B-U5.
     ("tls", "clientCaSecret"),
     ("tls", "clientCaSecretKey"),
 }
@@ -88,6 +87,10 @@ EXTRA_PATHS = {
 # present and `required` in the schema.
 REQUIRED_NO_DEFAULT = {
     ("tls", "enabled"),
+    # B-U5 (ADR-0854, X-ADR-1): the binary refuses to boot without
+    # LISTEN_TLS_CLIENT_AUTH, so the chart has no default for the value that
+    # renders it either.
+    ("tls", "clientAuth"),
 }
 
 # THE TWO MESSAGE SHAPES MEASURED: 3.20.2 and 4.3.0 (this builder's own pair,
@@ -122,9 +125,20 @@ REFUSAL_SLASH_TYPE = re.compile(r"at '([^']*)': got \S+, want \S+")
 REFUSAL_DOTTED_TYPE = re.compile(
     r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+Invalid type\.", re.MULTILINE
 )
-REFUSAL_SLASH_MISSING = re.compile(r"at '([^']*)': missing property '([^']+)'")
+# `missing properties 'enabled', 'clientAuth'` is how 3.20.2 and 4.3.0 report
+# BOTH of `tls`'s required keys absent at once (B-U5, measured on a bare lint);
+# the first named key is the one returned. 3.18.4 prints one line per key.
+REFUSAL_SLASH_MISSING = re.compile(r"at '([^']*)': missing propert(?:y|ies) '([^']+)'")
 REFUSAL_DOTTED_MISSING = re.compile(
     r"^-\s+(\(root\)|[A-Za-z0-9_.\-]+):\s+(\S+) is required", re.MULTILINE
+)
+# AN `enum` REFUSAL, measured the same way (4.3.0, 3.20.2, 3.18.4) while B-U5
+# briefly carried one on `tls.clientAuth`; kept so a future enum leaf parses:
+#   (4.3.0, 3.20.2) "- at '/tls/clientAuth': value must be one of 'off', 'optional', 'required'"
+#   (3.18.4)        "- tls.clientAuth: tls.clientAuth must be one of the following: ..."
+REFUSAL_SLASH_ENUM = re.compile(r"at '([^']*)': value must be one of")
+REFUSAL_DOTTED_ENUM = re.compile(
+    r"^-\s+([A-Za-z0-9_.\-]+):\s+\S+ must be one of the following", re.MULTILINE
 )
 
 
@@ -133,7 +147,7 @@ def extract_type_or_missing_refusal(stderr: str) -> tuple[tuple[str, ...], str] 
     refusal, on EITHER measured helm shape. Mirrors `extract_refusal`, for the
     two shapes that one does not parse (see the regexes' own comment).
     """
-    match = REFUSAL_SLASH_TYPE.search(stderr)
+    match = REFUSAL_SLASH_TYPE.search(stderr) or REFUSAL_SLASH_ENUM.search(stderr)
     if match:
         raw_path = match.group(1).strip("/")
         segments = tuple(raw_path.split("/")) if raw_path else ()
@@ -141,7 +155,7 @@ def extract_type_or_missing_refusal(stderr: str) -> tuple[tuple[str, ...], str] 
             return None
         return segments[:-1], segments[-1]
 
-    match = REFUSAL_DOTTED_TYPE.search(stderr)
+    match = REFUSAL_DOTTED_TYPE.search(stderr) or REFUSAL_DOTTED_ENUM.search(stderr)
     if match:
         raw_path = match.group(1)
         if raw_path == "(root)":
@@ -369,6 +383,45 @@ def test_tls_enabled_true_renders_successfully(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+# ── RENDER: `tls.clientAuth` CARRIES NO DEFAULT (B-U5, ADR-0854) ───────────────────
+#
+# The schema refuses only ABSENCE (`required`), before any template runs (K-3
+# accepts that pre-emption). `clientAuth` carries no `enum` and no `type`
+# (ruling R1, ADR-0847): a bare `off`, a non-string and an unknown mode reach
+# the render check's own named sentences, proved in `test_render_checks.py`
+# against the real chart, schema validation on.
+
+
+def assert_schema_refuses_client_auth(result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode != 0, result.stdout
+    assert "values don't meet the specifications of the schema" in result.stderr, result.stderr
+    found = extract_type_or_missing_refusal(result.stderr)
+    assert found, result.stderr
+    path, key = found
+    assert path == ("tls",), (path, result.stderr)
+    assert key == "clientAuth", (key, result.stderr)
+
+
+def test_tls_client_auth_absent_is_refused_by_the_schema(tmp_path: Path) -> None:
+    """`chart/ci/values.yaml` states `clientAuth: "off"`, so absence is made
+    here by rendering WITHOUT that baseline — the same bare render an adopter
+    who never set the key performs."""
+    values = overlay("tls:\n  enabled: true\n", tmp_path)
+    assert_schema_refuses_client_auth(
+        helm("template", "task-db", str(CHART), "--values", str(values))
+    )
+
+
+def test_tls_client_auth_each_mode_passes_the_schema(tmp_path: Path) -> None:
+    for mode in ("off", "optional", "required"):
+        result = render_overlay(
+            f'tls:\n  clientAuth: "{mode}"\n  clientCaSecret: peer-ca\n'
+            "  clientCaSecretKey: ca.crt\n",
+            tmp_path / mode,
+        )
+        assert result.returncode == 0, (mode, result.stderr)
+
+
 def lint(chart: Path) -> subprocess.CompletedProcess[str]:
     binary = shutil.which("helm")
     assert binary
@@ -403,7 +456,13 @@ def test_a_bare_lint_refuses_the_missing_tls_enabled() -> None:
     assert found, combined
     path, key = found
     assert path == ("tls",), (path, combined)
-    assert key == "enabled", (key, combined)
+    # EITHER of `tls`'s two required keys (B-U5 added `clientAuth`): a bare
+    # lint is missing both, and which one the parser meets first is helm's
+    # line order — 3.18.4 prints `enabled` inline after `[ERROR] values.yaml:`
+    # and `clientAuth` on a line of its own, measured.
+    assert key in ("enabled", "clientAuth"), (key, combined)
+    assert "enabled" in combined, combined
+    assert "clientAuth" in combined, combined
 
 
 def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path: Path) -> None:

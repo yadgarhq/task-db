@@ -758,6 +758,10 @@ pub fn boot_cleartext_env(db_name: &str, password_file: &Path) -> Vec<(String, S
         ("LISTEN".to_string(), "127.0.0.1:0".to_string()),
         ("METRICS_LISTEN".to_string(), "127.0.0.1:0".to_string()),
         ("LISTEN_TLS_ENABLED".to_string(), "0".to_string()),
+        // REQUIRED BESIDE THE SWITCH since B-U5 (ADR-0854): a cleartext
+        // listener still refuses to boot without a stated client-auth mode,
+        // and `off` is the only mode a cleartext listener accepts.
+        ("LISTEN_TLS_CLIENT_AUTH".to_string(), "off".to_string()),
     ]
 }
 

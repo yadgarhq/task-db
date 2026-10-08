@@ -147,6 +147,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         %addr,
         tls = tls.is_some(),
+        client_auth = %tls.as_ref().map_or(boot::ClientAuth::Off, |t| t.client_auth()),
         watching = tls_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
@@ -232,7 +233,7 @@ async fn stop_when(
 
 /// The subscriber every line of this boot sequence is written to.
 ///
-/// FIRST, and before `configure` — `boot::ServeTls` warns when a certificate is
+/// FIRST, and before `configure` — `boot::listener` warns when a certificate is
 /// configured beside a flag that is not "1", and a warning emitted before the
 /// subscriber exists is one nobody ever reads.
 fn init_tracing() {
@@ -270,7 +271,7 @@ fn init_tracing() {
 struct Configured {
     config: PoolConfig,
     migration_lock: LockOptions,
-    tls: Option<boot::ServeTls>,
+    tls: Option<boot::ServerTls>,
     server: Server,
     secret: Secret,
     tls_inputs: rotate::Inputs,
@@ -309,8 +310,8 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
     // structural rather than tidy: the downgrade this guards against is a
     // listener that opens in cleartext because TLS configuration failed, and
     // with one construction site there is nowhere else to write it.
-    let tls = boot::ServeTls::from_env(boot::LISTEN).map_err(|e| e.to_string())?;
-    let server = boot::server(tls.as_ref()).map_err(|e| e.to_string())?;
+    let tls = boot::listener(|key| std::env::var(key).ok()).map_err(|e| boot::refusal(&e))?;
+    let server = boot::server(tls.as_ref()).map_err(|e| boot::refusal(&e))?;
 
     // The credential never arrives as an environment variable — it is a mounted
     // Secret the operator issued (D58), read through the seam so this module has

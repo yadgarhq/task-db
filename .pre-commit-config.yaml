@@ -32,7 +32,14 @@ repos:
     # `no_test_skips` and `observe_coverage` also moved between the two tags;
     # none of the three changes this tree's own verdict (this PR's own CI run
     # is the proof — see the PR body).
-    rev: v1.31.0
+    #
+    # v1.31.0 → v1.34.0 FOR B-U5 (actions#113). Adopting
+    # `yadgar_lifecycle::serve_tls` moved this binary's last boot file read
+    # into the library, and `boot-reads-watched` refused a tree with zero
+    # judged reads; v1.34.0 accepts the `ADR-0523-LIBRARY-WATCHED` declaration
+    # `src/rotate.rs` now carries. The bump also brings v1.32/v1.33's hook
+    # changes; see the PR body for what they measured here.
+    rev: v1.34.0
     hooks:
       - id: gitleaks
       - id: prettier
