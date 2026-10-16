@@ -133,7 +133,7 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 # dev-dependency only — the shipped binary gains no new crate. No
 # `[features]` table exists on this crate to pick one of, unlike
 # `yadgar-telemetry`'s `grpc` above.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.14" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.17" }
 
 [lints.rust]
 unsafe_code = "forbid"
