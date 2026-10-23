@@ -83,10 +83,11 @@ async fn migration_5_heals_only_the_values_the_enum_forbids() {
     //
     // `apply` answers with HEAD, not with the last migration this test cares
     // about, so the number moves whenever one is appended — it was 5 until the
-    // fingerprint column became 6. The heal is still what the assertions above
-    // observe; this one only says the ledger advanced past it.
+    // fingerprint column became 6, and 6 until the title CHECK became 7. The
+    // heal is still what the assertions above observe; this one only says the
+    // ledger advanced past it.
     assert_eq!(
-        applied, 6,
+        applied, 7,
         "the fixture stopped at 4, so `apply` ran migration 5 and everything appended after it"
     );
 }
@@ -108,7 +109,7 @@ async fn a_second_apply_finds_nothing_pending() {
     w.migrate_to_head().await;
     assert_eq!(
         w.migrate_to_head().await,
-        6,
+        7,
         "a second apply finds nothing pending and stays at head"
     );
     assert_eq!(

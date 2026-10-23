@@ -406,8 +406,8 @@ async fn a_claim_recorded_before_the_fingerprint_still_replays() {
 
     assert_eq!(
         w.migrate_to_head().await,
-        6,
-        "the fixture stopped at 5, so the fingerprint migration is what ran"
+        7,
+        "the fixture stopped at 5, so the fingerprint migration and everything after it ran"
     );
 
     let replay =

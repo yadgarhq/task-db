@@ -41,7 +41,39 @@ fn all() -> Vec<Migration> {
         task_write_idempotency(),
         heal_unspecified_visibility(),
         task_write_request_fingerprint(),
+        task_title_at_most_128(),
     ]
+}
+
+/// The name of migration 7's constraint, which `sql::internal` matches to
+/// tell a too-long title apart from every other CHECK that can fail.
+pub(crate) const TITLE_CHECK: &str = "ck_task_title_len";
+
+/// A task title is at most 128 Unicode code points (yaadgaar #396,
+/// `yadgar.task.v1.Task.title`). `task` refuses a longer one first; this is the
+/// bound in the table, for every writer that is not `task`.
+///
+/// **A CHECK, NOT `MODIFY title VARCHAR(128)`.** Under a non-strict `sql_mode`
+/// a narrowing MODIFY truncates every longer title in place and reports a
+/// warning nobody reads. `ADD CONSTRAINT ... CHECK` instead validates the rows
+/// already stored and FAILS the migration if one is longer, so boot refuses —
+/// the loud failure. `CHAR_LENGTH` over utf8mb4 counts code points, the unit
+/// the contract names.
+///
+/// **THE RELEASE GATE.** Because it validates existing rows, this migration may
+/// run only once `SELECT COUNT(*) FROM task WHERE CHAR_LENGTH(title) > 128` is
+/// 0 — every project and status, soft-deleted rows included. It is not
+/// reversible by a rollback either: `yadgar-store` refuses to boot an older
+/// binary against a database already at 7.
+fn task_title_at_most_128() -> Migration {
+    Migration {
+        version: 7,
+        name: "task_title_at_most_128".into(),
+        sql: format!(
+            "ALTER TABLE task
+               ADD CONSTRAINT {TITLE_CHECK} CHECK (CHAR_LENGTH(title) <= 128)"
+        ),
+    }
 }
 
 /// `id` is a URN carrying a UUIDv7 (D42) — never the engine's integer key, which
