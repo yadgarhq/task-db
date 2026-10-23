@@ -14,6 +14,11 @@ use tonic::Status;
 use crate::pb::yadgar::common::v1::{InheritedSetting, Scope, Visibility};
 use crate::setting::owner_reach;
 
+/// How an engine error becomes a status — the second half of this module's
+/// job, in its own file because the first half filled this one.
+mod status;
+pub use status::internal;
+
 /// The gateway attests scope from credentials; it is never supplied by the
 /// caller (D12). An absent scope is a programming error upstream, not a
 /// permissive default — so it is refused rather than treated as "everything".
@@ -368,80 +373,5 @@ impl Readable {
             query = query.bind(value);
         }
         query
-    }
-}
-
-/// An engine error is never returned to the caller verbatim: it carries table
-/// names, column names and sometimes values. Logged here, generic on the wire.
-///
-/// EXCEPT for the one class that the caller can act on. A deadlock or a lock
-/// wait timeout means "someone else held the row; try again", and flattening it
-/// into `INTERNAL` tells a caller that a retryable wait is a permanent failure —
-/// which is how a moment of contention becomes a user-visible error. `ABORTED`
-/// is the code gRPC reserves for exactly this.
-///
-/// **AND A POOL THAT HAD NOTHING TO HAND OUT, which is the same argument one
-/// layer further out and was missing.** `sqlx::Error::PoolTimedOut` is its own
-/// variant rather than an `Error::Database`, so it never reached the arm above
-/// and answered `INTERNAL` — a caller told that a stall lasting as long as the
-/// acquire timeout is permanent, when every connection being busy is the most
-/// transient condition this service has. It is reported `UNAVAILABLE` rather
-/// than `ABORTED` because nothing was serialised against anything: the request
-/// never reached the engine, and `UNAVAILABLE` is what a caller's backoff is
-/// written for.
-pub fn internal(e: sqlx::Error) -> Status {
-    if matches!(e, sqlx::Error::PoolTimedOut) {
-        tracing::warn!(error = %e, "task-db pool exhausted; the caller may retry");
-        return Status::unavailable("no connection was free in time — retry");
-    }
-    if let sqlx::Error::Database(db) = &e {
-        // 1213 is ER_LOCK_DEADLOCK and 1205 ER_LOCK_WAIT_TIMEOUT. SQLSTATE
-        // 40001 covers the first; the second reports HY000 and is only
-        // identifiable by its number.
-        let deadlock = db.code().as_deref() == Some("40001")
-            || db
-                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                .is_some_and(|e| matches!(e.number(), 1205 | 1213));
-        if deadlock {
-            tracing::warn!(error = %e, "task-db lock contention; the caller may retry");
-            return Status::aborted("the write could not be serialised — retry");
-        }
-    }
-    tracing::error!(error = %e, "task-db engine error");
-    Status::internal("storage error")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::internal;
-
-    /// **The one arm no engine test can reach once the allocator is fixed.**
-    ///
-    /// A pool timeout used to be producible on demand: `CreateTask` took a
-    /// SECOND connection while holding its first, so at pool size N, N
-    /// concurrent creates exhausted the pool and every one of them was answered
-    /// `INTERNAL`. That path is gone and the mapping still has to be right — any
-    /// later statement that waits on a busy pool must answer retryably. Built
-    /// from the variant itself rather than provoked through an RPC, for the same
-    /// reason `boot.rs` tests its decisions in-crate: the alternative is a test
-    /// that can only assert what it can first break.
-    #[test]
-    fn a_pool_timeout_is_unavailable_and_therefore_retryable() {
-        assert_eq!(
-            internal(sqlx::Error::PoolTimedOut).code(),
-            tonic::Code::Unavailable,
-            "every connection being busy is the most transient condition this \
-             service has, and must not be reported as a permanent failure"
-        );
-    }
-
-    /// The default stays the default. Anything not named above is opaque and
-    /// non-retryable, because an engine error carries table names, column names
-    /// and sometimes values.
-    #[test]
-    fn any_other_engine_error_is_still_an_opaque_internal() {
-        let status = internal(sqlx::Error::RowNotFound);
-        assert_eq!(status.code(), tonic::Code::Internal);
-        assert_eq!(status.message(), "storage error");
     }
 }

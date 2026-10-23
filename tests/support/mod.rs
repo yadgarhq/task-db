@@ -594,7 +594,7 @@ pub async fn two_projects_two_users(name: &str) -> Cast {
 /// The migration lock as `main` builds it, with the chart's shipped wait.
 /// Stated in the TEST because `yadgar-store` has no default for it any more
 /// (ADR-0569, ledger 814).
-fn lock() -> yadgar_store::migrate::LockOptions {
+pub fn lock() -> yadgar_store::migrate::LockOptions {
     yadgar_store::migrate::LockOptions::new(60).expect("60 seconds is a wait")
 }
 
