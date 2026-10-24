@@ -56,7 +56,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use yadgar_task_db::boot::{self, ServeTlsError, ServerTls};
+use yadgar_task_db::boot::{self, ServeTlsError, ServerLimits, ServerTls};
 
 /// The name the test certificates are issued for, and the name the rig listens
 /// on.
@@ -369,7 +369,7 @@ async fn a_permanent_failure_on_the_first_address_is_reported_not_retried() {
 }
 
 fn spawn(listener: TcpListener, tls: Option<&ServerTls>) {
-    let mut builder = boot::server(tls).expect("a usable identity");
+    let mut builder = boot::server(tls, &limits()).expect("a usable identity");
     let router = builder.add_routes(tonic::service::Routes::default());
     tokio::spawn(async move {
         let _ = router
@@ -535,6 +535,27 @@ async fn an_explicitly_cleartext_listener_still_serves_cleartext() {
     assert_eq!(in_cleartext(port).await, Ok(200));
 }
 
+/// The chart's shipped listener limits (ADR-1006), as the environment renders
+/// them. Every case that builds a server states them, because the library has
+/// no default to fall back on.
+const LIMIT_VARS: [(&str, &str); 4] = [
+    ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
+    ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
+    ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
+    ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+];
+
+/// [`LIMIT_VARS`] read through [`boot::limits`], the call `main` makes.
+fn limits() -> ServerLimits {
+    boot::limits(|key| {
+        LIMIT_VARS
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| (*value).to_string())
+    })
+    .expect("the shipped limits are valid")
+}
+
 /// A lookup over fixed pairs, for the configuration cases below.
 fn lookup(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
     move |key| {
@@ -565,6 +586,49 @@ fn an_absent_listen_tls_enabled_refuses_naming_the_chart_key() {
         message.contains("`tls.enabled`"),
         "the refusal must name the chart key"
     );
+}
+
+/// ADR-1006 THROUGH THIS MODULE'S WIRING: each of the four listener limits is
+/// required, and the refusal names the variable AND the chart value that
+/// renders it. The sentence is lifecycle's; the prefix and the chart key are
+/// this module's, which is why the case lives here.
+#[test]
+fn an_absent_listener_limit_refuses_naming_the_variable_and_the_chart_key() {
+    for (var, chart) in [
+        (
+            "LISTEN_MAX_CONCURRENT_STREAMS",
+            "server.limits.maxConcurrentStreams",
+        ),
+        (
+            "LISTEN_KEEPALIVE_INTERVAL_SECS",
+            "server.limits.keepaliveIntervalSeconds",
+        ),
+        (
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS",
+            "server.limits.keepaliveTimeoutSeconds",
+        ),
+        (
+            "LISTEN_MAX_HEADER_LIST_BYTES",
+            "server.limits.maxHeaderListBytes",
+        ),
+    ] {
+        let error = boot::limits(|key| {
+            LIMIT_VARS
+                .iter()
+                .find(|(name, _)| *name == key && *name != var)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .expect_err("an absent listener limit must refuse the boot");
+        let message = boot::limits_refusal(&error);
+        assert!(
+            message.contains(var),
+            "the refusal must name {var}: {message}"
+        );
+        assert!(
+            message.contains(chart),
+            "the refusal must name {chart}: {message}"
+        );
+    }
 }
 
 /// ADR-0854 THROUGH THIS MODULE'S WIRING: an absent `LISTEN_TLS_CLIENT_AUTH`
@@ -772,7 +836,7 @@ async fn a_certificate_that_cannot_be_read_refuses_the_boot() {
     let missing = std::env::temp_dir().join("yadgar-task-db-no-such-cert-31c7ae.pem");
 
     let tls = serve_tls(&missing, key.path());
-    let error = boot::server(Some(&tls)).expect_err("a missing certificate must refuse");
+    let error = boot::server(Some(&tls), &limits()).expect_err("a missing certificate must refuse");
     assert!(
         matches!(error, ServeTlsError::Unreadable { .. }),
         "a missing certificate must refuse as an unreadable file"
@@ -793,7 +857,7 @@ async fn a_private_key_that_cannot_be_read_refuses_the_boot() {
     let missing = std::env::temp_dir().join("yadgar-task-db-no-such-key-8de402.pem");
 
     let tls = serve_tls(cert.path(), &missing);
-    let error = boot::server(Some(&tls)).expect_err("a missing private key must refuse");
+    let error = boot::server(Some(&tls), &limits()).expect_err("a missing private key must refuse");
     assert!(
         matches!(error, ServeTlsError::Unreadable { .. }),
         "a missing private key must refuse as an unreadable file"
@@ -817,7 +881,7 @@ async fn an_undecodable_certificate_refuses_the_boot() {
     for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
         let cert = TempPem::with(contents);
         let tls = serve_tls(cert.path(), key.path());
-        let outcome = boot::server(Some(&tls));
+        let outcome = boot::server(Some(&tls), &limits());
         assert!(
             matches!(outcome, Err(ServeTlsError::Unusable { .. })),
             "a certificate file containing {contents:?} must refuse the boot"
@@ -834,7 +898,7 @@ async fn an_undecodable_private_key_refuses_the_boot() {
     for contents in ["", "   ", "\n", "there is no key in this file\n"] {
         let key = TempPem::with(contents);
         let tls = serve_tls(cert.path(), key.path());
-        let outcome = boot::server(Some(&tls));
+        let outcome = boot::server(Some(&tls), &limits());
         assert!(
             matches!(outcome, Err(ServeTlsError::Unusable { .. })),
             "a key file containing {contents:?} must refuse the boot"
@@ -853,7 +917,7 @@ async fn a_certificate_and_a_key_that_do_not_match_refuse_the_boot() {
     let key = TempPem::with(&other.key_pem);
 
     let tls = serve_tls(cert.path(), key.path());
-    let outcome = boot::server(Some(&tls));
+    let outcome = boot::server(Some(&tls), &limits());
     assert!(
         matches!(outcome, Err(ServeTlsError::Unusable { .. })),
         "a certificate that does not belong to the key must refuse the boot"
@@ -904,7 +968,7 @@ async fn the_refusal_names_the_reason_rather_than_just_transport_error() {
     let key = TempPem::with(&other.key_pem);
 
     let tls = serve_tls(cert.path(), key.path());
-    let Err(error) = boot::server(Some(&tls)) else {
+    let Err(error) = boot::server(Some(&tls), &limits()) else {
         panic!("a certificate that does not belong to the key must refuse the boot");
     };
     // `boot::refusal` is the flattening `main` prints: lifecycle keeps tonic's

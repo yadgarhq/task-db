@@ -31,7 +31,7 @@ pub fn scope_of(scope: &Option<Scope>) -> Result<&Scope, Status> {
 /// Copy the scope fields a record needs, before the request is consumed.
 ///
 /// Empty strings when the scope is absent: the call is refused on its own merits,
-/// and telemetry must never be the thing that fails a request (D25).
+/// and telemetry must never be the thing that fails a request (D67).
 pub fn tel_scope(scope: &Option<Scope>) -> yadgar_telemetry::observe::Scope {
     let field = |f: fn(&Scope) -> &String| scope.as_ref().map(f).cloned().unwrap_or_default();
     yadgar_telemetry::observe::Scope {

@@ -243,3 +243,40 @@ fn an_unusable_migration_lock_wait_is_refused_naming_the_variable_and_the_chart_
         "the operator got the Debug variant, not the sentence: {stderr}"
     );
 }
+
+/// ADR-1006 (yaadgaar #218): the listener's four protocol limits are read right
+/// after the transport and carry no default. An absent one refuses the boot,
+/// and the refusal reaches the operator naming the variable AND the chart
+/// value that renders it, not a variant name.
+#[test]
+fn an_unset_listen_max_concurrent_streams_names_the_variable_and_the_chart_key() {
+    let stderr = refusal(&[
+        ("DB_HOST", "engine.example.invalid"),
+        ("DB_PORT", "13306"),
+        ("DB_NAME", "task_fixture"),
+        ("DB_USER", "task_fixture_user"),
+        ("DB_MAX_CONNECTIONS", "4"),
+        ("REPLICAS", "3"),
+        ("DB_ENGINE_MAX_CONNECTIONS", "200"),
+        ("DB_ENGINE_OPERATOR_RESERVE", "5"),
+        ("DB_ACQUIRE_TIMEOUT_SECONDS", "25"),
+        ("DB_IDLE_TIMEOUT_SECONDS", "600"),
+        ("DB_MAX_LIFETIME_SECONDS", "1800"),
+        ("DB_SSL_MODE", "verify-identity"),
+        ("DB_MIGRATION_LOCK_TIMEOUT_SECONDS", "60"),
+        ("LISTEN_TLS_ENABLED", "0"),
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
+    ]);
+    assert!(
+        stderr.contains("LISTEN_MAX_CONCURRENT_STREAMS"),
+        "the refusal must name the variable: {stderr}"
+    );
+    assert!(
+        stderr.contains("server.limits.maxConcurrentStreams"),
+        "the refusal must name the chart key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Missing"),
+        "the operator got the Debug variant, not the sentence: {stderr}"
+    );
+}

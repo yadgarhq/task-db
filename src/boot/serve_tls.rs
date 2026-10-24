@@ -15,7 +15,9 @@
 //! exactly the same path.
 
 use tonic::transport::Server;
-pub use yadgar_lifecycle::serve_tls::{ClientAuth, ServeTlsError, ServerTls, LISTEN};
+pub use yadgar_lifecycle::serve_tls::{
+    ClientAuth, ServeTlsError, ServerLimits, ServerLimitsError, ServerTls, LISTEN,
+};
 // THE ONE ERROR-CHAIN FLATTENER FOR THE ESTATE (ADR-0591).
 use yadgar_telemetry::diagnose::chain;
 
@@ -24,6 +26,11 @@ use yadgar_telemetry::diagnose::chain;
 /// `tls.clientCaSecret`), so an operator reading a crash loop knows which
 /// chart value to edit.
 pub const LISTEN_CHART_KEY: &str = "tls";
+
+/// The values block the listener's protocol limits render from (ADR-1006).
+/// Every refusal names a key under it (`server.limits.maxConcurrentStreams`,
+/// ...), so an operator reading a crash loop knows which chart value to edit.
+pub const LIMITS_CHART_KEY: &str = "server.limits";
 
 /// Read the listener's transport through `lookup`: `LISTEN_TLS_*`, named for
 /// `tls.*` in every refusal.
@@ -52,8 +59,30 @@ pub fn listener(
 /// the rustls acceptor here — the PEM decoded, the certificate matched to its
 /// key, the client CA parsed — so a bad mount exits without touching the
 /// engine. D69 puts the refusals first.
-pub fn server(tls: Option<&ServerTls>) -> Result<Server, ServeTlsError> {
-    yadgar_lifecycle::serve_tls::server(tls)
+pub fn server(tls: Option<&ServerTls>, limits: &ServerLimits) -> Result<Server, ServeTlsError> {
+    yadgar_lifecycle::serve_tls::server(tls, limits)
+}
+
+/// Read the listener's four protocol limits through `lookup`: `LISTEN_*`,
+/// named for `server.limits.*` in every refusal (ADR-1006).
+///
+/// **EVERY KEY IS REQUIRED.** The library has no default (ADR-0569, ADR-0705);
+/// the chart's `values.yaml` states them. An absent, non-numeric or
+/// out-of-range value refuses the boot, naming the variable and the chart
+/// value. `main` passes `std::env::var`, for the reason [`listener`] gives.
+///
+/// `main` reads it BEFORE [`server`], which applies it, so a bad key exits before
+/// the engine is touched.
+pub fn limits(lookup: impl Fn(&str) -> Option<String>) -> Result<ServerLimits, ServerLimitsError> {
+    ServerLimits::from_lookup(LISTEN, LIMITS_CHART_KEY, lookup)
+}
+
+/// The sentence `main` prints for a limits refusal. Lifecycle's `Display`
+/// already names the variable and the chart value and carries no `source`, so
+/// the flattener adds nothing; it is used for the one path every refusal in
+/// this binary takes (ADR-0591).
+pub fn limits_refusal(error: &ServerLimitsError) -> String {
+    chain(error)
 }
 
 /// The sentence `main` prints for a listener refusal: the WHOLE source chain,
@@ -67,4 +96,14 @@ pub fn server(tls: Option<&ServerTls>) -> Result<Server, ServeTlsError> {
 /// repeated reason is the cheaper failure than a missing one.
 pub fn refusal(error: &ServeTlsError) -> String {
     chain(error)
+}
+
+/// The sentence `main` prints when the serving task ends with an error, a port
+/// already in use included (yaadgaar #313).
+///
+/// tonic's own `Display` is the two words `transport error`; the address and the
+/// OS reason (`Address already in use`) are one `source()` hop down, so the
+/// flattener adds them and the address names which `LISTEN` failed.
+pub fn serve_refusal(addr: std::net::SocketAddr, error: &tonic::transport::Error) -> String {
+    format!("cannot serve on LISTEN={addr}: {}", chain(error))
 }
