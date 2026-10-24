@@ -1,24 +1,24 @@
 //! `database.acquireTimeoutSeconds`'s own ceiling, pinned against the ceiling
 //! a CALLER already imposes.
 //!
-//! Card C-DB2 (ADR-0837): `yadgar-store` v0.4.0 deletes the acquire wait's
-//! compiled-in 30s default and this chart states it instead, bounded
-//! `1..29`. **THE BOUND IS NOT ARBITRARY.** `task` reaches this module over
-//! `yadgar-dial`, whose `default_request_timeout()` is this process's own
-//! whole request deadline from the OTHER side — 30s. An acquire wait equal
-//! to or longer than that deadline could never surface as THIS pool's own
-//! error: the caller's timeout would always land first, one hop further
-//! from the cause, the same class of defect `boot::probe_connect_options`'s
-//! own doc comment names for a probe that built its own connection options.
-//! 29 leaves one second of margin; the shipped `25` leaves five.
+//! Card C-DB2 (ADR-0837) moved the acquire wait out of `yadgar-store` and into
+//! this chart. ADR-1006 then ruled that the timeout chain shrinks inward: each
+//! hop's timeout is strictly below its caller's. `task` reaches this module
+//! over `yadgar-dial`, and its request timeout is a chart value in `task`'s
+//! chart (ADR-0925 Q-C1, ADR-1006 default 14s), which this chart cannot read. The
+//! lowest value dial accepts for it is `min_request_timeout()`, also 14s. So
+//! the bound here is `1..13` and the shipped value is 12: below every
+//! deadline any caller can set. An acquire wait equal to or longer than the
+//! caller's deadline could never surface as THIS pool's error: the caller's
+//! timeout would always land first, one hop further from the cause.
 //!
 //! **THIS BINARY NEVER DIALS ANYTHING.** `yadgar-dial` is a dev-dependency
 //! only, named for this one comparison and nothing it ships (`Cargo.toml`).
 //!
 //! **EVERY NUMBER IS PINNED BY A LITERAL (ADR-0599),** the same discipline
-//! `tests/chart_grace_period.rs` already follows: the schema's `29` and the
-//! shipped `25` are read out of the real files rather than duplicated as
-//! constants here, `yadgar-dial`'s `30` is asserted against the function
+//! `tests/chart_grace_period.rs` already follows: the schema's `13` and the
+//! shipped `12` are read out of the real files rather than duplicated as
+//! constants here, `yadgar-dial`'s `14` is asserted against the function
 //! rather than assumed, and the relation between all three is asserted
 //! last.
 
@@ -107,45 +107,51 @@ fn schema_u64(key: &str, field: &str) -> u64 {
 #[test]
 fn the_acquire_timeout_bound_and_the_shipped_value_both_stay_below_the_callers_own_request_deadline(
 ) {
-    // THE LITERAL FIRST. If `yadgar-dial` ever moves its own request
-    // deadline, this is the assertion that reds and says so, rather than
-    // the comparison below quietly measuring against a number that moved.
-    let caller_deadline = yadgar_dial::default_request_timeout();
+    // THE LITERAL FIRST (ADR-1006). The caller's request timeout is a chart
+    // value in the CALLER's chart (`task`'s), which this chart cannot read.
+    // What it can read is the lowest value any caller can set:
+    // `yadgar_dial::min_request_timeout()`, one second above keepalive
+    // detection, and also the caller's ADR-1006 default. An acquire wait below
+    // that floor is below every caller's deadline. If dial ever moves its
+    // floor, this reds and says so rather than measuring against a number
+    // that moved.
+    let caller_floor = yadgar_dial::min_request_timeout();
     assert_eq!(
-        caller_deadline,
-        Duration::from_secs(30),
-        "yadgar-dial's own request deadline moved to {}s; re-derive \
+        caller_floor,
+        Duration::from_secs(14),
+        "yadgar-dial's lowest request timeout moved to {}s; re-derive \
          chart/values.schema.json's database.acquireTimeoutSeconds maximum (and its shipped \
          value) against it rather than leaving a bound measured against a number that no \
          longer holds",
-        caller_deadline.as_secs()
+        caller_floor.as_secs()
     );
 
     let schema_max = schema_u64("acquireTimeoutSeconds", "maximum");
     let shipped = database_scalar("acquireTimeoutSeconds");
 
     assert_eq!(
-        schema_max, 29,
+        schema_max, 13,
         "chart/values.schema.json's database.acquireTimeoutSeconds bound moved"
     );
     assert_eq!(
-        shipped, 25,
+        shipped, 12,
         "chart/values.yaml's shipped database.acquireTimeoutSeconds moved"
     );
 
-    // THE RELATION THAT MATTERS: an acquire wait at or above the caller's
-    // own deadline could never surface as THIS pool's error, because the
+    // THE RELATION THAT MATTERS (ADR-1006: each hop's timeout is strictly
+    // below its caller's): an acquire wait at or above the caller's own
+    // deadline could never surface as THIS pool's error, because the
     // caller's timeout always wins first.
     assert!(
-        schema_max < caller_deadline.as_secs(),
+        schema_max < caller_floor.as_secs(),
         "the schema allows database.acquireTimeoutSeconds up to {schema_max}s, which is not \
-         below yadgar-dial's {}s request deadline",
-        caller_deadline.as_secs()
+         below the lowest caller request deadline yadgar-dial accepts ({}s)",
+        caller_floor.as_secs()
     );
     assert!(
-        shipped < caller_deadline.as_secs(),
-        "the shipped database.acquireTimeoutSeconds ({shipped}s) is not below yadgar-dial's \
-         {}s request deadline",
-        caller_deadline.as_secs()
+        shipped < caller_floor.as_secs(),
+        "the shipped database.acquireTimeoutSeconds ({shipped}s) is not below the lowest \
+         caller request deadline yadgar-dial accepts ({}s)",
+        caller_floor.as_secs()
     );
 }

@@ -114,7 +114,17 @@ database:
   # derives max_connections from instance size, and a small instance is well
   # under it. On an engine with a smaller ceiling the pod could not start and
   # the operator had no value to change.
-  maxConnections: 8
+  #
+  # 3 PER REPLICA (ADR-1006). The engine is not the only cap: MariaDB also
+  # limits each ACCOUNT, and mariadb-operator writes `maxUserConnections: 20`
+  # on the user it creates for `database.user` (measured live on kind-yadgar,
+  # 2026-10-24; the MariaDB CRD has no knob for it). 3 x 6 (`autoscaling.maxReplicas`)
+  # = 18 fits; the old 8 x 6 = 48 did not, and `store` now refuses that at boot
+  # (`PoolError::WouldExceedUserCap`). Raising this or the replica ceiling needs
+  # the account's limit raised first — a chart-owned User CR is the follow-up.
+  # NOT YET SAFE MID-ROLL: a roll at the KEDA ceiling with `maxSurge: 1` runs
+  # 7 pods x 3 = 21, over 20 (tracked in yaadgaar #411).
+  maxConnections: 3
   engineMaxConnections: 151
 
   # THE RESERVE ITSELF (ADR-0849). `yadgar-store` compiled this in as `5`
@@ -136,20 +146,16 @@ database:
   # three sqlx defaults these replace — 30s, 600s and 1800s — the same shape
   # `migrationLockTimeoutSeconds` below already took for its own wait.
   #
-  # `acquireTimeoutSeconds` IS BOUNDED 1..29 (chart/values.schema.json),
-  # below `yadgar-dial`'s `REQUEST_TIMEOUT` of 30s: `task` reaches this
-  # module over that client, and an acquire wait equal to or longer than the
-  # caller's own deadline could never surface as THIS pool's error — the
-  # caller's timeout would always land first, one hop further from the
-  # cause. 25 leaves five seconds of margin.
-  #
-  # gateway's own `AUTH_DEADLINE` (10s) and `RESOLVE_DEADLINE` (5s) bound
-  # only gateway's calls to `iam` — they are not on the `task` -> `task-db`
-  # path this bound protects. gateway -> `task` carries no deadline of its
-  # own either; it dials through `yadgar-dial` too, at that client's same
-  # default 30s.
-  # `tests/chart_request_deadline.rs` pins both numbers against each other.
-  acquireTimeoutSeconds: 25
+  # `acquireTimeoutSeconds` IS BOUNDED 1..13 (chart/values.schema.json,
+  # ADR-1006): the timeout chain shrinks inward, each hop strictly below its
+  # caller. `task` reaches this module over `yadgar-dial`, whose request
+  # timeout is a value in `task`'s chart (ADR-1006 default 14s) that this chart cannot
+  # read; 14s is also the lowest that client accepts (`min_request_timeout`).
+  # An acquire wait equal to or longer than the caller's own deadline could
+  # never surface as THIS pool's error — the caller's timeout would always
+  # land first, one hop further from the cause. 12 leaves two seconds.
+  # `tests/chart_request_deadline.rs` pins the numbers against each other.
+  acquireTimeoutSeconds: 12
   # How long an idle connection is kept before the pool closes it. Replaces
   # sqlx's own 600s default.
   idleTimeoutSeconds: 600
