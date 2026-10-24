@@ -63,7 +63,8 @@ use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError};
 mod serve_tls;
 
 pub use serve_tls::{
-    listener, refusal, server, ClientAuth, ServeTlsError, ServerTls, LISTEN, LISTEN_CHART_KEY,
+    limits, limits_refusal, listener, refusal, serve_refusal, server, ClientAuth, ServeTlsError,
+    ServerLimits, ServerLimitsError, ServerTls, LIMITS_CHART_KEY, LISTEN, LISTEN_CHART_KEY,
 };
 
 /// The key this module used to read, and no longer does.

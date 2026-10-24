@@ -762,6 +762,25 @@ pub fn boot_cleartext_env(db_name: &str, password_file: &Path) -> Vec<(String, S
         // listener still refuses to boot without a stated client-auth mode,
         // and `off` is the only mode a cleartext listener accepts.
         ("LISTEN_TLS_CLIENT_AUTH".to_string(), "off".to_string()),
+        // THE FIVE LISTENER LIMITS (ADR-1006, yaadgaar #218). The library has no
+        // default for any of them, so the binary refuses to boot when one is
+        // absent. These are the chart's shipped defaults.
+        (
+            "LISTEN_MAX_CONCURRENT_STREAMS".to_string(),
+            "256".to_string(),
+        ),
+        (
+            "LISTEN_KEEPALIVE_INTERVAL_SECS".to_string(),
+            "30".to_string(),
+        ),
+        (
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS".to_string(),
+            "10".to_string(),
+        ),
+        (
+            "LISTEN_MAX_HEADER_LIST_BYTES".to_string(),
+            "16384".to_string(),
+        ),
     ]
 }
 

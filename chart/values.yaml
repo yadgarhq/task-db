@@ -353,6 +353,32 @@ tls:
   certSecretKey: tls.crt
   keySecretKey: tls.key
 
+# THE LISTENER'S PROTOCOL LIMITS (ADR-1006, yaadgaar #218). Chart values with
+# defaults, not constants: a limit belongs where an operator can change it.
+# `yadgar-lifecycle` takes all four as parameters and has NO default of its own
+# (ADR-0569, ADR-0705): the binary refuses to boot when one is absent, not a
+# whole number or outside the range below, naming the variable and the key.
+# `chart/values.schema.json` carries the same ranges, and
+# `templates/render-checks.yaml` refuses a keepalive timeout that is not below
+# its interval, which no schema can express. `tests/chart_server_limits.rs`
+# pins every number here against the library's own range constants.
+server:
+  # Connection age (ADR-1006, 30 min) omitted until tonic#2780 ships; yaadgaar #417.
+  limits:
+    # HTTP/2 streams one connection may have open at once. Rendered as
+    # LISTEN_MAX_CONCURRENT_STREAMS. Range 1..10000.
+    maxConcurrentStreams: 256
+    # Seconds between HTTP/2 keepalive PINGs on an idle connection. Rendered as
+    # LISTEN_KEEPALIVE_INTERVAL_SECS. Range 1..3600.
+    keepaliveIntervalSeconds: 30
+    # Seconds to wait for a PING's answer before dropping the connection.
+    # Rendered as LISTEN_KEEPALIVE_TIMEOUT_SECS. Range 1..600, and STRICTLY
+    # BELOW `keepaliveIntervalSeconds`.
+    keepaliveTimeoutSeconds: 10
+    # Largest HTTP/2 header list a request may carry, in bytes. Rendered as
+    # LISTEN_MAX_HEADER_LIST_BYTES. Range 1024..1048576.
+    maxHeaderListBytes: 16384
+
 # D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
 # waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet
 # exactly when the system is in trouble.

@@ -79,7 +79,7 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # ADR-0854) and verifies a client certificate against
 # LISTEN_TLS_CLIENT_CA_FILE when the mode is `optional` or `required`. Default
 # features stay on: `rotate` is the watcher above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
   "serve-tls",
 ] }
 sqlx = { version = "0.9", default-features = false, features = [

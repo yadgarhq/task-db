@@ -108,6 +108,49 @@
       "additionalProperties": false,
       "required": ["enabled", "clientAuth"]
     },
+    "server": {
+      "properties": {
+        "limits": {
+          "properties": {
+            "maxConcurrentStreams": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "description": "HTTP/2 streams one connection may have open at once. Rendered as LISTEN_MAX_CONCURRENT_STREAMS and read with no fallback (ADR-1006). Range 1..10000, the same as yadgar-lifecycle's ServerLimits."
+            },
+            "keepaliveIntervalSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600,
+              "description": "Seconds between HTTP/2 keepalive PINGs on an idle connection. Rendered as LISTEN_KEEPALIVE_INTERVAL_SECS and read with no fallback (ADR-1006). Range 1..3600, the same as yadgar-lifecycle's ServerLimits."
+            },
+            "keepaliveTimeoutSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 600,
+              "description": "Seconds to wait for a keepalive PING's answer before dropping the connection; must also be below keepaliveIntervalSeconds, which templates/render-checks.yaml refuses because a schema cannot express it. Rendered as LISTEN_KEEPALIVE_TIMEOUT_SECS and read with no fallback (ADR-1006). Range 1..600, the same as yadgar-lifecycle's ServerLimits."
+            },
+            "maxHeaderListBytes": {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 1048576,
+              "description": "Largest HTTP/2 header list a request may carry, in bytes. Rendered as LISTEN_MAX_HEADER_LIST_BYTES and read with no fallback (ADR-1006). Range 1024..1048576, the same as yadgar-lifecycle's ServerLimits."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "maxConcurrentStreams",
+            "keepaliveIntervalSeconds",
+            "keepaliveTimeoutSeconds",
+            "maxHeaderListBytes"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": ["limits"]
+    },
     "autoscaling": {
       "properties": {
         "enabled": {},

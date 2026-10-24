@@ -113,7 +113,22 @@ async fn a_sigterm_drains_the_server_instead_of_killing_the_process() {
     // `Routes::default()` answers every method with `Unimplemented`. What is
     // under test is the LIFECYCLE of the server, not any handler in it, and a
     // router that needs no pool keeps the rig honest about that.
-    let mut builder = boot::server(None).expect("a cleartext listener");
+    // The library has no default for the listener's limits (ADR-1006), so the rig
+    // states the chart's shipped four, through the call `main` makes.
+    let limits = boot::limits(|key| {
+        Some(
+            match key {
+                "LISTEN_MAX_CONCURRENT_STREAMS" => "256",
+                "LISTEN_KEEPALIVE_INTERVAL_SECS" => "30",
+                "LISTEN_KEEPALIVE_TIMEOUT_SECS" => "10",
+                "LISTEN_MAX_HEADER_LIST_BYTES" => "16384",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    })
+    .expect("the shipped limits are valid");
+    let mut builder = boot::server(None, &limits).expect("a cleartext listener");
     let router = builder.add_routes(tonic::service::Routes::default());
     let serving = tokio::spawn(async move {
         router
