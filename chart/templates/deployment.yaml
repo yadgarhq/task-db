@@ -264,16 +264,16 @@ spec:
             # in the binary any more: `yadgar-store` v0.4.0 deleted the `5` it
             # used to compile in, so this chart is the only place it is stated.
             - name: DB_ENGINE_OPERATOR_RESERVE
-              value: {{ .Values.database.engineOperatorReserve | quote }}
+              value: {{ .Values.database.engineOperatorReserve | int64 | quote }}
             # THE POOL'S OWN DURATIONS (ADR-0837, card C-DB2). No default
             # behind any of the three in the binary either: `yadgar-store`
             # v0.4.0 deleted sqlx's own 30s/600s/1800s.
             - name: DB_ACQUIRE_TIMEOUT_SECONDS
-              value: {{ .Values.database.acquireTimeoutSeconds | quote }}
+              value: {{ .Values.database.acquireTimeoutSeconds | int64 | quote }}
             - name: DB_IDLE_TIMEOUT_SECONDS
-              value: {{ .Values.database.idleTimeoutSeconds | quote }}
+              value: {{ .Values.database.idleTimeoutSeconds | int64 | quote }}
             - name: DB_MAX_LIFETIME_SECONDS
-              value: {{ .Values.database.maxLifetimeSeconds | quote }}
+              value: {{ .Values.database.maxLifetimeSeconds | int64 | quote }}
             # The migration lock's wait (ledger 814). No default behind it in the
             # binary; values.yaml carries the bound and its arithmetic.
             - name: DB_MIGRATION_LOCK_TIMEOUT_SECONDS
