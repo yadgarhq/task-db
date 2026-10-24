@@ -15,6 +15,7 @@ pub mod schema;
 pub mod service;
 pub mod setting;
 mod sql;
+pub mod txn;
 mod write;
 
 /// Generated from the vendored contract (D16, D70).

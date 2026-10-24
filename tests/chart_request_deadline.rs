@@ -12,8 +12,9 @@
 //! caller's deadline could never surface as THIS pool's error: the caller's
 //! timeout would always land first, one hop further from the cause.
 //!
-//! **THIS BINARY NEVER DIALS ANYTHING.** `yadgar-dial` is a dev-dependency
-//! only, named for this one comparison and nothing it ships (`Cargo.toml`).
+//! **THIS BINARY NEVER DIALS ANYTHING.** `yadgar-dial` is linked for
+//! `Deadline` alone (ADR-1019, `src/txn.rs`), and this test reads its floor
+//! back (`Cargo.toml`).
 //!
 //! **EVERY NUMBER IS PINNED BY A LITERAL (ADR-0599),** the same discipline
 //! `tests/chart_grace_period.rs` already follows: the schema's `13` and the

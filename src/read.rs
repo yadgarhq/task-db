@@ -1,11 +1,13 @@
 //! `GetTask` and `ListTasks`.
 
 use tonic::Status;
+use yadgar_dial::Deadline;
 
 use crate::pb::yadgar::task::v1::*;
 use crate::rows::{row_to_task, COLUMNS};
 use crate::service::TaskDb;
 use crate::sql::{internal, scope_of, Reach};
+use crate::txn;
 
 /// D56 bounds reads: an unbounded page is how one caller takes the whole table.
 ///
@@ -18,7 +20,11 @@ const MAX_PAGE: i32 = 500;
 const DEFAULT_PAGE: i32 = 50; // ADR-0569-EXCEPTION(CB): contract bound, not a knob — see the doc comment above.
 
 impl TaskDb {
-    pub(crate) async fn get(&self, req: GetTaskRequest) -> Result<GetTaskResponse, Status> {
+    pub(crate) async fn get(
+        &self,
+        req: GetTaskRequest,
+        deadline: Deadline,
+    ) -> Result<GetTaskResponse, Status> {
         let scope = scope_of(&req.scope)?;
         let reach = Reach::of(scope);
 
@@ -36,11 +42,12 @@ impl TaskDb {
                       WHERE id = ? AND deleted_at IS NULL AND {}",
                     clause.sql()
                 );
+                let mut held = txn::acquire(&self.pool, deadline).await?;
                 // AUDIT: the interpolation is this module's own predicate; every
                 // caller value is a bound parameter.
                 clause
                     .bind(reach.bind(sqlx::query(sqlx::AssertSqlSafe(sql)).bind(id)))
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(held.conn())
                     .await
             }
             Some(get_task_request::Key::Number(number)) => {
@@ -56,6 +63,7 @@ impl TaskDb {
                       WHERE number = ? AND deleted_at IS NULL AND project_id = ? AND {}",
                     clause.sql()
                 );
+                let mut held = txn::acquire(&self.pool, deadline).await?;
                 // AUDIT: as above.
                 clause
                     .bind(
@@ -65,7 +73,7 @@ impl TaskDb {
                                 .bind(reach.project()),
                         ),
                     )
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(held.conn())
                     .await
             }
             None => return Err(Status::invalid_argument("one of id or number is required")),
@@ -78,7 +86,11 @@ impl TaskDb {
         })
     }
 
-    pub(crate) async fn list(&self, req: ListTasksRequest) -> Result<ListTasksResponse, Status> {
+    pub(crate) async fn list(
+        &self,
+        req: ListTasksRequest,
+        deadline: Deadline,
+    ) -> Result<ListTasksResponse, Status> {
         let scope = scope_of(&req.scope)?;
         let reach = Reach::of(scope);
         let limit = page_size(req.page_size);
@@ -120,9 +132,10 @@ impl TaskDb {
         if !req.page_token.is_empty() {
             query = query.bind(&req.page_token);
         }
+        let mut held = txn::acquire(&self.pool, deadline).await?;
         let mut rows = query
             .bind(i64::from(limit) + 1)
-            .fetch_all(&self.pool)
+            .fetch_all(held.conn())
             .await
             .map_err(internal)?;
 
