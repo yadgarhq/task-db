@@ -195,7 +195,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// The BINARY installs the exporter, never the library — a library that
 /// installs one picks the backend for every service linking it. A failure here
 /// is logged and ignored: a service that cannot export metrics should still
-/// serve traffic, which is D25's rule applied to the metrics path too.
+/// serve traffic, which is D67's rule applied to the metrics path too.
 ///
 /// Its own function since `run` stopped being `#[tokio::main]`: clippy's
 /// cognitive-complexity ceiling did not see through the macro, and does now.
