@@ -168,6 +168,27 @@ impl World {
         Self::build(name, max_connections, None, None).await
     }
 
+    /// The same service against ONE connection that waits `acquire_timeout`
+    /// for it — the pool the ADR-1019 deadline tests exhaust by holding it.
+    ///
+    /// Migrated on the fixture pool first and then swapped: migration holds
+    /// two connections at once (`store`'s `MIN_CONNECTIONS`), so a one-wide
+    /// pool cannot migrate its own database.
+    pub async fn exhaustible(name: &str, acquire_timeout: std::time::Duration) -> Self {
+        let migrated = Self::fresh(name).await;
+        migrated.pool.close().await;
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(acquire_timeout)
+            .connect(&format!("{}/{name}", base()))
+            .await
+            .expect("pool");
+        Self {
+            db: TaskDb::new(pool.clone()),
+            pool,
+        }
+    }
+
     /// A database at migration `version` and no further — the state a data
     /// migration has to be handed in order to be tested at all.
     ///

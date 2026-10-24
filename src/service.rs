@@ -9,6 +9,7 @@
 
 use sqlx::MySqlPool;
 use tonic::{Request, Response, Status};
+use yadgar_dial::Deadline;
 use yadgar_telemetry::estimator::Class;
 use yadgar_telemetry::grpc::status_name;
 use yadgar_telemetry::observe::{Call, Outcome};
@@ -53,11 +54,12 @@ impl TaskDbService for TaskDb {
         &self,
         request: Request<CreateTaskRequest>,
     ) -> Result<Response<CreateTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(SERVICE, "CreateTask", Kind::Write, tel_scope(&req.scope));
 
         call.run(
-            async move { self.create(req).await },
+            async move { self.create(req, deadline).await },
             |r| envelope(r, 1),
             status_name,
         )
@@ -69,11 +71,12 @@ impl TaskDbService for TaskDb {
         &self,
         request: Request<GetTaskRequest>,
     ) -> Result<Response<GetTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(SERVICE, "GetTask", Kind::Read, tel_scope(&req.scope));
 
         call.run(
-            async move { self.get(req).await },
+            async move { self.get(req, deadline).await },
             |r| envelope(r, 1),
             status_name,
         )
@@ -85,11 +88,12 @@ impl TaskDbService for TaskDb {
         &self,
         request: Request<ListTasksRequest>,
     ) -> Result<Response<ListTasksResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(SERVICE, "ListTasks", Kind::Read, tel_scope(&req.scope));
 
         call.run(
-            async move { self.list(req).await },
+            async move { self.list(req, deadline).await },
             |r| envelope(r, r.tasks.len() as u32),
             status_name,
         )
@@ -101,11 +105,12 @@ impl TaskDbService for TaskDb {
         &self,
         request: Request<UpdateTaskRequest>,
     ) -> Result<Response<UpdateTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(SERVICE, "UpdateTask", Kind::Write, tel_scope(&req.scope));
 
         call.run(
-            async move { self.update(req).await },
+            async move { self.update(req, deadline).await },
             |r| envelope(r, 1),
             status_name,
         )
@@ -117,6 +122,7 @@ impl TaskDbService for TaskDb {
         &self,
         request: Request<DeleteTaskRequest>,
     ) -> Result<Response<DeleteTaskResponse>, Status> {
+        let deadline = Deadline::of(&request);
         let req = request.into_inner();
         let call = Call::start(SERVICE, "DeleteTask", Kind::Write, tel_scope(&req.scope));
 
@@ -124,7 +130,7 @@ impl TaskDbService for TaskDb {
         // delete costs time and belongs in the count, and omitting it would make
         // deletes invisible.
         call.run(
-            async move { self.delete(req).await },
+            async move { self.delete(req, deadline).await },
             |r| envelope(r, 1),
             status_name,
         )
