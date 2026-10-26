@@ -26,7 +26,7 @@ description = "The task module's -db twin: the only writer of its store, serving
 # this crate's headroom check used to hard-code. `boot::pool_config` below
 # now reads all four from the environment with no fallback, the same shape
 # every other knob here already takes.
-yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.4.0" }
+yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.6.0" }
 # In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
 # feature on tonic itself.
 tonic = { version = "0.14", default-features = false, features = [
@@ -79,7 +79,7 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # ADR-0854) and verifies a client certificate against
 # LISTEN_TLS_CLIENT_CA_FILE when the mode is `optional` or `required`. Default
 # features stay on: `rotate` is the watcher above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
   "serve-tls",
 ] }
 sqlx = { version = "0.9", default-features = false, features = [
@@ -106,6 +106,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v7"] }
 
+# THE CALLER'S DEADLINE (ADR-1019). `yadgar_dial::Deadline` reads the incoming
+# `grpc-timeout` once at handler entry, and `txn::acquire` bounds the pool wait
+# by what is left of it, `DEADLINE_MARGIN` included, so this module answers
+# DEADLINE_EXCEEDED itself before tonic drops the handler. The chart's
+# `database.acquireTimeoutSeconds` stays, as the ceiling.
+#
+# A NORMAL DEPENDENCY NOW, NOT A DEV ONE. It used to be named only so
+# `tests/chart_request_deadline.rs` could read `min_request_timeout()` back;
+# that test still does. The shipped tree gains what dial links: the `metrics`
+# facade (with `rapidhash` and `rustversion`), `rustls` with `std` only, and
+# tonic's `channel` feature. Every one was already in Cargo.lock through the
+# dev side, so the lock file moves only dial's own source line. This binary
+# still dials nothing.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.25" }
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 
@@ -126,14 +141,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # watching. Same crate and same features yadgar-dial uses for the client half of
 # this seam.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-# `tests/chart_request_deadline.rs` pins `database.acquireTimeoutSeconds`'s
-# schema bound below the caller's own request deadline (card C-DB2,
-# M-audit-C): this binary never dials out, so the only reason this crate
-# names `yadgar-dial` at all is to read `default_request_timeout()` back. A
-# dev-dependency only — the shipped binary gains no new crate. No
-# `[features]` table exists on this crate to pick one of, unlike
-# `yadgar-telemetry`'s `grpc` above.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.20" }
 
 [lints.rust]
 unsafe_code = "forbid"

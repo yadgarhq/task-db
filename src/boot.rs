@@ -63,7 +63,8 @@ use yadgar_store::pool::{parse_ssl_mode, PoolConfig, PoolError};
 mod serve_tls;
 
 pub use serve_tls::{
-    listener, refusal, server, ClientAuth, ServeTlsError, ServerTls, LISTEN, LISTEN_CHART_KEY,
+    limits, limits_refusal, listener, refusal, serve_refusal, server, ClientAuth, ServeTlsError,
+    ServerLimits, ServerLimitsError, ServerTls, LIMITS_CHART_KEY, LISTEN, LISTEN_CHART_KEY,
 };
 
 /// The key this module used to read, and no longer does.
@@ -154,9 +155,10 @@ const SSL_MODE_CHART_KEY: &str = "database.sslMode";
 const OPERATOR_RESERVE_KEY: &str = "DB_ENGINE_OPERATOR_RESERVE";
 const OPERATOR_RESERVE_CHART_KEY: &str = "database.engineOperatorReserve";
 
-/// Bounded above by `chart/values.schema.json`'s `maximum: 29` — below the
-/// dial client's own `REQUEST_TIMEOUT` (30s), so this pool's own acquire
-/// wait can never be the deadline a caller's whole request runs against.
+/// Bounded above by `chart/values.schema.json`'s `maximum: 13` — below the
+/// lowest request timeout a caller's dial client accepts (14s, ADR-1006), so
+/// this pool's own acquire wait can never be the deadline a caller's whole
+/// request runs against.
 /// `tests/chart_request_deadline.rs` pins the two together.
 const ACQUIRE_TIMEOUT_KEY: &str = "DB_ACQUIRE_TIMEOUT_SECONDS";
 const ACQUIRE_TIMEOUT_CHART_KEY: &str = "database.acquireTimeoutSeconds";

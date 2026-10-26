@@ -179,7 +179,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stop = stop_when(signals, tls_inputs, schedule);
 
     match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
+        Drain::Finished(result) => result.map_err(|e| boot::serve_refusal(addr, &e))?,
         // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
         // an error in the log, not a CrashLoopBackOff on top of it.
         Drain::Overran => tracing::error!(
@@ -195,7 +195,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// The BINARY installs the exporter, never the library — a library that
 /// installs one picks the backend for every service linking it. A failure here
 /// is logged and ignored: a service that cannot export metrics should still
-/// serve traffic, which is D25's rule applied to the metrics path too.
+/// serve traffic, which is D67's rule applied to the metrics path too.
 ///
 /// Its own function since `run` stopped being `#[tokio::main]`: clippy's
 /// cognitive-complexity ceiling did not see through the macro, and does now.
@@ -311,7 +311,9 @@ fn configure() -> Result<Configured, Box<dyn std::error::Error>> {
     // listener that opens in cleartext because TLS configuration failed, and
     // with one construction site there is nowhere else to write it.
     let tls = boot::listener(|key| std::env::var(key).ok()).map_err(|e| boot::refusal(&e))?;
-    let server = boot::server(tls.as_ref()).map_err(|e| boot::refusal(&e))?;
+    let limits =
+        boot::limits(|key| std::env::var(key).ok()).map_err(|e| boot::limits_refusal(&e))?;
+    let server = boot::server(tls.as_ref(), &limits).map_err(|e| boot::refusal(&e))?;
 
     // The credential never arrives as an environment variable — it is a mounted
     // Secret the operator issued (D58), read through the seam so this module has

@@ -9,6 +9,12 @@
 //! its harness is the one already measured green in CI against both cases
 //! below.
 //!
+//! **IN-FLIGHT CANARY.** This file does not see an in-flight call finishing.
+//! The one binary test that holds a call across SIGTERM and asserts the caller
+//! gets its answer is `yadgarhq/task`'s `sigterm_lets_an_in_flight_call_finish`
+//! (task#87, merged; yaadgaar #318). It is the single canary, and it is not
+//! copied here.
+//!
 //! The library tests prove the parts — `yadgar-lifecycle` that a signal
 //! resolves `shutdown()` and that a changed file resolves `rotate::watch`,
 //! `tests/assembly.rs` that the watch set holds the right files. None of
@@ -137,6 +143,57 @@ async fn a_rewritten_shared_document_drains_and_exits_zero() {
         "a rotation is not an error; it must drain and exit 0 ({})",
         describe(Some(status))
     );
+}
+
+/// Case (iii): a listener that cannot bind ends the process, NON-ZERO, ON ITS
+/// OWN (yaadgaar #313).
+///
+/// tonic binds inside the spawned serving task, so a port already in use ends
+/// that task with an error before anything asks it to stop. `drain_within`
+/// used to await only the stop request, so the error stayed unread and the
+/// process idled serving nothing until SIGTERM. A kubelet sees a Running pod
+/// whose port answers nothing. Now `drain_within` returns `Finished(Err)` the
+/// moment the task ends, and `main` exits 1 naming `LISTEN=<addr>` and the OS
+/// reason.
+///
+/// THE TEST SENDS NO SIGNAL. Sending SIGTERM was the only way to end the process
+/// before, and it hid the defect: the drain then returned the stale error.
+#[tokio::test]
+async fn a_bind_failure_exits_non_zero_on_its_own_naming_the_listen_address() {
+    let root = tempfile_dir("bind");
+    let mut env = cleartext_env("bind", &root).await;
+
+    // A port this test holds for the whole run, so the binary's bind fails.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port to hold");
+    let addr = held.local_addr().expect("the held port has an address");
+    for (key, value) in &mut env {
+        if key == "LISTEN" {
+            *value = addr.to_string();
+        }
+    }
+
+    let mut task_db = Booted::start(&env);
+    // The "listening" line is logged BEFORE the serving task binds, so the
+    // five seconds below start when the bind is attempted, not at process start.
+    task_db.wait_until_listening();
+    let status = task_db.wait_for_exit("on its own after the bind failed", MARGIN);
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a bind failure must exit non-zero ({})",
+        describe(Some(status))
+    );
+    let seen = task_db.seen().join("\n");
+    assert!(
+        seen.contains(&format!("LISTEN={addr}")),
+        "the refusal must name LISTEN=<addr>: {seen}"
+    );
+    assert!(
+        seen.contains("Address already in use"),
+        "the refusal must carry the OS reason: {seen}"
+    );
+    drop(held);
 }
 
 /// A per-test scratch directory for the password file `cleartext_env` writes

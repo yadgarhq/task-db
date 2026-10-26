@@ -168,6 +168,27 @@ impl World {
         Self::build(name, max_connections, None, None).await
     }
 
+    /// The same service against ONE connection that waits `acquire_timeout`
+    /// for it — the pool the ADR-1019 deadline tests exhaust by holding it.
+    ///
+    /// Migrated on the fixture pool first and then swapped: migration holds
+    /// two connections at once (`store`'s `MIN_CONNECTIONS`), so a one-wide
+    /// pool cannot migrate its own database.
+    pub async fn exhaustible(name: &str, acquire_timeout: std::time::Duration) -> Self {
+        let migrated = Self::fresh(name).await;
+        migrated.pool.close().await;
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(acquire_timeout)
+            .connect(&format!("{}/{name}", base()))
+            .await
+            .expect("pool");
+        Self {
+            db: TaskDb::new(pool.clone()),
+            pool,
+        }
+    }
+
     /// A database at migration `version` and no further — the state a data
     /// migration has to be handed in order to be tested at all.
     ///
@@ -762,6 +783,25 @@ pub fn boot_cleartext_env(db_name: &str, password_file: &Path) -> Vec<(String, S
         // listener still refuses to boot without a stated client-auth mode,
         // and `off` is the only mode a cleartext listener accepts.
         ("LISTEN_TLS_CLIENT_AUTH".to_string(), "off".to_string()),
+        // THE FIVE LISTENER LIMITS (ADR-1006, yaadgaar #218). The library has no
+        // default for any of them, so the binary refuses to boot when one is
+        // absent. These are the chart's shipped defaults.
+        (
+            "LISTEN_MAX_CONCURRENT_STREAMS".to_string(),
+            "256".to_string(),
+        ),
+        (
+            "LISTEN_KEEPALIVE_INTERVAL_SECS".to_string(),
+            "30".to_string(),
+        ),
+        (
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS".to_string(),
+            "10".to_string(),
+        ),
+        (
+            "LISTEN_MAX_HEADER_LIST_BYTES".to_string(),
+            "16384".to_string(),
+        ),
     ]
 }
 

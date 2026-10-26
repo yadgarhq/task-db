@@ -6,12 +6,14 @@
 use sqlx::types::Json;
 use sqlx::{MySql, Row as _, Transaction};
 use tonic::Status;
+use yadgar_dial::Deadline;
 
 use crate::idem::{self, Claimed};
 use crate::pb::yadgar::common::v1::{Meta, Scope, Visibility};
 use crate::pb::yadgar::task::v1::*;
 use crate::service::TaskDb;
 use crate::sql::{internal, scope_of, Reach};
+use crate::txn;
 
 // TWO VOCABULARIES IN FILES OF THEIR OWN, because this file crossed the shared
 // 500-line ceiling. Neither is a step of an RPC: `payload` is what D9's
@@ -51,6 +53,7 @@ impl TaskDb {
     pub(crate) async fn create(
         &self,
         req: CreateTaskRequest,
+        deadline: Deadline,
     ) -> Result<CreateTaskResponse, Status> {
         let scope = scope_of(&req.scope)?;
         let task = req
@@ -59,7 +62,8 @@ impl TaskDb {
             .ok_or_else(|| Status::invalid_argument("task is required"))?;
         assigned_by_the_module(task.meta.as_ref())?;
 
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut held = txn::acquire(&self.pool, deadline).await?;
+        let mut tx = held.begin().await?;
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
@@ -165,6 +169,7 @@ impl TaskDb {
     pub(crate) async fn update(
         &self,
         req: UpdateTaskRequest,
+        deadline: Deadline,
     ) -> Result<UpdateTaskResponse, Status> {
         let scope = scope_of(&req.scope)?;
         let task = req
@@ -175,7 +180,8 @@ impl TaskDb {
         let fields = fields_of(req.update_mask.as_ref())?;
         let reach = Reach::of(scope);
 
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut held = txn::acquire(&self.pool, deadline).await?;
+        let mut tx = held.begin().await?;
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
@@ -321,11 +327,13 @@ impl TaskDb {
     pub(crate) async fn delete(
         &self,
         req: DeleteTaskRequest,
+        deadline: Deadline,
     ) -> Result<DeleteTaskResponse, Status> {
         let scope = scope_of(&req.scope)?;
         let reach = Reach::of(scope);
 
-        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let mut held = txn::acquire(&self.pool, deadline).await?;
+        let mut tx = held.begin().await?;
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
