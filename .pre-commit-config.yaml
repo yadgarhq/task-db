@@ -39,7 +39,7 @@ repos:
     # judged reads; v1.34.0 accepts the `ADR-0523-LIBRARY-WATCHED` declaration
     # `src/rotate.rs` now carries. The bump also brings v1.32/v1.33's hook
     # changes; see the PR body for what they measured here.
-    rev: v1.36.1
+    rev: v1.37.0
     hooks:
       - id: gitleaks
       - id: prettier
