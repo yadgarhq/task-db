@@ -98,6 +98,7 @@ async fn a_replayed_update_returns_the_original_outcome() {
         expect_version: 1,
         task: a_task("after"),
         update_mask: None,
+        caller_fingerprint: vec![],
         idempotency: key("k-update"),
     };
 
@@ -134,6 +135,7 @@ async fn a_replayed_delete_is_not_an_error() {
         scope: w.scope(P_A, U1),
         id: id.clone(),
         expect_version: 1,
+        caller_fingerprint: vec![],
         idempotency: key("k-delete"),
     };
 
@@ -195,6 +197,7 @@ async fn a_key_reused_for_a_different_operation_is_refused() {
             scope: w.scope(P_A, U1),
             id,
             expect_version: 1,
+            caller_fingerprint: vec![],
             idempotency: key("reused"),
         }))
         .await
@@ -225,6 +228,7 @@ async fn a_failed_write_leaves_no_claim_behind() {
         expect_version: 99,
         task: a_task("nope"),
         update_mask: None,
+        caller_fingerprint: vec![],
         idempotency: key("k-fail"),
     };
     w.db.update_task(Request::new(bad))
@@ -237,6 +241,7 @@ async fn a_failed_write_leaves_no_claim_behind() {
         expect_version: 1,
         task: a_task("corrected"),
         update_mask: None,
+        caller_fingerprint: vec![],
         idempotency: key("k-fail"),
     }))
     .await
@@ -301,6 +306,7 @@ async fn a_key_reused_with_a_different_update_is_refused() {
         expect_version: 1,
         task: a_task(title),
         update_mask: None,
+        caller_fingerprint: vec![],
         idempotency: key("k-differ-update"),
     };
 
@@ -338,6 +344,7 @@ async fn a_reordered_update_mask_is_still_a_replay() {
         update_mask: Some(prost_types::FieldMask {
             paths: paths.into_iter().map(String::from).collect(),
         }),
+        caller_fingerprint: vec![],
         idempotency: key("k-mask"),
     };
 
@@ -406,7 +413,7 @@ async fn a_claim_recorded_before_the_fingerprint_still_replays() {
 
     assert_eq!(
         w.migrate_to_head().await,
-        7,
+        8,
         "the fixture stopped at 5, so the fingerprint migration and everything after it ran"
     );
 

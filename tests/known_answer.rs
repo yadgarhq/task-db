@@ -167,6 +167,7 @@ async fn the_stored_fingerprint_of_an_update_is_exactly_these_bytes() {
         update_mask: Some(prost_types::FieldMask {
             paths: vec!["title".into(), "body".into(), "title".into()],
         }),
+        caller_fingerprint: vec![],
         idempotency: key("kat-update"),
     }))
     .await
@@ -205,6 +206,7 @@ async fn the_stored_fingerprint_of_a_delete_is_exactly_these_bytes() {
         scope: w.scope(P_A, U1),
         id,
         expect_version: 1,
+        caller_fingerprint: vec![],
         idempotency: key("kat-delete"),
     }))
     .await
@@ -217,5 +219,74 @@ async fn the_stored_fingerprint_of_a_delete_is_exactly_these_bytes() {
             .expect("a claim taken with a key must record a fingerprint")),
         "59fe72d80c2dfe369eea83169ec74abce0f14476a4c86298f678e612cf01c758",
         "the bytes written for a DeleteTask claim have moved"
+    );
+}
+
+/// **THE STORE FINGERPRINT EXCLUDES `caller_fingerprint` (ADR-1051 rule 4).**
+/// The two requests above, each now carrying 32 bytes of caller fingerprint,
+/// must store EXACTLY the digests they stored without one.
+///
+/// The tests above cannot catch a `Payload` that forgot to clear the field:
+/// they send it empty, and proto3 encodes an empty `bytes` as nothing at all,
+/// so the digest is the same whether the field is cleared or not. These are
+/// the only known-answer tests that send it populated. Without the exclusion
+/// an old caller and a new one sending the same write would differ by this
+/// field alone.
+#[tokio::test]
+async fn the_stored_fingerprint_of_an_update_does_not_cover_the_caller_fingerprint() {
+    let w = World::fresh("td_kat_update_caller").await;
+    let id = w.seed_row(P_A, U1, 1, Visibility::Private as i8, "").await;
+    assert_eq!(id, SEEDED_ID, "the literal below is built from this id");
+
+    w.db.update_task(Request::new(UpdateTaskRequest {
+        scope: w.scope(P_A, U1),
+        id,
+        expect_version: 1,
+        task: Some(Task {
+            title: "kat".into(),
+            ..Default::default()
+        }),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".into(), "body".into(), "title".into()],
+        }),
+        caller_fingerprint: vec![7; 32],
+        idempotency: key("kat-update-caller"),
+    }))
+    .await
+    .expect("update");
+
+    assert_eq!(
+        hex(&w
+            .stored_fingerprint(P_A, U1, "kat-update-caller")
+            .await
+            .expect("a claim taken with a key must record a fingerprint")),
+        "bb36ca9e753a7a6eaf484c6ff4953d2d04906ccbfaea07b717c8bf1864279c7a",
+        "the digest `the_stored_fingerprint_of_an_update_is_exactly_these_bytes` pins"
+    );
+}
+
+#[tokio::test]
+async fn the_stored_fingerprint_of_a_delete_does_not_cover_the_caller_fingerprint() {
+    let w = World::fresh("td_kat_delete_caller").await;
+    let id = w.seed_row(P_A, U1, 1, Visibility::Private as i8, "").await;
+    assert_eq!(id, SEEDED_ID, "the literal below is built from this id");
+
+    w.db.delete_task(Request::new(DeleteTaskRequest {
+        scope: w.scope(P_A, U1),
+        id,
+        expect_version: 1,
+        caller_fingerprint: vec![9; 32],
+        idempotency: key("kat-delete-caller"),
+    }))
+    .await
+    .expect("delete");
+
+    assert_eq!(
+        hex(&w
+            .stored_fingerprint(P_A, U1, "kat-delete-caller")
+            .await
+            .expect("a claim taken with a key must record a fingerprint")),
+        "59fe72d80c2dfe369eea83169ec74abce0f14476a4c86298f678e612cf01c758",
+        "the digest `the_stored_fingerprint_of_a_delete_is_exactly_these_bytes` pins"
     );
 }

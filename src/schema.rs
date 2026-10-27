@@ -42,6 +42,7 @@ fn all() -> Vec<Migration> {
         heal_unspecified_visibility(),
         task_write_request_fingerprint(),
         task_title_at_most_128(),
+        task_write_caller_fingerprint(),
     ]
 }
 
@@ -230,6 +231,35 @@ fn task_write_request_fingerprint() -> Migration {
         name: "task_write_request_fingerprint".into(),
         sql: "ALTER TABLE task_write
                 ADD COLUMN request_fingerprint BINARY(32) NULL DEFAULT NULL"
+            .into(),
+    }
+}
+
+/// The caller fingerprint a claim stores (ADR-1051 rule 4): the logic service's
+/// own SHA-256 of the request it was answering, so `LookupWrite` can compare a
+/// retry against the claim BEFORE that service reads the task, and so a claim
+/// collision can be decided on the caller's request rather than on a store
+/// payload built from a read that may since have moved.
+///
+/// `BINARY(32)` for the reason migration 6's column is: a SHA-256 digest is
+/// exactly 32 bytes and never pads. The writer binds an absent fingerprint as
+/// NULL, never as empty bytes, which this type would pad to 32 zeros.
+///
+/// **NULLABLE, and NULL means "nothing to compare", as on migration 6.** Every
+/// claim recorded before this migration, every `CreateTask` claim, and every
+/// write sent without one carries NULL, and a NULL replays: a lookup does not
+/// compare, and a colliding write falls back to the store fingerprint.
+///
+/// **THE DERIVATION IS A COMPATIBILITY SURFACE.** A change to how the logic
+/// service computes these bytes needs a migration here that sets the column to
+/// NULL; otherwise every retry across that deploy is refused as a different
+/// request (ADR-1051 rule 5).
+fn task_write_caller_fingerprint() -> Migration {
+    Migration {
+        version: 8,
+        name: "task_write_caller_fingerprint".into(),
+        sql: "ALTER TABLE task_write
+                ADD COLUMN caller_fingerprint BINARY(32) NULL DEFAULT NULL"
             .into(),
     }
 }

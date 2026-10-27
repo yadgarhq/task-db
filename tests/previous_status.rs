@@ -57,6 +57,7 @@ fn request(
             ..Default::default()
         }),
         update_mask: mask(paths),
+        caller_fingerprint: vec![],
         idempotency: key
             .map(|k| yadgar_task_db::pb::yadgar::common::v1::Idempotency { key: k.into() }),
     }

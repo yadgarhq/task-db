@@ -22,6 +22,7 @@ use sqlx::Row as _;
 use support::{World, P_A, U1};
 use tonic::{Code, Request, Status};
 use yadgar_dial::Deadline;
+use yadgar_task_db::pb::yadgar::common::v1::Idempotency;
 use yadgar_task_db::pb::yadgar::task::v1::task_db_service_server::TaskDbService as _;
 use yadgar_task_db::pb::yadgar::task::v1::*;
 use yadgar_task_db::txn;
@@ -167,6 +168,7 @@ async fn every_rpc(
                 update_mask: Some(prost_types::FieldMask {
                     paths: vec!["title".into()],
                 }),
+                caller_fingerprint: vec![],
                 idempotency: None,
             },
             timeout
@@ -179,7 +181,22 @@ async fn every_rpc(
                 scope: scope(world),
                 id: "yadgar:task:x".into(),
                 expect_version: 1,
+                caller_fingerprint: vec![],
                 idempotency: None,
+            },
+            timeout
+        ))
+    );
+    // A READ with no transaction, but it still takes a connection, so the
+    // caller's deadline bounds its acquire exactly as it bounds the others.
+    run!(
+        "LookupWrite",
+        world.db.lookup_write(with_deadline(
+            LookupWriteRequest {
+                scope: scope(world),
+                idempotency: Some(Idempotency { key: "k".into() }),
+                rpc: WriteRpc::UpdateTask as i32,
+                caller_fingerprint: vec![1; 32],
             },
             timeout
         ))

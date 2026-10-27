@@ -3,7 +3,7 @@
 //! One RPC is one transaction (D5), and scope is enforced on every path rather
 //! than trusted from the caller. The operations themselves live next door —
 //! `read` for the two that answer questions, `write` for the three that change
-//! something — because what a handler does HERE is start a `Call`, hand off, and
+//! something, `idem::lookup` for the read of the claim ledger — because what a handler does HERE is start a `Call`, hand off, and
 //! record what came back. Keeping the boundary and the statements in one file is
 //! what made a missing `WHERE` clause hard to see.
 
@@ -132,6 +132,25 @@ impl TaskDbService for TaskDb {
         call.run(
             async move { self.delete(req, deadline).await },
             |r| envelope(r, 1),
+            status_name,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn lookup_write(
+        &self,
+        request: Request<LookupWriteRequest>,
+    ) -> Result<Response<LookupWriteResponse>, Status> {
+        let deadline = Deadline::of(&request);
+        let req = request.into_inner();
+        // A READ (ADR-1051): it takes no lock and writes nothing, whatever it
+        // answers. One row on a hit, none on a miss — and a miss is `OK`.
+        let call = Call::start(SERVICE, "LookupWrite", Kind::Read, tel_scope(&req.scope));
+
+        call.run(
+            async move { self.lookup(req, deadline).await },
+            |r| envelope(r, u32::from(r.outcome.is_some())),
             status_name,
         )
         .await

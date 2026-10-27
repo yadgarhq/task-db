@@ -37,6 +37,7 @@ async fn set_status(w: &World, id: &str, version: u64, status: TaskStatus) {
             ..Default::default()
         }),
         update_mask: None,
+        caller_fingerprint: vec![],
         idempotency: None,
     }))
     .await

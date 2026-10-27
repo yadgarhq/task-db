@@ -25,8 +25,8 @@
 //!
 //! **Which fields count as the payload is per-RPC**, and D9 requires that
 //! stated per field rather than left to a reader. This module's answer, for all
-//! three of its mutating RPCs: **every field of the request except `scope` and
-//! `idempotency`.**
+//! three of its mutating RPCs: **every field of the request except `scope`,
+//! `idempotency` and `caller_fingerprint`.**
 //!
 //! - `CreateTask` — `task`.
 //! - `UpdateTask` — `id`, `expect_version`, `task`, `update_mask`.
@@ -35,13 +35,27 @@
 //! `scope` is excluded because it is already the claim's key: a row is found by
 //! `(project_id, user_id, idem_key)`, so a differing scope reaches a different
 //! row and never a comparison. `idempotency` excludes itself — it carries the
-//! key the comparison is keyed on. Nothing else is excluded, and the test for
-//! whether a field belongs is D9's: whether a replay would silently discard the
-//! difference. Every remaining field fails that test.
+//! key the comparison is keyed on. `caller_fingerprint` (ADR-1051, on
+//! `UpdateTask` and `DeleteTask` only) is excluded because it is a SECOND
+//! comparison with its own column, below; inside the store digest it would make
+//! an old caller and a new one sending the same write differ by that field
+//! alone. Nothing else is excluded, and the test for whether a field belongs is
+//! D9's: whether a replay would silently discard the difference. Every
+//! remaining field fails that test.
 //!
 //! `update_mask.paths` is SORTED before the digest is taken. `["title","body"]`
 //! and `["body","title"]` name the same fields and encode to different bytes, so
 //! an unsorted digest would refuse a request that discards nothing.
+//!
+//! **THE CALLER FINGERPRINT (ADR-1051, migration 8).** The logic service's own
+//! digest of the request IT was answering, computed before it reads the task.
+//! The claim stores it in `caller_fingerprint`, NULL when the write carried
+//! none. On a collision, when BOTH the stored claim and the retry carry one,
+//! that comparison decides and the store digest is not consulted: task copies
+//! fields out of its read into the store payload, so a retry after a concurrent
+//! change differs in the store digest while being the same caller request.
+//! Otherwise the store digest decides, exactly as before the field existed.
+//! [`decide`] is that rule, and [`lookup`]'s `LookupWrite` uses it too.
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -50,6 +64,92 @@ use tonic::Status;
 
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
 use crate::sql::internal;
+
+// `LookupWrite` (ADR-1051): a read of this ledger by key, in a file of its own
+// because `write.rs` sits near the shared 500-line ceiling and the RPC is a read.
+mod lookup;
+
+/// The `rpc` each write records its claim under. ONE spelling each, because
+/// `LookupWrite` maps a `WriteRpc` onto the same column the writes fill.
+pub const CREATE_TASK: &str = "CreateTask";
+pub const UPDATE_TASK: &str = "UpdateTask";
+pub const DELETE_TASK: &str = "DeleteTask";
+
+/// A used key naming another write RPC than the one asking.
+const DIFFERENT_OPERATION: &str = "this idempotency key was already used for a different operation";
+
+/// A used key whose recorded request differs from the one asking.
+const DIFFERENT_REQUEST: &str = "this idempotency key was already used for a different request — \
+     a replay would discard what this one asked for";
+
+/// The columns a recorded claim is decided on, in [`Recorded`]'s order.
+const RECORDED: &str = "rpc, response, request_fingerprint, caller_fingerprint";
+
+/// One claim as stored: `rpc`, `response`, `request_fingerprint`,
+/// `caller_fingerprint`. Both fingerprints are nullable.
+type Recorded = (String, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What the request asking about a claim brings to compare against it.
+/// `request` is the store digest, which `LookupWrite` cannot compute and so
+/// never carries.
+struct Presented<'a> {
+    rpc: &'a str,
+    request: Option<&'a [u8; 32]>,
+    caller: Option<&'a [u8; 32]>,
+}
+
+/// A caller fingerprint as received (ADR-1051 rule 4). EMPTY MEANS ABSENT —
+/// proto3 `bytes` has no presence bit, and empty is what every caller that
+/// predates the field sends. Present, it is exactly 32 bytes or refused.
+pub fn caller_fingerprint(bytes: &[u8]) -> Result<Option<[u8; 32]>, Status> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    <[u8; 32]>::try_from(bytes).map(Some).map_err(|_| {
+        Status::invalid_argument(format!(
+            "caller_fingerprint must be empty or exactly 32 bytes, not {}",
+            bytes.len()
+        ))
+    })
+}
+
+/// Decide a recorded claim against the request presenting the same key: refuse
+/// it, or return the outcome exactly as recorded.
+///
+/// The rpc first: decoding a stored `CreateTaskResponse` as a
+/// `DeleteTaskResponse` would succeed and mean nothing. Then ONE fingerprint
+/// comparison — the caller fingerprints when both sides carry one, the store
+/// digests otherwise. A NULL on the side being compared is not a difference:
+/// there is nothing to compare, so it replays.
+fn decide<T: Message + Default>(row: Recorded, presented: Presented<'_>) -> Result<T, Status> {
+    let (rpc, response, request, caller) = row;
+    if rpc != presented.rpc {
+        return Err(Status::invalid_argument(DIFFERENT_OPERATION));
+    }
+
+    // D9 as amended. A key reused with a DIFFERENT request is refused, because
+    // replaying it hands the first request's outcome to a caller who sent a
+    // second: the operation actually asked for is discarded and the answer
+    // reports success. The caller cannot tell, and refusing never lies.
+    let differs = |stored: Option<Vec<u8>>, sent: Option<&[u8; 32]>| {
+        stored
+            .zip(sent)
+            .is_some_and(|(s, f)| s.as_slice() != f.as_slice())
+    };
+    let refused = if caller.is_some() && presented.caller.is_some() {
+        differs(caller, presented.caller)
+    } else {
+        differs(request, presented.request)
+    };
+    if refused {
+        return Err(Status::invalid_argument(DIFFERENT_REQUEST));
+    }
+
+    T::decode(response.as_slice()).map_err(|e| {
+        tracing::error!(error = %e, rpc, "a recorded idempotent outcome no longer decodes");
+        Status::internal("storage error")
+    })
+}
 
 /// What to do about a key that has been offered.
 pub enum Claimed<T> {
@@ -76,12 +176,14 @@ pub fn fingerprint(payload: &[u8]) -> [u8; 32] {
 ///
 /// `payload` is a thunk rather than bytes on purpose: a caller that supplies no
 /// key does not participate, and encoding a request body it will never be
-/// compared against is work nobody asked for.
+/// compared against is work nobody asked for. `caller` is the request's caller
+/// fingerprint as [`caller_fingerprint`] validated it; `CreateTask` has none.
 pub async fn claim<T, P>(
     tx: &mut Transaction<'_, MySql>,
     scope: &Scope,
     rpc: &str,
     idem: Option<&Idempotency>,
+    caller: Option<&[u8; 32]>,
     payload: P,
 ) -> Result<Claimed<T>, Status>
 where
@@ -101,22 +203,33 @@ where
     // The fingerprint is bound HERE rather than in `record`, so it commits with
     // the claim and inside the caller's transaction. A write that fails leaves
     // neither, which is what keeps its retry a fresh attempt.
+    //
+    // `caller` binds as NULL when absent, never as empty bytes: `BINARY(32)`
+    // pads, so empty would store thirty-two zeros that every later lookup
+    // compares against and refuses.
     let claimed = sqlx::query(
         "INSERT INTO task_write
-           (project_id, user_id, idem_key, rpc, response, request_fingerprint)
-         VALUES (?, ?, ?, ?, '', ?)",
+           (project_id, user_id, idem_key, rpc, response, request_fingerprint,
+            caller_fingerprint)
+         VALUES (?, ?, ?, ?, '', ?, ?)",
     )
     .bind(&scope.project_id)
     .bind(&scope.user_id)
     .bind(key)
     .bind(rpc)
     .bind(fingerprint.as_slice())
+    .bind(caller.map(<[u8; 32]>::as_slice))
     .execute(&mut **tx)
     .await;
 
+    let presented = Presented {
+        rpc,
+        request: Some(&fingerprint),
+        caller,
+    };
     match claimed {
         Ok(_) => Ok(Claimed::Proceed),
-        Err(e) if is_duplicate(&e) => replay(tx, scope, rpc, key, &fingerprint).await,
+        Err(e) if is_duplicate(&e) => replay(tx, scope, key, presented).await,
         Err(e) => Err(internal(e)),
     }
 }
@@ -124,55 +237,32 @@ where
 async fn replay<T: Message + Default>(
     tx: &mut Transaction<'_, MySql>,
     scope: &Scope,
-    rpc: &str,
     key: &str,
-    fingerprint: &[u8; 32],
+    presented: Presented<'_>,
 ) -> Result<Claimed<T>, Status> {
     // `FOR UPDATE`, and it is not about locking. A plain SELECT here reads this
     // transaction's snapshot, which was taken before the row the other writer
     // just committed — so it would find nothing and the replay would look like a
     // fresh key. A locking read always sees the latest committed version.
-    let row: (String, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT rpc, response, request_fingerprint FROM task_write
-          WHERE project_id = ? AND user_id = ? AND idem_key = ?
-          FOR UPDATE",
-    )
-    .bind(&scope.project_id)
-    .bind(&scope.user_id)
-    .bind(key)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(internal)?;
-
-    if row.0 != rpc {
-        // Decoding a stored CreateTaskResponse as a DeleteTaskResponse would
-        // succeed and mean nothing, so this is refused rather than guessed at.
-        return Err(Status::invalid_argument(
-            "this idempotency key was already used for a different operation",
-        ));
-    }
-
-    // D9 as amended. A key reused with a DIFFERENT payload is refused, because
-    // replaying it hands the first request's outcome to a caller who sent a
-    // second: the operation actually asked for is discarded and the answer
-    // reports success. The caller cannot tell, and refusing never lies.
     //
-    // A NULL fingerprint is a claim recorded before migration 6 and is NOT a
-    // difference — there is nothing to compare, so it replays as it always did.
-    let recorded = row.2;
-    if recorded.is_some_and(|r| r.as_slice() != fingerprint.as_slice()) {
-        return Err(Status::invalid_argument(
-            "this idempotency key was already used for a different request — \
-             a replay would discard what this one asked for",
-        ));
-    }
+    // A NULL request fingerprint is a claim recorded before migration 6, and a
+    // NULL caller fingerprint one recorded before migration 8 or without one;
+    // neither is a difference, and [`decide`] replays them as they always did.
+    let sql = format!(
+        "SELECT {RECORDED} FROM task_write
+          WHERE project_id = ? AND user_id = ? AND idem_key = ?
+          FOR UPDATE"
+    );
+    // AUDIT: the interpolation is this module's own column list.
+    let row: Recorded = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&scope.project_id)
+        .bind(&scope.user_id)
+        .bind(key)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(internal)?;
 
-    T::decode(row.1.as_slice())
-        .map(Claimed::Replay)
-        .map_err(|e| {
-            tracing::error!(error = %e, rpc, "a recorded idempotent outcome no longer decodes");
-            Status::internal("storage error")
-        })
+    decide(row, presented).map(Claimed::Replay)
 }
 
 /// Record the outcome, so the retry that arrives in a moment has something to
