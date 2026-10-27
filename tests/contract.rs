@@ -94,6 +94,7 @@ async fn only_the_owner_may_delete_and_the_row_survives() {
         scope: w.scope(P_A, user),
         id: id.clone(),
         expect_version: 1,
+        caller_fingerprint: vec![],
         idempotency: None,
     };
 
@@ -194,6 +195,7 @@ async fn an_update_rewrites_tags_and_links() {
         update_mask: mask.map(|paths| prost_types::FieldMask {
             paths: paths.into_iter().map(String::from).collect(),
         }),
+        caller_fingerprint: vec![],
         idempotency: None,
     };
 
@@ -431,6 +433,7 @@ async fn a_caller_supplied_meta_on_update_is_refused() {
                     ..new_task("rewritten")
                 }),
                 update_mask: None,
+                caller_fingerprint: vec![],
                 idempotency: None,
             }))
             .await
@@ -470,6 +473,7 @@ async fn an_absent_or_empty_meta_on_update_is_accepted() {
                 ..new_task("edited")
             }),
             update_mask: None,
+            caller_fingerprint: vec![],
             idempotency: None,
         }))
         .await

@@ -789,6 +789,7 @@ async fn delete_stays_owner_only_even_for_an_org_task() {
             scope: c.scope(P_A, U2),
             id: c.u3_org.clone(),
             expect_version: 1,
+            caller_fingerprint: vec![],
             idempotency: None,
         }))
         .await

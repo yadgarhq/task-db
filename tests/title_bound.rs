@@ -99,7 +99,7 @@ async fn migration_7_admits_a_database_whose_titles_are_at_most_128_code_points(
     let w = World::fresh_at("td_title_admit", 6).await;
     let id = seed_titled(&w, 1, &persian(128)).await;
 
-    assert_eq!(w.migrate_to_head().await, 7);
+    assert_eq!(w.migrate_to_head().await, 8);
     assert_eq!(stored_title(&w, &id).await, persian(128));
 }
 

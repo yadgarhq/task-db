@@ -67,8 +67,9 @@ impl TaskDb {
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
-            "CreateTask",
+            idem::CREATE_TASK,
             req.idempotency.as_ref(),
+            None,
             || req.payload(),
         )
         .await?
@@ -178,6 +179,7 @@ impl TaskDb {
             .ok_or_else(|| Status::invalid_argument("task is required"))?;
         assigned_by_the_module(task.meta.as_ref())?;
         let fields = fields_of(req.update_mask.as_ref())?;
+        let caller = idem::caller_fingerprint(&req.caller_fingerprint)?;
         let reach = Reach::of(scope);
 
         let mut held = txn::acquire(&self.pool, deadline).await?;
@@ -185,8 +187,9 @@ impl TaskDb {
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
-            "UpdateTask",
+            idem::UPDATE_TASK,
             req.idempotency.as_ref(),
+            caller.as_ref(),
             || req.payload(),
         )
         .await?
@@ -330,6 +333,7 @@ impl TaskDb {
         deadline: Deadline,
     ) -> Result<DeleteTaskResponse, Status> {
         let scope = scope_of(&req.scope)?;
+        let caller = idem::caller_fingerprint(&req.caller_fingerprint)?;
         let reach = Reach::of(scope);
 
         let mut held = txn::acquire(&self.pool, deadline).await?;
@@ -337,8 +341,9 @@ impl TaskDb {
         if let Claimed::Replay(original) = idem::claim(
             &mut tx,
             scope,
-            "DeleteTask",
+            idem::DELETE_TASK,
             req.idempotency.as_ref(),
+            caller.as_ref(),
             || req.payload(),
         )
         .await?

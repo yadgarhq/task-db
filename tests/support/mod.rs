@@ -408,6 +408,7 @@ impl World {
                     ..Default::default()
                 }),
                 update_mask: None,
+                caller_fingerprint: vec![],
                 idempotency: None,
             }))
             .await
@@ -479,6 +480,32 @@ impl World {
         .fetch_one(&self.pool)
         .await
         .expect("select request_fingerprint")
+    }
+
+    /// The bytes actually in `task_write.caller_fingerprint` for one claim
+    /// (ADR-1051, migration 8).
+    ///
+    /// Read from the COLUMN for the reason [`World::stored_fingerprint`] is:
+    /// `BINARY(32)` pads, so an absent fingerprint bound as empty bytes would
+    /// read back as thirty-two zeros rather than NULL, and every later lookup
+    /// against the claim would be refused. Only the column can tell the two
+    /// apart.
+    pub async fn stored_caller_fingerprint(
+        &self,
+        project: &str,
+        user: &str,
+        key: &str,
+    ) -> Option<Vec<u8>> {
+        sqlx::query_scalar(
+            "SELECT caller_fingerprint FROM task_write
+              WHERE project_id = ? AND user_id = ? AND idem_key = ?",
+        )
+        .bind(project)
+        .bind(user)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await
+        .expect("select caller_fingerprint")
     }
 
     pub async fn count_titled(&self, title: &str) -> i64 {

@@ -12,9 +12,14 @@ use crate::pb::yadgar::task::v1::*;
 ///
 /// Which fields count as the payload is per-RPC, and D9 requires that written
 /// down rather than inferred. This module's answer is the same for all three of
-/// its mutating RPCs: **every field of the request except `scope` and
-/// `idempotency`** — see the header of `src/idem.rs` for why those two, and only
-/// those two, are excluded.
+/// its mutating RPCs: **every field of the request except `scope`,
+/// `idempotency` and `caller_fingerprint`** — see the header of `src/idem.rs`
+/// for why those three, and only those three, are excluded.
+///
+/// **`caller_fingerprint` IS CLEARED, AND NO KNOWN-ANSWER TEST OVER AN EMPTY
+/// ONE CAN SEE IT.** proto3 encodes empty `bytes` as nothing, so a request that
+/// leaves it empty digests the same whether it is cleared or not. The tests
+/// that send it POPULATED are what pin the exclusion.
 ///
 /// Stated as "clear the two, keep the rest" rather than as a list of the fields
 /// to hash. The list would be the same today and would silently stop being
@@ -39,6 +44,7 @@ impl Payload for UpdateTaskRequest {
         let mut canonical = self.clone();
         canonical.scope = None;
         canonical.idempotency = None;
+        canonical.caller_fingerprint = Vec::new();
         // A mask is a SET of field names, and its encoding is a sequence. Two
         // masks naming the same fields in another order, or one naming a field
         // twice, ask for the identical write — so a digest taken over the bytes
@@ -57,6 +63,36 @@ impl Payload for DeleteTaskRequest {
         let mut canonical = self.clone();
         canonical.scope = None;
         canonical.idempotency = None;
+        canonical.caller_fingerprint = Vec::new();
         canonical.encode_to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pure half of what `tests/known_answer.rs` pins end to end: requests
+    /// identical but for `caller_fingerprint` — absent, or two different 32-byte
+    /// values — digest identically.
+    #[test]
+    fn the_store_payload_excludes_the_caller_fingerprint() {
+        let update = |caller: Vec<u8>| UpdateTaskRequest {
+            id: "yadgar:task:x".into(),
+            expect_version: 3,
+            caller_fingerprint: caller,
+            ..Default::default()
+        };
+        assert_eq!(update(vec![]).payload(), update(vec![1; 32]).payload());
+        assert_eq!(update(vec![1; 32]).payload(), update(vec![2; 32]).payload());
+
+        let delete = |caller: Vec<u8>| DeleteTaskRequest {
+            id: "yadgar:task:x".into(),
+            expect_version: 3,
+            caller_fingerprint: caller,
+            ..Default::default()
+        };
+        assert_eq!(delete(vec![]).payload(), delete(vec![1; 32]).payload());
+        assert_eq!(delete(vec![1; 32]).payload(), delete(vec![2; 32]).payload());
     }
 }
