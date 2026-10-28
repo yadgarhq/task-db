@@ -222,6 +222,24 @@ async fn the_claim_stores_the_caller_fingerprint_and_null_when_it_is_empty() {
     );
 }
 
+/// `DeleteTask` shares the claim binding with `UpdateTask`, so an empty
+/// caller fingerprint on a delete must also store NULL, not the 32 zero bytes
+/// `BINARY(32)` would pad it to. Only a read-back of the column proves it.
+#[tokio::test]
+async fn a_delete_claim_stores_null_when_its_caller_fingerprint_is_empty() {
+    let w = World::fresh("td_cfp_delete_null").await;
+    let id = w.create(P_A, U1, "doomed").await;
+
+    delete(&w, remove(&w, &id, 1, "k-delete-empty", vec![]))
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        w.stored_caller_fingerprint(P_A, U1, "k-delete-empty").await,
+        None
+    );
+}
+
 /// Any length other than 0 or 32 is refused with INVALID_ARGUMENT, on a closed
 /// pool so the refusal is proved to come before any database access.
 #[tokio::test]

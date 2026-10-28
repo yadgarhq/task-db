@@ -202,7 +202,14 @@ async fn a_key_reused_for_a_different_operation_is_refused() {
         }))
         .await
         .expect_err("the same key naming a different operation must be refused");
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    // The store fingerprint refuses a crossed key too, with the "different
+    // request" text. Only the rpc check says "different operation".
+    assert!(
+        err.message()
+            .contains("this idempotency key was already used for a different operation"),
+        "{err:?}"
+    );
 }
 
 /// An absent key is the honest "this caller does not participate" case, and must
