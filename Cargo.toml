@@ -26,7 +26,7 @@ description = "The task module's -db twin: the only writer of its store, serving
 # this crate's headroom check used to hard-code. `boot::pool_config` below
 # now reads all four from the environment with no fallback, the same shape
 # every other knob here already takes.
-yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.6.0" }
+yadgar-store = { git = "https://github.com/yadgarhq/store.git", tag = "v0.6.4" }
 # In tonic 0.14 prost codegen moved out to tonic-prost; there is no "prost"
 # feature on tonic itself.
 tonic = { version = "0.14", default-features = false, features = [
@@ -48,7 +48,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 # The shared instrumentation seam (D67), pinned by release tag like every in-org crate.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.0", features = ["grpc"] }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.7", features = ["grpc"] }
 # WHICH SIGNALS END THIS PROCESS, decided once for the estate rather than once
 # per repository (ADR-0526's pin, D19's rule). `boot::shutdown` was the fifth
 # copy of one function and the only one that did not match the other four, which
@@ -79,7 +79,7 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # ADR-0854) and verifies a client certificate against
 # LISTEN_TLS_CLIENT_CA_FILE when the mode is `optional` or `required`. Default
 # features stay on: `rotate` is the watcher above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.2", features = [
   "serve-tls",
 ] }
 sqlx = { version = "0.9", default-features = false, features = [
@@ -119,7 +119,7 @@ uuid = { version = "1", features = ["v7"] }
 # tonic's `channel` feature. Every one was already in Cargo.lock through the
 # dev side, so the lock file moves only dial's own source line. This binary
 # still dials nothing.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.25" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.26" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
