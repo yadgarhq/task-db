@@ -34,6 +34,12 @@ This module requires `transactions` and `row-locking` — **not** vector or
 full-text. It is an addressed module (D10); requiring either would make it refuse
 to boot on an engine that serves it perfectly well.
 
+## Installing
+
+Install task-db from the published OCI chart: `helm install task-db oci://ghcr.io/yadgarhq/charts/task-db --version <version>`. The release pins that chart to the image digest.
+
+A checkout of `chart/` renders `image.tag: latest`, a moving tag. Use a checkout for development only.
+
 ## Local development
 
 ```bash
