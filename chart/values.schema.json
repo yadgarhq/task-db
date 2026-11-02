@@ -28,7 +28,8 @@
         "engineOperatorReserve": {
           "type": "integer",
           "minimum": 1,
-          "description": "Connections of engineMaxConnections this pool's own arithmetic leaves untouched, so a non-admin operator can still connect when every replica's pool is full. Rendered as DB_ENGINE_OPERATOR_RESERVE and read with no fallback (ADR-0849). Minimum 1: yadgar-store refuses a zero reserve at boot."
+          "maximum": 100000,
+          "description": "Connections of engineMaxConnections this pool's own arithmetic leaves untouched, so a non-admin operator can still connect when every replica's pool is full. Rendered as DB_ENGINE_OPERATOR_RESERVE and read with no fallback (ADR-0849). Minimum 1: yadgar-store refuses a zero reserve at boot. Maximum 100000: MariaDB's own ceiling for max_connections, and the reserve sits inside it."
         },
         "acquireTimeoutSeconds": {
           "type": "integer",
@@ -39,12 +40,14 @@
         "idleTimeoutSeconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Seconds an idle connection is kept before the pool closes it. Rendered as DB_IDLE_TIMEOUT_SECONDS and read with no fallback (ADR-0837)."
+          "maximum": 31536000,
+          "description": "Seconds an idle connection is kept before the pool closes it. Rendered as DB_IDLE_TIMEOUT_SECONDS and read with no fallback (ADR-0837). Maximum 31536000 (one year): the largest wait_timeout MariaDB accepts, so a longer pool setting has no effect."
         },
         "maxLifetimeSeconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Seconds at which a connection is retired however busy it is. Rendered as DB_MAX_LIFETIME_SECONDS and read with no fallback (ADR-0837)."
+          "maximum": 31536000,
+          "description": "Seconds at which a connection is retired however busy it is. Rendered as DB_MAX_LIFETIME_SECONDS and read with no fallback (ADR-0837). Maximum 31536000: a one-year cap that keeps the value in a sane range."
         },
         "migrationLockTimeoutSeconds": {
           "type": "integer",
