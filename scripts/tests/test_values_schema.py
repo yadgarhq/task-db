@@ -829,7 +829,12 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "server.limits.maxHeaderListBytes": {"type": "integer", "minimum": 1024, "maximum": 1048576},
 }
 
+# The `server` block has ONE shape in all three -db charts (ADR-1006, yaadgaar
+# #327 ruling 3, 2026-11-03): the root requires `server`, and `server` and
+# `server.limits` are `type: object`. project-db shipped it first; iam-db and
+# task-db joined on purpose, so the three census tables agree.
 BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
+    "": {"required": ["server"]},
     "database": {
         "type": "object",
         "required": [
