@@ -25,34 +25,44 @@ struct Limit {
     key: &'static str,
     var: &'static str,
     default: u64,
-    range: RangeInclusive<u64>,
+    /// `None` for `maxConnectionAgeSeconds` until the lifecycle pin carries
+    /// `ServerLimits::MAX_CONNECTION_AGE_SECS` (yadgarhq/lifecycle#78, v0.4.0);
+    /// `the_connection_age_schema_bounds_are_the_literal_range` holds its bounds
+    /// meanwhile, and the pin-bump PR replaces the `None` with the const.
+    range: Option<RangeInclusive<u64>>,
 }
 
-fn limits() -> [Limit; 4] {
+fn limits() -> [Limit; 5] {
     [
         Limit {
             key: "maxConcurrentStreams",
             var: "LISTEN_MAX_CONCURRENT_STREAMS",
             default: 256,
-            range: ServerLimits::MAX_CONCURRENT_STREAMS,
+            range: Some(ServerLimits::MAX_CONCURRENT_STREAMS),
         },
         Limit {
             key: "keepaliveIntervalSeconds",
             var: "LISTEN_KEEPALIVE_INTERVAL_SECS",
             default: 30,
-            range: ServerLimits::KEEPALIVE_INTERVAL_SECS,
+            range: Some(ServerLimits::KEEPALIVE_INTERVAL_SECS),
         },
         Limit {
             key: "keepaliveTimeoutSeconds",
             var: "LISTEN_KEEPALIVE_TIMEOUT_SECS",
             default: 10,
-            range: ServerLimits::KEEPALIVE_TIMEOUT_SECS,
+            range: Some(ServerLimits::KEEPALIVE_TIMEOUT_SECS),
         },
         Limit {
             key: "maxHeaderListBytes",
             var: "LISTEN_MAX_HEADER_LIST_BYTES",
             default: 16384,
-            range: ServerLimits::MAX_HEADER_LIST_BYTES,
+            range: Some(ServerLimits::MAX_HEADER_LIST_BYTES),
+        },
+        Limit {
+            key: "maxConnectionAgeSeconds",
+            var: "LISTEN_MAX_CONNECTION_AGE_SECS",
+            default: 1800,
+            range: None,
         },
     ]
 }
@@ -141,12 +151,12 @@ fn the_shipped_defaults_are_the_numbers_adr_1006_ruled() {
 fn every_shipped_default_sits_inside_the_librarys_range() {
     for limit in limits() {
         let value = shipped(limit.key);
+        let Some(range) = limit.range else { continue };
         assert!(
-            limit.range.contains(&value),
-            "server.limits.{} ships {value}, outside yadgar-lifecycle's {:?}: the pod would \
+            range.contains(&value),
+            "server.limits.{} ships {value}, outside yadgar-lifecycle's {range:?}: the pod would \
              refuse to boot on its own default",
-            limit.key,
-            limit.range
+            limit.key
         );
     }
 }
@@ -154,24 +164,34 @@ fn every_shipped_default_sits_inside_the_librarys_range() {
 #[test]
 fn the_schema_bounds_are_the_librarys_range() {
     for limit in limits() {
-        assert_eq!(
-            schema_u64(limit.key, "minimum"),
-            *limit.range.start(),
-            "chart/values.schema.json's {} minimum is not the library's",
-            limit.key
-        );
-        assert_eq!(
-            schema_u64(limit.key, "maximum"),
-            *limit.range.end(),
-            "chart/values.schema.json's {} maximum is not the library's",
-            limit.key
-        );
+        if let Some(range) = &limit.range {
+            assert_eq!(
+                schema_u64(limit.key, "minimum"),
+                *range.start(),
+                "chart/values.schema.json's {} minimum is not the library's",
+                limit.key
+            );
+            assert_eq!(
+                schema_u64(limit.key, "maximum"),
+                *range.end(),
+                "chart/values.schema.json's {} maximum is not the library's",
+                limit.key
+            );
+        }
         assert!(
             schema_object(limit.key).contains("\"type\": \"integer\""),
             "chart/values.schema.json's {} must be an integer",
             limit.key
         );
     }
+}
+
+/// `maxConnectionAgeSeconds` has no library const to compare with yet (see
+/// `Limit::range`), so its range is pinned as a literal: ADR-1006, 1..=86400.
+#[test]
+fn the_connection_age_schema_bounds_are_the_literal_range() {
+    assert_eq!(schema_u64("maxConnectionAgeSeconds", "minimum"), 1);
+    assert_eq!(schema_u64("maxConnectionAgeSeconds", "maximum"), 86_400);
 }
 
 #[test]

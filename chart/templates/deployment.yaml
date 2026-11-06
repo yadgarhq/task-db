@@ -336,7 +336,7 @@ spec:
               value: /var/run/config/client-ca/ca.crt
             {{- end }}
             # THE LISTENER'S PROTOCOL LIMITS (ADR-1006, yaadgaar #218), RENDERED
-            # FROM `server.limits` AND NOWHERE ELSE. The binary reads all four
+            # FROM `server.limits` AND NOWHERE ELSE. The binary reads all five
             # with no default and refuses to boot when one is absent, not a
             # whole number or out of range, so nothing here sits behind an `if`.
             # `quote` because env values are strings. The schema bounds each
@@ -350,6 +350,8 @@ spec:
               value: {{ .Values.server.limits.keepaliveTimeoutSeconds | int64 | quote }}
             - name: LISTEN_MAX_HEADER_LIST_BYTES
               value: {{ .Values.server.limits.maxHeaderListBytes | int64 | quote }}
+            - name: LISTEN_MAX_CONNECTION_AGE_SECS
+              value: {{ .Values.server.limits.maxConnectionAgeSeconds | int64 | quote }}
           volumeMounts:
             # THE CONFIGURATION REPOSITORY'S SHARED CONFIGMAP (ADR-0569,
             # ADR-0570, step 2a): the knobs every service reads.

@@ -829,6 +829,10 @@ pub fn boot_cleartext_env(db_name: &str, password_file: &Path) -> Vec<(String, S
             "LISTEN_MAX_HEADER_LIST_BYTES".to_string(),
             "16384".to_string(),
         ),
+        (
+            "LISTEN_MAX_CONNECTION_AGE_SECS".to_string(),
+            "1800".to_string(),
+        ),
     ]
 }
 

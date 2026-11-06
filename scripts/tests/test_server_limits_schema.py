@@ -1,4 +1,4 @@
-"""The four listener limits ADR-1006 adds live in ONE place each: `chart/values.schema.json`,
+"""The five listener limits ADR-1006 adds live in ONE place each: `chart/values.schema.json`,
 and the one rule the schema cannot state lives in `chart/templates/render-checks.yaml`.
 
 yaadgaar #218. `yadgar-lifecycle` takes the stream, keepalive and header-list limits as
@@ -7,7 +7,8 @@ under `server.limits` and renders each into `LISTEN_*`. This file holds the char
 a bad value is refused at RENDER, before anything is deployed. The Rust half
 (`tests/chart_server_limits.rs`) pins the schema bounds to the library's own ranges.
 
-The connection age (ADR-1006, 30 min) is omitted until tonic#2780 ships (yaadgaar #417).
+The connection age (ADR-1006, 30 min) is the fifth limit; `yadgar-lifecycle` reads it from
+v0.4.0 on and older releases ignore the variable (yaadgaar #417).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ LIMITS = [
     pytest.param("keepaliveIntervalSeconds", "LISTEN_KEEPALIVE_INTERVAL_SECS", "30", 1, 3600, id="interval"),
     pytest.param("keepaliveTimeoutSeconds", "LISTEN_KEEPALIVE_TIMEOUT_SECS", "10", 1, 600, id="timeout"),
     pytest.param("maxHeaderListBytes", "LISTEN_MAX_HEADER_LIST_BYTES", "16384", 1024, 1048576, id="header"),
+    pytest.param("maxConnectionAgeSeconds", "LISTEN_MAX_CONNECTION_AGE_SECS", "1800", 1, 86400, id="age"),
 ]
 
 
@@ -55,12 +57,6 @@ def rendered_value(manifest: str, variable: str) -> str:
         if line.strip() == f"- name: {variable}":
             return lines[i + 1].strip()
     raise AssertionError(f"{variable} is not rendered at all")
-
-
-def test_the_connection_age_is_not_rendered() -> None:
-    result = render()
-    assert result.returncode == 0, result.stderr
-    assert "LISTEN_MAX_CONNECTION_AGE_SECS" not in result.stdout
 
 
 @pytest.mark.parametrize("key, variable, shipped, low, high", LIMITS)
