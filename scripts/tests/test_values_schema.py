@@ -827,6 +827,7 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "server.limits.keepaliveIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
     "server.limits.keepaliveTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
     "server.limits.maxHeaderListBytes": {"type": "integer", "minimum": 1024, "maximum": 1048576},
+    "server.limits.maxConnectionAgeSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
 }
 
 # The `server` block has ONE shape in all three -db charts (ADR-1006, yaadgaar
@@ -859,6 +860,7 @@ BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
             "keepaliveIntervalSeconds",
             "keepaliveTimeoutSeconds",
             "maxHeaderListBytes",
+            "maxConnectionAgeSeconds",
         ],
     },
 }

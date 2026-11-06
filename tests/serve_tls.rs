@@ -538,11 +538,12 @@ async fn an_explicitly_cleartext_listener_still_serves_cleartext() {
 /// The chart's shipped listener limits (ADR-1006), as the environment renders
 /// them. Every case that builds a server states them, because the library has
 /// no default to fall back on.
-const LIMIT_VARS: [(&str, &str); 4] = [
+const LIMIT_VARS: [(&str, &str); 5] = [
     ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
     ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
     ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
     ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+    ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800"),
 ];
 
 /// [`LIMIT_VARS`] read through [`boot::limits`], the call `main` makes.

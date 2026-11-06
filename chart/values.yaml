@@ -410,7 +410,6 @@ tls:
 # its interval, which no schema can express. `tests/chart_server_limits.rs`
 # pins every number here against the library's own range constants.
 server:
-  # Connection age (ADR-1006, 30 min) omitted until tonic#2780 ships; yaadgaar #417.
   limits:
     # HTTP/2 streams one connection may have open at once. Rendered as
     # LISTEN_MAX_CONCURRENT_STREAMS. Range 1..10000.
@@ -425,6 +424,10 @@ server:
     # Largest HTTP/2 header list a request may carry, in bytes. Rendered as
     # LISTEN_MAX_HEADER_LIST_BYTES. Range 1024..1048576.
     maxHeaderListBytes: 16384
+    # Seconds a connection lives before the server sends GOAWAY (30 min).
+    # Rendered as LISTEN_MAX_CONNECTION_AGE_SECS. Range 1..86400.
+    # yadgar-lifecycle reads it from v0.4.0; older releases ignore it.
+    maxConnectionAgeSeconds: 1800
 
 # D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
 # waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet

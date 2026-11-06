@@ -149,6 +149,12 @@
               "minimum": 1024,
               "maximum": 1048576,
               "description": "Largest HTTP/2 header list a request may carry, in bytes. Rendered as LISTEN_MAX_HEADER_LIST_BYTES and read with no fallback (ADR-1006). Range 1024..1048576, the same as yadgar-lifecycle's ServerLimits."
+            },
+            "maxConnectionAgeSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400,
+              "description": "Seconds a connection lives before the server sends GOAWAY. Rendered as LISTEN_MAX_CONNECTION_AGE_SECS and read with no fallback by yadgar-lifecycle v0.4.0 and later (ADR-1006); older releases ignore it. Range 1..86400, pinned by tests/chart_server_limits.rs."
             }
           },
           "additionalProperties": false,
@@ -157,7 +163,8 @@
             "maxConcurrentStreams",
             "keepaliveIntervalSeconds",
             "keepaliveTimeoutSeconds",
-            "maxHeaderListBytes"
+            "maxHeaderListBytes",
+            "maxConnectionAgeSeconds"
           ]
         }
       },

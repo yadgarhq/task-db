@@ -122,6 +122,7 @@ async fn a_sigterm_drains_the_server_instead_of_killing_the_process() {
                 "LISTEN_KEEPALIVE_INTERVAL_SECS" => "30",
                 "LISTEN_KEEPALIVE_TIMEOUT_SECS" => "10",
                 "LISTEN_MAX_HEADER_LIST_BYTES" => "16384",
+                "LISTEN_MAX_CONNECTION_AGE_SECS" => "1800",
                 _ => return None,
             }
             .to_string(),
