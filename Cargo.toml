@@ -48,7 +48,7 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 # The shared instrumentation seam (D67), pinned by release tag like every in-org crate.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.15", features = ["grpc"] }
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.2.16", features = ["grpc"] }
 # WHICH SIGNALS END THIS PROCESS, decided once for the estate rather than once
 # per repository (ADR-0526's pin, D19's rule). `boot::shutdown` was the fifth
 # copy of one function and the only one that did not match the other four, which
@@ -79,7 +79,7 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # ADR-0854) and verifies a client certificate against
 # LISTEN_TLS_CLIENT_CA_FILE when the mode is `optional` or `required`. Default
 # features stay on: `rotate` is the watcher above.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.10", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.4.1", features = [
   "serve-tls",
 ] }
 sqlx = { version = "0.9", default-features = false, features = [
