@@ -119,7 +119,7 @@ uuid = { version = "1", features = ["v7"] }
 # tonic's `channel` feature. Every one was already in Cargo.lock through the
 # dev side, so the lock file moves only dial's own source line. This binary
 # still dials nothing.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.32" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.33" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
